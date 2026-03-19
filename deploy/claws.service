@@ -1,0 +1,18 @@
+[Unit]
+Description=Claws - GitHub Automation Service
+After=network.target
+
+[Service]
+Type=simple
+User=brendan
+Group=brendan
+WorkingDirectory=/opt/claws
+EnvironmentFile=-/home/brendan/.claws/env
+ExecStart=/usr/bin/node /opt/claws/dist/main.js
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=330
+
+[Install]
+WantedBy=multi-user.target

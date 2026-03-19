@@ -1,0 +1,73 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+      - LICENSE
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-tags: true
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Compute version tag
+        id: version
+        run: |
+          today=$(date -u +%Y-%m-%d)
+          last=$(git tag --list "v${today}.*" --sort=-v:refname | head -n1)
+          if [ -z "$last" ]; then
+            v=1
+          else
+            v=$(( ${last##*.} + 1 ))
+          fi
+          echo "tag=v${today}.${v}" >> "$GITHUB_OUTPUT"
+
+      - run: npm ci
+      - name: Inject version into build
+        run: echo 'export const VERSION = "${{ steps.version.outputs.tag }}";' > src/version.ts
+      - run: npm run build
+      - run: npm prune --omit=dev
+
+      - name: Create release tarball
+        run: tar -czf claws.tar.gz dist/ deploy/ node_modules/
+
+      - name: Push tag
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          git tag "$TAG"
+          git push origin "$TAG"
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${{ steps.version.outputs.tag }}$" | head -n1)
+          if [ -z "$PREV_TAG" ]; then
+            echo "body=Initial release" >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "body<<RELEASE_EOF"
+              git log --oneline --no-merges "$PREV_TAG"..HEAD | head -20
+              echo "RELEASE_EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          body: ${{ steps.notes.outputs.body }}
+          files: claws.tar.gz

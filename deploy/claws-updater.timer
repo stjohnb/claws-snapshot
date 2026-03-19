@@ -1,0 +1,9 @@
+[Unit]
+Description=Claws auto-updater timer
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=60
+
+[Install]
+WantedBy=timers.target
