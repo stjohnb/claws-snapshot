@@ -146,3 +146,7 @@ src/
     └── ci-fixer.ts        Fixes failing CI on PRs
 ```
 
+## License
+
+[MIT](LICENSE)
+
