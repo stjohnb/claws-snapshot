@@ -1,6 +1,6 @@
 # Jobs
 
-Most jobs follow the same lifecycle:
+Sixteen jobs follow the same lifecycle (plus one event-driven handler):
 
 1. List target issues/PRs via `gh` CLI
 2. For each item: record task in DB, create a git worktree, run Claude via the
@@ -10,7 +10,8 @@ Most jobs follow the same lifecycle:
 
 Exceptions: `auto-merger`, `repo-standards`, `runner-monitor`, and
 `ubuntu-latest-scanner` do not invoke Claude or create worktrees.
-`whatsapp-handler` is event-driven (not scheduled).
+`email-monitor` invokes Claude but does not create worktrees or interact
+with GitHub. `whatsapp-handler` is event-driven (not scheduled).
 
 ## issue-refiner
 
@@ -608,3 +609,34 @@ repo.
 
 Does not create worktrees, PRs, or invoke Claude — purely a filesystem scan
 with issue creation via the `gh` CLI.
+
+## email-monitor
+
+**Source**: `src/jobs/email-monitor.ts`
+**Trigger**: Unseen emails from the configured veg box sender
+**Interval**: 5 minutes (configurable via `intervals.emailMonitorMs`)
+**Requires**: `emailEnabled: true`, `emailUser`, and `emailAppPassword` configured
+
+A personal automation unrelated to GitHub. Polls a Gmail inbox via IMAP for
+unseen emails from a specific sender (the weekly veg box delivery
+notification). When a matching email is found:
+
+1. Extracts the plain text body from the email (handles multipart MIME and
+   quoted-printable encoding)
+2. Sends the email body to Claude to extract the vegetable list from the
+   "Regular Veg Size" section
+3. Sends the extracted list to Claude to generate 3–5 family-friendly recipe
+   ideas
+4. Sends the vegetable list and recipes as a reply email via SMTP
+5. Marks the original email as read to prevent reprocessing
+
+Two Claude invocations per email (extraction + recipe generation), both
+routed through the bounded Claude queue.
+
+**Email configuration**:
+- IMAP: `imap.gmail.com:993` (TLS)
+- SMTP: `smtp.gmail.com:465` (TLS)
+- Authentication via Gmail app password (`emailAppPassword`)
+
+Does not create worktrees, PRs, or interact with GitHub. Exposes
+`getEmailStatus()` for the dashboard status endpoint.

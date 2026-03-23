@@ -53,7 +53,8 @@ src/
     ├── issue-auditor.ts        Daily audit ensuring no issues fall between the cracks
     ├── whatsapp-handler.ts     Interprets WhatsApp messages via Claude, creates GitHub issues
     ├── runner-monitor.ts       Monitors self-hosted GH Actions runners via SSH
-    └── ubuntu-latest-scanner.ts  Scans workflows for non-self-hosted runners, creates alert issues
+    ├── ubuntu-latest-scanner.ts  Scans workflows for non-self-hosted runners, creates alert issues
+    └── email-monitor.ts        Polls Gmail for veg box emails, generates recipe suggestions via Claude
 
 deploy/
 ├── claws.service           systemd service unit
@@ -68,7 +69,7 @@ deploy/
 
 **`main.ts`** — Wires everything together. Initializes the SQLite database,
 recovers orphaned tasks from a previous crash (cleans up dangling worktrees,
-marks tasks failed), prunes old logs, registers all 15 jobs with the scheduler
+marks tasks failed), prunes old logs, registers all 16 jobs with the scheduler
 (interval jobs staggered by 2 seconds to prevent thundering herd), starts the
 HTTP server, sets up live config reloading (interval and schedule changes
 propagated to the scheduler without restart), initializes the WhatsApp gateway
@@ -229,7 +230,7 @@ file context.
 
 ## Jobs
 
-Fifteen scheduled jobs run on timers or schedules, plus one event-driven handler.
+Sixteen scheduled jobs run on timers or schedules, plus one event-driven handler.
 See [Jobs](jobs.md) for detailed behavior of each.
 
 | Job | Trigger | Interval | Summary |
@@ -250,6 +251,7 @@ See [Jobs](jobs.md) for detailed behavior of each.
 | `whatsapp-handler` | WhatsApp message | Event-driven | Interprets messages via Claude, creates GitHub issues |
 | `runner-monitor` | Self-hosted GH Actions runners | 10 min | SSHes to runners, checks service health, restarts dead services, cleans disk |
 | `ubuntu-latest-scanner` | Daily at 6 AM | Scheduled | Scans workflow files for non-self-hosted runners, creates alert issues |
+| `email-monitor` | Unseen veg box emails | 5 min | Polls Gmail, extracts vegetables via Claude, generates recipes, sends reply email |
 
 ## Key Patterns
 
@@ -519,6 +521,12 @@ defaults.
 | `pausedJobs` | — | `[]` (job names to pause on startup) |
 | `skippedItems` | — | `[]` (array of `{repo, number}` excluded from processing) |
 | `prioritizedItems` | — | `[]` (array of `{repo, number}` processed first) |
+| `emailEnabled` | `CLAWS_EMAIL_ENABLED` | `false` |
+| `emailUser` | `CLAWS_EMAIL_USER` | *(empty)* |
+| `emailAppPassword` | `CLAWS_EMAIL_APP_PASSWORD` | *(empty)* |
+| `emailRecipient` | `CLAWS_EMAIL_RECIPIENT` | *(empty)* |
+| `emailVegBoxSender` | — | *(empty)* |
+| `intervals.emailMonitorMs` | — | `300000` (5 min) |
 
 Config changes made via the web UI (`POST /config`) take effect immediately
 at runtime — no restart required. The config module uses ESM live bindings
@@ -526,8 +534,8 @@ at runtime — no restart required. The config module uses ESM live bindings
 Interval and schedule changes are propagated to the scheduler via
 `onConfigChange()` listeners that call `updateInterval()` /
 `updateScheduledHour()`. The only exceptions are `port` (requires socket
-re-bind) and `whatsappEnabled` (requires QR pairing), which are shown as
-read-only in the UI.
+re-bind), `whatsappEnabled` (requires QR pairing), and `emailEnabled`
+(requires restart), which are shown as read-only in the UI.
 
 Env vars always take priority over `config.json`. Fields set via env var
 are shown as disabled in the config UI with a note indicating the override.
