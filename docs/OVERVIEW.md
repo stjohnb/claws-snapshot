@@ -552,7 +552,7 @@ The WhatsApp gateway requires a one-time QR-code pairing step. See
 - **Language**: TypeScript (strict mode, ES2022 target, Node16 modules, ESM)
 - **Database**: SQLite via better-sqlite3 (WAL mode)
 - **Testing**: Vitest — co-located test files, heavy mocking of external boundaries
-- **CI**: GitHub Actions on self-hosted runner — build + test on every push
+- **CI**: GitHub Actions on self-hosted runner — build + test on every push. Both CI and Release workflows use per-branch concurrency groups (`ci-${{ github.ref }}` / `release-${{ github.ref }}`) with `cancel-in-progress: true`, so newer pushes to the same branch cancel older runs while different branches run independently. Doc-only changes (`docs/**`, `**/*.md`, `LICENSE`) skip CI via `paths-ignore`.
 - **History cleanup**: Workflow-dispatch action for branch cleanup and `git-filter-repo` to audit/scrub git secrets
 - **Releases**: Date-based version tags (`v<YYYY-MM-DD>.<N>`), tarball attached to GitHub Release
 - **Auto-updates**: systemd timer checks for new releases every 60s, downloads + swaps + health checks with automatic rollback
