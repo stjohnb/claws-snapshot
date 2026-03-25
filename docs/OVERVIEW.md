@@ -135,7 +135,9 @@ from PRs with in-progress checks).
 (`enqueue`) that runs up to `MAX_CLAUDE_WORKERS` (default 2) Claude processes in
 parallel; (2) git worktree helpers — `ensureClone`, `createWorktree`,
 `createWorktreeFromBranch`, `removeWorktree`, `attemptMerge`, `pushBranch`,
-`generatePRDescription`, etc. `ensureClone` (exported) clones a repo on first
+`generatePRDescription`, `generateDocsPRDescription` (lighter-weight variant
+for doc-only PRs), `regeneratePRDescription` (re-generates after review
+cycles), etc. `ensureClone` (exported) clones a repo on first
 use and on subsequent calls runs `git fetch --all --prune` followed by
 `git checkout origin/<defaultBranch> --force` to refresh the main clone's
 working directory — this ensures any code reading directly from the main clone
@@ -191,13 +193,12 @@ endpoints and config views require authentication via
 Token comparison uses `crypto.timingSafeEqual`.
 
 **`plan-parser.ts`** — Parses structured implementation plan comments into
-discrete phases for multi-PR workflows. Looks for `### PR N:` or `### Phase N:`
-headers to split a plan into phases. Also provides `findPlanComment()` to locate the
-most recent plan comment in an issue's comment history, `getPlanUpdatePhase()`
-to read the `<!-- plan-updated-after-phase:N -->` marker from plan text,
-and `makePlanUpdateFooter()` to generate the visible + machine-readable
-footer appended after plan updates. Used by issue-worker to implement
-multi-phase plans sequentially and update the plan between phases.
+discrete phases for multi-PR workflows. `parsePlan()` looks for `### PR N:`
+or `### Phase N:` headers to split a plan into phases (falls back to a
+single phase if no structure is found). `findPlanComment()` locates the most
+recent `## Implementation Plan` comment in an issue's comment history. Used
+by issue-worker to implement multi-phase plans sequentially and by
+doc-maintainer to extract plans from recently-closed issues.
 
 **`log.ts`** — Timestamped console logging with four levels: `debug`, `info`,
 `warn`, `error`. Errors also trigger Slack notifications. All log calls capture
@@ -324,7 +325,8 @@ cancellations.
 ### Crash Recovery
 
 At startup, any tasks still marked `running` in the database (from a previous
-crash) have their worktrees cleaned up and are marked `failed`.
+crash) have their worktrees cleaned up, stale git worktree metadata is pruned
+(`git worktree prune`), and the tasks are marked `failed`.
 
 ### Transient Retry & Rate Limit Circuit Breaker
 
@@ -394,7 +396,7 @@ Two jobs monitor CI infrastructure health:
   processes older than 6 hours only if the runner service is down), and
   monitors disk usage (cleans temp files when above 90%). Actions taken are
   reported via Slack. Runner hosts are configured with baked-in defaults
-  (two Hetzner servers, overridable via `runners` in `config.json`).
+  (one default host, overridable via `runners` in `config.json`).
 - **ubuntu-latest-scanner**: Daily scan of `.github/workflows/*.yml` files in
   all cloned repos. Detects `runs-on:` values that are not `self-hosted` and
   creates a deduped alert issue in the offending repo. Skips commented-out
@@ -509,7 +511,7 @@ defaults.
 | `schedules.ideaSuggesterHour` | — | `4` (4 AM local time) |
 | `schedules.issueAuditorHour` | — | `5` (5 AM local time) |
 | `schedules.ubuntuLatestScannerHour` | — | `6` (6 AM local time) |
-| `runners` | — | Two default self-hosted runner hosts (see config) |
+| `runners` | — | One default self-hosted runner host (see config) |
 | `logRetentionDays` | — | `14` |
 | `logRetentionPerJob` | — | `20` |
 | `whatsappEnabled` | `WHATSAPP_ENABLED` | `false` |
