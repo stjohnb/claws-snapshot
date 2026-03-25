@@ -82,6 +82,8 @@ visual context.
 **Trigger**: Issues labelled `Refined`
 **Interval**: 5 minutes
 
+- Guards against duplicate work: if an open PR already exists for this issue,
+  removes `Refined` and skips (prevents creating a second PR)
 - Removes the `Ready` label (work starting)
 - Creates a worktree on branch `claws/issue-<N>-<hex4>`
 - Provides the issue title, body, and all comments as context
@@ -92,6 +94,7 @@ visual context.
   fails), creates a PR titled `fix: resolve #N — <title>` that closes
   the issue
 - Adds the `In Review` label to the issue (signals a PR is open for review)
+- Propagates the `Priority` label from the issue to the new PR (if present)
 - Removes the `Refined` label
 
 ### Multi-PR issues
@@ -104,11 +107,10 @@ creates one PR per phase:
 - The final PR uses `Closes #N` to auto-close the issue on merge
 - PR titles include `(N/total)` suffixes
 
-Before implementing each subsequent phase, the worker updates the plan comment
-to reflect completed work: completed phases get `[COMPLETED]` prepended to
-their titles, and remaining phases are revised to account for what has already
-been merged. A `<!-- plan-updated-after-phase:N -->` marker prevents redundant
-updates.
+Before implementing each subsequent phase, the worker posts a progress
+comment summarizing completed PRs and the next phase number. A
+`<!-- phase-progress:N -->` marker in the comment prevents duplicate posts.
+The original plan comment is preserved unmodified.
 
 Between phases, the worker scans open issues for ones with merged `claws/`
 PRs but more phases remaining. When a PR has been merged and more phases
@@ -302,7 +304,8 @@ For each canonical (non-duplicate) issue:
 - The `.plans/` directory is cleaned up after Claude runs and is never
   committed
 - Instructs Claude to create/update `docs/OVERVIEW.md` and supporting docs
-- If commits were produced: pushes and creates a PR titled
+- If commits were produced: generates a lightweight PR description
+  (`generateDocsPRDescription`), pushes and creates a PR titled
   `docs: update documentation for <repo>` (auto-merged by the auto-merger
   job once checks pass, with a safety guard ensuring only doc files are
   changed)
@@ -551,7 +554,7 @@ See [WhatsApp Setup](whatsapp-setup.md) for configuration and pairing.
 
 Monitors self-hosted GitHub Actions runner hosts via SSH. Unlike most jobs,
 this does not operate on GitHub repos — it directly manages infrastructure.
-Runner hosts are configured with baked-in defaults (two Hetzner servers),
+Runner hosts are configured with a baked-in default (one host),
 overridable via the `runners` array in `config.json`.
 
 For each configured runner (sequential, with per-host error reporting):
