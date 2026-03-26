@@ -14,7 +14,7 @@
   "dependencies": {
     "baileys": "^7.0.0-rc.1",
     "better-sqlite3": "^12",
-    "imapflow": "^1.2.15",
+    "imapflow": "^1.2.18",
     "nodemailer": "^8.0.3",
     "qrcode": "^1.5.4",
     "yaml": "^2.8.2"
