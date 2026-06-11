@@ -13,8 +13,10 @@ import path from "node:path";
 import QRCode from "qrcode";
 import { WHATSAPP_ALLOWED_NUMBERS, WHATSAPP_AUTH_DIR } from "./config.js";
 import * as log from "./log.js";
+import { formatMs } from "./format.js";
 import { reportError } from "./error-reporter.js";
 import { notify } from "./slack.js";
+import { recordWhatsappEvent } from "./db.js";
 
 export interface WhatsAppMessage {
   from: string;
@@ -57,10 +59,6 @@ const MAX_FAILURES_BEFORE_CLEAR = 5;
 
 export function isConnected(): boolean {
   return connected;
-}
-
-export function isPairingRequired(): boolean {
-  return pairingRequired;
 }
 
 export function isPairing(): boolean {
@@ -169,7 +167,7 @@ function notifySlack(
 
 const noop = () => {};
 const DECRYPT_KEYWORDS = /retry|decrypt|session|prekey|cipher|signal/i;
-const TRANSIENT_MESSAGES = /keep alive|stream errored/i;
+const TRANSIENT_MESSAGES = /keep alive|stream errored|bad-request/i;
 
 const baileysLogger = {
   level: "debug" as const,
@@ -192,15 +190,19 @@ const baileysLogger = {
   },
   error(obj: unknown, msg?: string) {
     const text = msg ?? String(obj);
-    if (TRANSIENT_MESSAGES.test(text)) {
-      log.warn(`[whatsapp/baileys] ${text}`);
+    const errStr = (typeof obj === "object" && obj !== null)
+      ? String((obj as Record<string, unknown>).err ?? "")
+      : "";
+    const displayText = msg ?? (errStr || text);
+    if (TRANSIENT_MESSAGES.test(text) || TRANSIENT_MESSAGES.test(errStr)) {
+      log.warn(`[whatsapp/baileys] ${displayText}`);
       return;
     }
-    log.error(`[whatsapp/baileys] ${text}`);
+    log.error(`[whatsapp/baileys] ${displayText}`);
     const errorPayload = (typeof obj === "object" && obj !== null)
       ? (obj as Record<string, unknown>).err ?? (obj as Record<string, unknown>).trace ?? obj
       : obj;
-    reportError("whatsapp:baileys-error", text, errorPayload).catch(() => {});
+    reportError("whatsapp:baileys-error", displayText, errorPayload).catch(() => {});
   },
 };
 
@@ -257,6 +259,7 @@ async function connect(onMessage: MessageHandler): Promise<void> {
       connected = true;
       consecutiveFailures = 0;
       pairingRequired = false;
+      recordWhatsappEvent("connected");
       notifySlack("connected");
       if (sock.user?.id) {
         ownJid = sock.user.id.split(":")[0].split("@")[0];
@@ -284,6 +287,7 @@ async function connect(onMessage: MessageHandler): Promise<void> {
 
       if (statusCode === DisconnectReason.loggedOut) {
         log.error("[whatsapp] Logged out — delete auth state and re-scan QR code");
+        recordWhatsappEvent("logged-out", "Status 401");
         clearAuthState();
         pairingRequired = true;
         notifySlack("pairing-required", "Logged out by WhatsApp");
@@ -316,10 +320,39 @@ async function connect(onMessage: MessageHandler): Promise<void> {
         return;
       }
 
+      if (statusCode === 515) {
+        log.warn("[whatsapp] Restart required (515) — reconnecting in 1 s");
+        recordWhatsappEvent("restart-required", "Status 515 from Baileys");
+        reconnectTimer = setTimeout(() => {
+          connect(onMessage).catch((err) => {
+            log.error(`[whatsapp] Reconnect after 515 failed: ${err}`);
+            reportError("whatsapp:reconnect", "reconnect attempt failed", err).catch(() => {});
+          });
+        }, 1000);
+        return;
+      }
+
+      if (statusCode === 440) {
+        log.warn("[whatsapp] Connection replaced by another session (440)");
+        recordWhatsappEvent("connection-replaced", "Status 440 — another session took over");
+        clearAuthState();
+        pairingRequired = true;
+        notifySlack("pairing-required", "Connection replaced by another WhatsApp session");
+        if (pairingListener) {
+          try {
+            pairingListener({ type: "error", message: "Connection replaced by another session" });
+          } finally {
+            clearPairingState();
+          }
+        }
+        return;
+      }
+
       consecutiveFailures++;
 
       if (consecutiveFailures >= MAX_FAILURES_BEFORE_CLEAR) {
         log.warn(`[whatsapp] ${consecutiveFailures} consecutive failures — clearing stale auth state`);
+        recordWhatsappEvent("auth-cleared", `${consecutiveFailures} consecutive failures`);
         clearAuthState();
         pairingRequired = true;
         notifySlack("pairing-required", `${consecutiveFailures} consecutive connection failures`);
@@ -335,7 +368,7 @@ async function connect(onMessage: MessageHandler): Promise<void> {
       }
 
       const delay = getBackoffDelay();
-      log.warn(`[whatsapp] Disconnected (status ${statusCode}), reconnecting in ${delay / 1000}s...`);
+      log.warn(`[whatsapp] Disconnected (status ${statusCode}), reconnecting in ${formatMs(delay)}...`);
       reconnectTimer = setTimeout(() => {
         connect(onMessage).catch((err) => {
           log.error(`[whatsapp] Reconnect failed: ${err}`);
@@ -394,6 +427,10 @@ export async function startPairing(listener: PairingListener): Promise<void> {
 
   // Stop existing connection if any
   await stop();
+
+  // Restore pairing-required context so notifySlack("connected") fires after pairing
+  // stop() resets lastNotifiedState to null, which would suppress the post-pair notification
+  lastNotifiedState = "pairing-required";
 
   // Clear stale auth state for fresh pairing
   clearAuthState();
@@ -534,6 +571,7 @@ async function handleIncoming(
     return;
   }
 
+  recordWhatsappEvent("message-received");
   await onMessage({
     from: jid,
     text: text ?? undefined,

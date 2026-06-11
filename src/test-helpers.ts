@@ -17,6 +17,7 @@ export function mockIssue(overrides: Partial<Issue> = {}): Issue {
     title: "Test issue",
     body: "Test issue body",
     labels: [],
+    author: { login: "testuser" },
     ...overrides,
   };
 }
@@ -30,6 +31,7 @@ export function mockPR(overrides: Partial<PR> = {}): PR {
     labels: [],
     author: { login: "testuser" },
     body: "",
+    isCrossRepository: false,
     ...overrides,
   };
 }

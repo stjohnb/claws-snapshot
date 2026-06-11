@@ -7,13 +7,18 @@ import * as claude from "../claude.js";
 import * as log from "../log.js";
 import * as db from "../db.js";
 import { reportError } from "../error-reporter.js";
+import { getItemTimeoutMs, handleTimeoutIfApplicable } from "../timeout-handler.js";
 import { processTextForImages } from "../images.js";
+import { guardContent, makeGuardCtx } from "../prompt-guard.js";
+import { getModel } from "../model-selector.js";
+import { classifyComplexity } from "../classify-complexity.js";
 
 export const REPORT_HEADER = "## Bug Investigation Report";
 const MAX_DEBUG_LOG_SIZE = 50_000;
 
 interface DebugData {
   debugLogs: string | null;
+  debugLogsFetchError: string | null;
   turns: string | null;
   pgNetErrors: string | null;
   pgNetErrorsFetchError: string | null;
@@ -28,31 +33,38 @@ export function extractGameId(body: string): string | null {
   const labelMatch = body.match(/game.?id[:\s]+([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})/i);
   if (labelMatch) return labelMatch[1];
 
-  // Bare UUID
-  const uuidMatch = body.match(/([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})/i);
+  // Bare UUID — strip URLs first to avoid matching UUIDs in image/attachment URLs
+  const stripped = body.replace(/https?:\/\/\S+/gi, "");
+  const uuidMatch = stripped.match(/([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})/i);
   if (uuidMatch) return uuidMatch[1];
 
   return null;
 }
 
 async function fetchDebugData(gameId: string): Promise<DebugData> {
-  const result: DebugData = { debugLogs: null, turns: null, pgNetErrors: null, pgNetErrorsFetchError: null };
+  const result: DebugData = { debugLogs: null, debugLogsFetchError: null, turns: null, pgNetErrors: null, pgNetErrorsFetchError: null };
 
-  // Debug logs (public)
-  try {
-    const resp = await fetch(`${KWYJIBO_BASE_URL}/api/games/${gameId}/debug-logs`);
-    if (resp.ok) {
-      const text = await resp.text();
-      result.debugLogs = text.length > MAX_DEBUG_LOG_SIZE
-        ? text.slice(0, MAX_DEBUG_LOG_SIZE / 2) +
-          "\n\n... [TRUNCATED — log too large] ...\n\n" +
-          text.slice(-MAX_DEBUG_LOG_SIZE / 2)
-        : text;
-    } else {
-      log.warn(`[triage-kwyjibo-errors] debug-logs returned ${resp.status} for game ${gameId}`);
+  // Debug logs (requires API key)
+  if (KWYJIBO_API_KEY) {
+    try {
+      const resp = await fetch(`${KWYJIBO_BASE_URL}/api/games/${gameId}/debug-logs`, {
+        headers: { "x-api-key": KWYJIBO_API_KEY },
+      });
+      if (resp.ok) {
+        const text = await resp.text();
+        result.debugLogs = text.length > MAX_DEBUG_LOG_SIZE
+          ? text.slice(0, MAX_DEBUG_LOG_SIZE / 2) +
+            "\n\n... [TRUNCATED — log too large] ...\n\n" +
+            text.slice(-MAX_DEBUG_LOG_SIZE / 2)
+          : text;
+      } else {
+        result.debugLogsFetchError = `HTTP ${resp.status}`;
+        log.warn(`[triage-kwyjibo-errors] debug-logs returned ${resp.status} for game ${gameId}`);
+      }
+    } catch (err) {
+      result.debugLogsFetchError = String(err);
+      log.warn(`[triage-kwyjibo-errors] Failed to fetch debug-logs for game ${gameId}: ${err}`);
     }
-  } catch (err) {
-    log.warn(`[triage-kwyjibo-errors] Failed to fetch debug-logs for game ${gameId}: ${err}`);
   }
 
   // Turns (public)
@@ -106,22 +118,30 @@ export function buildInvestigationPrompt(
   debugData: DebugData,
   debugGuide: string | null,
 ): string {
+  const guardCtx = makeGuardCtx(fullName, issue.number);
   const sections: string[] = [
     `You are investigating a production bug report for the ${fullName} game.`,
     ``,
-    `## Bug Report (GitHub Issue #${issue.number}: ${issue.title})`,
+    `## Bug Report (GitHub Issue #${issue.number}: ${guardContent(issue.title, guardCtx("issue-title"))})`,
     ``,
-    issue.body,
+    guardContent(issue.body, guardCtx("issue-body")),
   ];
 
   if (debugGuide) {
     sections.push(``, `## Debugging Guide`, ``, debugGuide);
   }
 
+  // debugData fields (debugLogs, turns, pgNetErrors) are server-side JSON from the
+  // game database / pg_net infrastructure — not user-generated content. Intentionally
+  // left unguarded, similar to CI logs in ci-fixer.ts.
   if (debugData.debugLogs) {
     sections.push(``, `## Debug Logs`, ``, "```json", debugData.debugLogs, "```");
+  } else if (!KWYJIBO_API_KEY) {
+    sections.push(``, `## Debug Logs`, ``, "API key not configured — debug logs could not be retrieved.");
+  } else if (debugData.debugLogsFetchError) {
+    sections.push(``, `## Debug Logs`, ``, `Failed to retrieve debug logs: ${debugData.debugLogsFetchError}`);
   } else {
-    sections.push(``, `## Debug Logs`, ``, "No game ID could be extracted from the issue, or debug logs were unavailable.");
+    sections.push(``, `## Debug Logs`, ``, "Debug logs unavailable.");
   }
 
   if (debugData.turns) {
@@ -135,7 +155,7 @@ export function buildInvestigationPrompt(
   } else if (debugData.pgNetErrorsFetchError) {
     sections.push(``, `## pg_net Errors`, ``, `Failed to retrieve pg_net errors: ${debugData.pgNetErrorsFetchError}`);
   } else {
-    sections.push(``, `## pg_net Errors`, ``, "No game ID found — pg_net errors were not fetched.");
+    sections.push(``, `## pg_net Errors`, ``, "pg_net errors unavailable.");
   }
 
   sections.push(
@@ -165,45 +185,56 @@ async function processIssue(repo: Repo, issue: gh.Issue): Promise<void> {
   const fullName = repo.fullName;
   log.info(`[triage-kwyjibo-errors] Investigating ${fullName}#${issue.number}: ${issue.title}`);
 
-  const taskId = db.recordTaskStart("triage-kwyjibo-errors", fullName, issue.number, null);
-  let wtPath: string | undefined;
+  const branchName = `claws/investigate-${issue.number}-${claude.randomSuffix()}`;
 
-  try {
-    const branchName = `claws/investigate-${issue.number}-${claude.randomSuffix()}`;
-    wtPath = await claude.createWorktree(repo, branchName, "triage-kwyjibo-errors");
-    db.updateTaskWorktree(taskId, wtPath, branchName);
+  await db.withTaskRecording("triage-kwyjibo-errors", fullName, issue.number, null, async (taskId) => {
+    await claude.withNewWorktree(repo, branchName, "triage-kwyjibo-errors", async (wtPath) => {
+      db.updateTaskWorktree(taskId, wtPath, branchName);
 
-    const debugGuide = readDebuggingGuide(wtPath);
-    const gameId = extractGameId(issue.body);
+      const debugGuide = readDebuggingGuide(wtPath);
+      const gameId = extractGameId(issue.body);
 
-    let debugData: DebugData = { debugLogs: null, turns: null, pgNetErrors: null, pgNetErrorsFetchError: null };
-    if (gameId) {
-      log.info(`[triage-kwyjibo-errors] Extracted game ID ${gameId} from ${fullName}#${issue.number}`);
-      debugData = await fetchDebugData(gameId);
-    } else {
-      log.warn(`[triage-kwyjibo-errors] No game ID found in ${fullName}#${issue.number}, investigating from issue body only`);
-    }
+      let debugData: DebugData = { debugLogs: null, debugLogsFetchError: null, turns: null, pgNetErrors: null, pgNetErrorsFetchError: null };
+      if (gameId) {
+        log.info(`[triage-kwyjibo-errors] Extracted game ID ${gameId} from ${fullName}#${issue.number}`);
+        debugData = await fetchDebugData(gameId);
+      } else {
+        log.warn(`[triage-kwyjibo-errors] No game ID found in ${fullName}#${issue.number}, investigating from issue body only`);
+      }
 
-    const imageContext = await processTextForImages([issue.body], wtPath);
-    const prompt = buildInvestigationPrompt(fullName, issue, debugData, debugGuide) + imageContext;
-    const output = await claude.enqueue(() => claude.runClaude(prompt, wtPath!), gh.hasPriorityLabel(issue.labels));
+      const issueBodyHtml = await gh.getIssueBodyHtml(fullName, issue.number).catch(() => "");
+      const imageContext = await processTextForImages([issue.body], wtPath, repo.owner, { repo: fullName, issueNumber: issue.number }, [issueBodyHtml]);
+      const prompt = buildInvestigationPrompt(fullName, issue, debugData, debugGuide) + imageContext;
+      const timeoutMs = getItemTimeoutMs(fullName, issue.number);
+      const tier = await classifyComplexity(
+        [
+          `Bug investigation for ${fullName}#${issue.number}.`,
+          `Issue title: ${issue.title}`,
+          `Issue body (first 2000 chars):`,
+          (issue.body ?? "").slice(0, 2000),
+        ].join("\n"),
+        wtPath,
+      );
+      const model = getModel(tier, "text-only", "opencode");
+      db.updateTaskModel(taskId, model);
+      log.info(`[triage-kwyjibo-errors] Using model "${model}" for ${fullName}#${issue.number}`);
+      let taskTokensUsed: number | undefined;
+      let taskCostUsd: number | undefined;
+      const output = await claude.runClaude(prompt, wtPath, { capability: "text-only", timeoutMs, tier, model, agent: "plan", onTokensUsed: (t, c) => { taskTokensUsed = t; taskCostUsd = c; } });
+      if (taskTokensUsed !== undefined && taskCostUsd !== undefined) {
+        db.updateTaskTokenUsage(taskId, taskTokensUsed, taskCostUsd);
+      }
 
-    if (output.trim()) {
-      await gh.commentOnIssue(fullName, issue.number, `${REPORT_HEADER}\n\n${output}`);
-      log.info(`[triage-kwyjibo-errors] Posted investigation report for ${fullName}#${issue.number}`);
-    } else {
-      log.warn(`[triage-kwyjibo-errors] Empty investigation output for ${fullName}#${issue.number}`);
-    }
+      if (output.trim()) {
+        await gh.commentOnIssue(fullName, issue.number, `${REPORT_HEADER}\n\n${output}`);
+        log.info(`[triage-kwyjibo-errors] Posted investigation report for ${fullName}#${issue.number}`);
+      } else {
+        log.warn(`[triage-kwyjibo-errors] Empty investigation output for ${fullName}#${issue.number}`);
+      }
 
-    db.recordTaskComplete(taskId);
-  } catch (err) {
-    db.recordTaskFailed(taskId, String(err));
-    throw err;
-  } finally {
-    if (wtPath) {
-      await claude.removeWorktree(repo, wtPath);
-    }
-  }
+      db.recordTaskComplete(taskId, { commits: 0 });
+    });
+  });
 }
 
 export async function run(repos: Repo[]): Promise<void> {
@@ -217,6 +248,8 @@ export async function run(repos: Repo[]): Promise<void> {
     const issues = await gh.listOpenIssues(repo.fullName);
     for (const issue of issues) {
       if (gh.isItemSkipped(repo.fullName, issue.number)) continue;
+      if (gh.hasIgnoreLabel(issue.labels)) continue;
+      if (!await gh.isAllowedActor(issue.author.login)) continue;
       const gameId = extractGameId(issue.body);
       if (!gameId) continue;
 
@@ -224,14 +257,15 @@ export async function run(repos: Repo[]): Promise<void> {
       const comments = await gh.getIssueComments(repo.fullName, issue.number);
       const hasReport = comments.some((c) => c.body.includes(REPORT_HEADER));
       if (hasReport) {
-        gh.populateQueueCache("needs-refinement", repo.fullName, { number: issue.number, title: issue.title, type: "issue", updatedAt: issue.updatedAt, priority: gh.hasPriorityLabel(issue.labels) });
+        gh.populateQueueCache("needs-refinement", repo.fullName, { number: issue.number, title: issue.title, type: "issue", updatedAt: issue.updatedAt, priority: gh.hasPriorityLabel(issue.labels), labels: issue.labels.map((l) => l.name) });
         continue;
       }
 
-      gh.populateQueueCache("needs-triage", repo.fullName, { number: issue.number, title: issue.title, type: "issue", updatedAt: issue.updatedAt, priority: gh.hasPriorityLabel(issue.labels) });
+      gh.populateQueueCache("needs-triage", repo.fullName, { number: issue.number, title: issue.title, type: "issue", updatedAt: issue.updatedAt, priority: gh.hasPriorityLabel(issue.labels), labels: issue.labels.map((l) => l.name) });
       tasks.push(
-        processIssue(repo, issue).catch((err) => {
-          reportError("triage-kwyjibo-errors:process-issue", `${repo.fullName}#${issue.number}`, err);
+        processIssue(repo, issue).catch(async (err) => {
+          await handleTimeoutIfApplicable("triage-kwyjibo-errors", repo.fullName, issue.number, err);
+          await reportError("triage-kwyjibo-errors:process-issue", `${repo.fullName}#${issue.number}`, err);
         }),
       );
     }

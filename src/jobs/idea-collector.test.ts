@@ -15,7 +15,10 @@ vi.mock("../error-reporter.js", () => ({
   reportError: vi.fn(),
 }));
 
-const { mockFs, mockGh, mockClaude, mockSlack, mockExecFile } = vi.hoisted(() => ({
+vi.mock("../db.js", () => ({}));
+vi.mock("../model-selector.js", () => ({ getModel: () => "sonnet" }));
+
+const { mockFs, mockGh, mockClaude, mockSlack } = vi.hoisted(() => ({
   mockFs: {
     existsSync: vi.fn(),
     readdirSync: vi.fn(),
@@ -27,28 +30,25 @@ const { mockFs, mockGh, mockClaude, mockSlack, mockExecFile } = vi.hoisted(() =>
   mockGh: {
     createIssue: vi.fn(),
     createPR: vi.fn(),
+    searchIssues: vi.fn(),
   },
   mockClaude: {
-    createWorktree: vi.fn(),
-    removeWorktree: vi.fn(),
+    withNewWorktree: vi.fn(),
     pushBranch: vi.fn(),
     randomSuffix: vi.fn().mockReturnValue("cd34"),
+    git: vi.fn(),
   },
   mockSlack: {
     getReactions: vi.fn(),
     postMessage: vi.fn(),
     isSlackBotConfigured: vi.fn().mockReturnValue(true),
   },
-  mockExecFile: vi.fn(),
 }));
 
 vi.mock("node:fs", () => ({ default: mockFs }));
 vi.mock("../github.js", () => mockGh);
 vi.mock("../claude.js", () => mockClaude);
 vi.mock("../slack.js", () => mockSlack);
-vi.mock("node:util", () => ({
-  promisify: () => mockExecFile,
-}));
 
 import { run, classifyReactions } from "./idea-collector.js";
 import type { PendingIdeasFile } from "./idea-suggester.js";
@@ -139,11 +139,11 @@ describe("idea-collector", () => {
     mockFs.readFileSync.mockReturnValue(JSON.stringify(makePendingFile()));
     mockGh.createIssue.mockResolvedValue(42);
     mockGh.createPR.mockResolvedValue(99);
-    mockClaude.createWorktree.mockResolvedValue("/tmp/collect-wt");
-    mockClaude.removeWorktree.mockResolvedValue(undefined);
+    mockGh.searchIssues.mockResolvedValue([]);
+    mockClaude.withNewWorktree.mockImplementation(async (_r: unknown, _b: unknown, _n: unknown, fn: (p: string) => Promise<unknown>) => fn("/tmp/collect-wt"));
     mockClaude.pushBranch.mockResolvedValue(undefined);
+    mockClaude.git.mockResolvedValue("");
     mockSlack.postMessage.mockResolvedValue("ts-reply");
-    mockExecFile.mockResolvedValue({ stdout: "", stderr: "" });
   });
 
   it("skips when no pending ideas directory exists", async () => {
@@ -168,7 +168,7 @@ describe("idea-collector", () => {
 
     await run([repo]);
 
-    expect(mockClaude.createWorktree).not.toHaveBeenCalled();
+    expect(mockClaude.withNewWorktree).not.toHaveBeenCalled();
     expect(mockFs.unlinkSync).not.toHaveBeenCalled();
   });
 
@@ -179,7 +179,7 @@ describe("idea-collector", () => {
 
     await run([repo]);
 
-    expect(mockClaude.createWorktree).not.toHaveBeenCalled();
+    expect(mockClaude.withNewWorktree).not.toHaveBeenCalled();
   });
 
   it("processes when all ideas have reactions", async () => {
@@ -187,9 +187,9 @@ describe("idea-collector", () => {
       .mockResolvedValueOnce([{ name: "white_check_mark", count: 1, users: ["U1"] }])
       .mockResolvedValueOnce([{ name: "x", count: 1, users: ["U1"] }]);
     // git status --porcelain returns non-empty (changes exist)
-    mockExecFile.mockImplementation((_cmd: string, args: string[]) => {
-      if (args.includes("--porcelain")) return Promise.resolve({ stdout: "M ideas/", stderr: "" });
-      return Promise.resolve({ stdout: "", stderr: "" });
+    mockClaude.git.mockImplementation((args: string[]) => {
+      if (args.includes("--porcelain")) return Promise.resolve("M ideas/");
+      return Promise.resolve("");
     });
 
     await run([repo]);
@@ -206,7 +206,7 @@ describe("idea-collector", () => {
     expect(mockGh.createIssue).toHaveBeenCalledTimes(1);
 
     // Should create worktree, commit, push, create PR
-    expect(mockClaude.createWorktree).toHaveBeenCalled();
+    expect(mockClaude.withNewWorktree).toHaveBeenCalled();
     expect(mockClaude.pushBranch).toHaveBeenCalled();
     expect(mockGh.createPR).toHaveBeenCalledWith(
       "test-org/test-repo",
@@ -226,6 +226,66 @@ describe("idea-collector", () => {
     );
   });
 
+  it("does not process when only unrecognized reactions exist even after timeout", async () => {
+    const oldPending = makePendingFile({
+      postedAt: new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString(),
+    });
+    mockFs.readFileSync.mockReturnValue(JSON.stringify(oldPending));
+    mockSlack.getReactions
+      .mockResolvedValueOnce([{ name: "thumbsup", count: 1, users: ["U1"] }])
+      .mockResolvedValueOnce([{ name: "heart", count: 1, users: ["U1"] }]);
+
+    await run([repo]);
+
+    // Unrecognized reactions produce null disposition — same as no reactions
+    expect(mockClaude.withNewWorktree).not.toHaveBeenCalled();
+    expect(mockFs.unlinkSync).not.toHaveBeenCalled();
+  });
+
+  it("does not process when no reactions exist even after timeout", async () => {
+    const oldPending = makePendingFile({
+      postedAt: new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString(),
+    });
+    mockFs.readFileSync.mockReturnValue(JSON.stringify(oldPending));
+    mockSlack.getReactions
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([]);
+
+    await run([repo]);
+
+    expect(mockClaude.withNewWorktree).not.toHaveBeenCalled();
+    expect(mockFs.unlinkSync).not.toHaveBeenCalled();
+  });
+
+  it("gives up and processes after 7-day upper-bound when no reactions arrive", async () => {
+    const veryOldPending = makePendingFile({
+      postedAt: new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString(), // 8 days ago
+    });
+    mockFs.readFileSync.mockReturnValue(JSON.stringify(veryOldPending));
+    mockSlack.getReactions
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([]);
+    mockClaude.git.mockImplementation((args: string[]) => {
+      if (args.includes("--porcelain")) return Promise.resolve("M ideas/");
+      return Promise.resolve("");
+    });
+
+    await run([repo]);
+
+    // Should process — all unreacted ideas become "potential"
+    expect(mockClaude.withNewWorktree).toHaveBeenCalled();
+    expect(mockFs.unlinkSync).toHaveBeenCalled();
+
+    // All ideas should be written to potential.md
+    const writeFileCalls = mockFs.writeFileSync.mock.calls;
+    const potentialWrite = writeFileCalls.find((c: unknown[]) =>
+      (c[0] as string).includes("potential.md"),
+    );
+    expect(potentialWrite).toBeDefined();
+    expect(potentialWrite![1]).toContain("Add dark mode");
+    expect(potentialWrite![1]).toContain("Add leaderboard");
+  });
+
   it("processes with timeout — unreacted ideas become potential", async () => {
     const oldPending = makePendingFile({
       postedAt: new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString(), // 25h ago
@@ -234,9 +294,9 @@ describe("idea-collector", () => {
     mockSlack.getReactions
       .mockResolvedValueOnce([{ name: "white_check_mark", count: 1, users: ["U1"] }])
       .mockResolvedValueOnce([]); // no reaction — will become potential
-    mockExecFile.mockImplementation((_cmd: string, args: string[]) => {
-      if (args.includes("--porcelain")) return Promise.resolve({ stdout: "M ideas/", stderr: "" });
-      return Promise.resolve({ stdout: "", stderr: "" });
+    mockClaude.git.mockImplementation((args: string[]) => {
+      if (args.includes("--porcelain")) return Promise.resolve("M ideas/");
+      return Promise.resolve("");
     });
 
     await run([repo]);
@@ -263,9 +323,9 @@ describe("idea-collector", () => {
     mockGh.createIssue
       .mockRejectedValueOnce(new Error("GitHub error"))
       .mockResolvedValueOnce(43);
-    mockExecFile.mockImplementation((_cmd: string, args: string[]) => {
-      if (args.includes("--porcelain")) return Promise.resolve({ stdout: "M ideas/", stderr: "" });
-      return Promise.resolve({ stdout: "", stderr: "" });
+    mockClaude.git.mockImplementation((args: string[]) => {
+      if (args.includes("--porcelain")) return Promise.resolve("M ideas/");
+      return Promise.resolve("");
     });
 
     await run([repo]);
@@ -298,9 +358,9 @@ describe("idea-collector", () => {
       .mockResolvedValueOnce([{ name: "white_check_mark", count: 1, users: ["U1"] }])
       .mockResolvedValueOnce([{ name: "thinking_face", count: 1, users: ["U1"] }])
       .mockResolvedValueOnce([{ name: "x", count: 1, users: ["U1"] }]);
-    mockExecFile.mockImplementation((_cmd: string, args: string[]) => {
-      if (args.includes("--porcelain")) return Promise.resolve({ stdout: "M ideas/", stderr: "" });
-      return Promise.resolve({ stdout: "", stderr: "" });
+    mockClaude.git.mockImplementation((args: string[]) => {
+      if (args.includes("--porcelain")) return Promise.resolve("M ideas/");
+      return Promise.resolve("");
     });
 
     await run([repo]);
@@ -327,27 +387,63 @@ describe("idea-collector", () => {
     expect(rejectedWrite![1]).toContain("Rejected idea");
   });
 
-  it("worktree cleaned up after processing", async () => {
-    mockSlack.getReactions.mockResolvedValue([
+  it("sanitizes focus area names with slashes and special characters", async () => {
+    const pending = makePendingFile({
+      ideas: [
+        { messageTs: "ts1", title: "Add CI checks", description: "Improve pipeline", focusArea: "CI/CD & Quality Assurance" },
+      ],
+    });
+    mockFs.readFileSync.mockImplementation((p: string) => {
+      if (p.includes("pending-ideas")) return JSON.stringify(pending);
+      return "";
+    });
+    mockFs.existsSync.mockImplementation((p: string) => {
+      if (p.includes("pending-ideas")) return true;
+      if (p.includes("ideas/")) return false;
+      return true;
+    });
+    mockSlack.getReactions.mockResolvedValueOnce([
       { name: "white_check_mark", count: 1, users: ["U1"] },
     ]);
-    mockExecFile.mockImplementation((_cmd: string, args: string[]) => {
-      if (args.includes("--porcelain")) return Promise.resolve({ stdout: "M ideas/", stderr: "" });
-      return Promise.resolve({ stdout: "", stderr: "" });
+    mockClaude.git.mockImplementation((args: string[]) => {
+      if (args.includes("--porcelain")) return Promise.resolve("M ideas/");
+      return Promise.resolve("");
     });
 
     await run([repo]);
 
-    expect(mockClaude.removeWorktree).toHaveBeenCalledWith(repo, "/tmp/collect-wt");
+    const writeFileCalls = mockFs.writeFileSync.mock.calls;
+    const areaWrite = writeFileCalls.find((c: unknown[]) =>
+      (c[0] as string).includes("ci-cd-quality-assurance.md"),
+    );
+    expect(areaWrite).toBeDefined();
+    // Must NOT contain a path separator within the filename
+    const filePath = areaWrite![0] as string;
+    const fileName = filePath.split("/").pop()!;
+    expect(fileName).toBe("ci-cd-quality-assurance.md");
+  });
+
+  it("worktree cleaned up after processing", async () => {
+    mockSlack.getReactions.mockResolvedValue([
+      { name: "white_check_mark", count: 1, users: ["U1"] },
+    ]);
+    mockClaude.git.mockImplementation((args: string[]) => {
+      if (args.includes("--porcelain")) return Promise.resolve("M ideas/");
+      return Promise.resolve("");
+    });
+
+    await run([repo]);
+
+    expect(mockClaude.withNewWorktree).toHaveBeenCalled();
   });
 
   it("PR body includes disposition table", async () => {
     mockSlack.getReactions
       .mockResolvedValueOnce([{ name: "white_check_mark", count: 1, users: ["U1"] }])
       .mockResolvedValueOnce([{ name: "x", count: 1, users: ["U1"] }]);
-    mockExecFile.mockImplementation((_cmd: string, args: string[]) => {
-      if (args.includes("--porcelain")) return Promise.resolve({ stdout: "M ideas/", stderr: "" });
-      return Promise.resolve({ stdout: "", stderr: "" });
+    mockClaude.git.mockImplementation((args: string[]) => {
+      if (args.includes("--porcelain")) return Promise.resolve("M ideas/");
+      return Promise.resolve("");
     });
 
     await run([repo]);
@@ -363,9 +459,9 @@ describe("idea-collector", () => {
     mockSlack.getReactions
       .mockResolvedValueOnce([{ name: "white_check_mark", count: 1, users: ["U1"] }])
       .mockResolvedValueOnce([{ name: "thinking_face", count: 1, users: ["U1"] }]);
-    mockExecFile.mockImplementation((_cmd: string, args: string[]) => {
-      if (args.includes("--porcelain")) return Promise.resolve({ stdout: "M ideas/", stderr: "" });
-      return Promise.resolve({ stdout: "", stderr: "" });
+    mockClaude.git.mockImplementation((args: string[]) => {
+      if (args.includes("--porcelain")) return Promise.resolve("M ideas/");
+      return Promise.resolve("");
     });
 
     await run([repo]);
@@ -374,5 +470,200 @@ describe("idea-collector", () => {
     expect(summaryCall[1]).toContain("1 accepted");
     expect(summaryCall[1]).toContain("1 potential");
     expect(summaryCall[1]).toContain("0 rejected");
+  });
+
+  it("skips issue creation when issue with same title already exists", async () => {
+    mockSlack.getReactions
+      .mockResolvedValueOnce([{ name: "white_check_mark", count: 1, users: ["U1"] }])
+      .mockResolvedValueOnce([{ name: "x", count: 1, users: ["U1"] }]);
+    mockGh.searchIssues.mockResolvedValue([{ number: 99, title: "Add dark mode" }]);
+    mockClaude.git.mockImplementation((args: string[]) => {
+      if (args.includes("--porcelain")) return Promise.resolve("M ideas/");
+      return Promise.resolve("");
+    });
+
+    await run([repo]);
+
+    expect(mockGh.createIssue).not.toHaveBeenCalled();
+    // Should reuse existing issue number in PR body
+    const prBody = mockGh.createPR.mock.calls[0][3] as string;
+    expect(prBody).toContain("#99");
+  });
+
+  it("scaffolds overview.md with focus areas when none declared", async () => {
+    mockSlack.getReactions
+      .mockResolvedValueOnce([{ name: "white_check_mark", count: 1, users: ["U1"] }])
+      .mockResolvedValueOnce([{ name: "x", count: 1, users: ["U1"] }]);
+    mockFs.existsSync.mockImplementation((p: string) => {
+      if (typeof p === "string" && p.includes("focus-areas.md")) return false;
+      if (typeof p === "string" && p.includes("overview.md")) return false;
+      return true;
+    });
+    mockClaude.git.mockImplementation((args: string[]) => {
+      if (args.includes("--porcelain")) return Promise.resolve("M ideas/");
+      return Promise.resolve("");
+    });
+
+    await run([repo]);
+
+    const writeFileCalls = mockFs.writeFileSync.mock.calls;
+    // overview.md should be written with focus areas
+    const overviewWrite = writeFileCalls.find((c: unknown[]) =>
+      (c[0] as string).includes("overview.md"),
+    );
+    expect(overviewWrite).toBeDefined();
+    expect(overviewWrite![1]).toContain("# Ideas");
+    expect(overviewWrite![1]).toContain("## Focus Areas");
+    expect(overviewWrite![1]).toContain("- user experience");
+    expect(overviewWrite![1]).toContain("- multiplayer");
+
+    // focus-areas.md should NOT be written
+    const focusAreasWrite = writeFileCalls.find((c: unknown[]) =>
+      (c[0] as string).includes("focus-areas.md"),
+    );
+    expect(focusAreasWrite).toBeUndefined();
+  });
+
+  it("does not overwrite overview.md when focus areas already declared", async () => {
+    mockSlack.getReactions
+      .mockResolvedValueOnce([{ name: "white_check_mark", count: 1, users: ["U1"] }])
+      .mockResolvedValueOnce([{ name: "x", count: 1, users: ["U1"] }]);
+    mockFs.existsSync.mockImplementation((p: string) => {
+      if (typeof p === "string" && p.includes("focus-areas.md")) return false;
+      if (typeof p === "string" && p.includes("overview.md")) return true;
+      return true;
+    });
+    mockFs.readFileSync.mockImplementation((p: string) => {
+      if (typeof p === "string" && p.includes("overview.md")) {
+        return "# Ideas\n\n## Focus Areas\n\n- Existing area\n";
+      }
+      if (typeof p === "string" && p.includes("pending-ideas")) {
+        return JSON.stringify(makePendingFile());
+      }
+      return "";
+    });
+    mockClaude.git.mockImplementation((args: string[]) => {
+      if (args.includes("--porcelain")) return Promise.resolve("M ideas/");
+      return Promise.resolve("");
+    });
+
+    await run([repo]);
+
+    const writeFileCalls = mockFs.writeFileSync.mock.calls;
+    const overviewWrite = writeFileCalls.find((c: unknown[]) =>
+      (c[0] as string).includes("overview.md"),
+    );
+    expect(overviewWrite).toBeUndefined();
+  });
+
+  it("appends focus areas to existing overview.md without section", async () => {
+    mockSlack.getReactions
+      .mockResolvedValueOnce([{ name: "white_check_mark", count: 1, users: ["U1"] }])
+      .mockResolvedValueOnce([{ name: "x", count: 1, users: ["U1"] }]);
+    mockFs.existsSync.mockImplementation((p: string) => {
+      if (typeof p === "string" && p.includes("focus-areas.md")) return false;
+      if (typeof p === "string" && p.includes("overview.md")) return true;
+      return true;
+    });
+    mockFs.readFileSync.mockImplementation((p: string) => {
+      if (typeof p === "string" && p.includes("overview.md")) {
+        return "# Ideas\n\nThis repo tracks enhancement ideas.\n";
+      }
+      if (typeof p === "string" && p.includes("pending-ideas")) {
+        return JSON.stringify(makePendingFile());
+      }
+      return "";
+    });
+    mockClaude.git.mockImplementation((args: string[]) => {
+      if (args.includes("--porcelain")) return Promise.resolve("M ideas/");
+      return Promise.resolve("");
+    });
+
+    await run([repo]);
+
+    const writeFileCalls = mockFs.writeFileSync.mock.calls;
+    const overviewWrite = writeFileCalls.find((c: unknown[]) =>
+      (c[0] as string).includes("overview.md"),
+    );
+    expect(overviewWrite).toBeDefined();
+    // Should preserve existing content and append focus areas
+    expect(overviewWrite![1]).toContain("This repo tracks enhancement ideas.");
+    expect(overviewWrite![1]).toContain("## Focus Areas");
+    expect(overviewWrite![1]).toContain("- user experience");
+  });
+
+  it("skips overview.md focus areas update when legacy focus-areas.md has areas", async () => {
+    mockSlack.getReactions
+      .mockResolvedValueOnce([{ name: "white_check_mark", count: 1, users: ["U1"] }])
+      .mockResolvedValueOnce([{ name: "x", count: 1, users: ["U1"] }]);
+    mockFs.existsSync.mockImplementation((p: string) => {
+      if (typeof p === "string" && p.includes("overview.md")) return false;
+      if (typeof p === "string" && p.includes("focus-areas.md")) return true;
+      return true;
+    });
+    mockFs.readFileSync.mockImplementation((p: string) => {
+      if (typeof p === "string" && p.includes("focus-areas.md")) return "- Existing legacy area\n";
+      if (typeof p === "string" && p.includes("pending-ideas")) return JSON.stringify(makePendingFile());
+      return "";
+    });
+    mockClaude.git.mockImplementation((args: string[]) => {
+      if (args.includes("--porcelain")) return Promise.resolve("M ideas/");
+      return Promise.resolve("");
+    });
+
+    await run([repo]);
+
+    const writeFileCalls = mockFs.writeFileSync.mock.calls;
+    // overview.md should NOT be scaffolded since legacy file has focus areas
+    const overviewWrite = writeFileCalls.find((c: unknown[]) =>
+      (c[0] as string).includes("overview.md"),
+    );
+    expect(overviewWrite).toBeUndefined();
+  });
+
+  it("skips overview.md focus areas update when overview.md already has Focus Areas section", async () => {
+    mockSlack.getReactions
+      .mockResolvedValueOnce([{ name: "white_check_mark", count: 1, users: ["U1"] }])
+      .mockResolvedValueOnce([{ name: "x", count: 1, users: ["U1"] }]);
+    mockFs.existsSync.mockReturnValue(true);
+    mockFs.readFileSync.mockImplementation((p: string) => {
+      if ((p as string).includes("overview.md"))
+        return "# Ideas\n\n## Focus Areas\n\n- Existing area\n";
+      return JSON.stringify(makePendingFile());
+    });
+    mockClaude.git.mockImplementation((args: string[]) => {
+      if (args.includes("--porcelain")) return Promise.resolve("M ideas/");
+      return Promise.resolve("");
+    });
+
+    await run([repo]);
+
+    const writeFileCalls = mockFs.writeFileSync.mock.calls;
+    const overviewWrite = writeFileCalls.find((c: unknown[]) =>
+      (c[0] as string).includes("overview.md"),
+    );
+    // overview.md should NOT be updated since it already has focus areas
+    expect(overviewWrite).toBeUndefined();
+  });
+
+  it("creates issue when searchIssues returns no exact title match", async () => {
+    mockSlack.getReactions
+      .mockResolvedValueOnce([{ name: "white_check_mark", count: 1, users: ["U1"] }])
+      .mockResolvedValueOnce([{ name: "x", count: 1, users: ["U1"] }]);
+    // Substring match but not exact — should still create
+    mockGh.searchIssues.mockResolvedValue([{ number: 50, title: "Add dark mode toggle to settings" }]);
+    mockClaude.git.mockImplementation((args: string[]) => {
+      if (args.includes("--porcelain")) return Promise.resolve("M ideas/");
+      return Promise.resolve("");
+    });
+
+    await run([repo]);
+
+    expect(mockGh.createIssue).toHaveBeenCalledWith(
+      "test-org/test-repo",
+      "Add dark mode",
+      "Support dark theme...",
+      [],
+    );
   });
 });

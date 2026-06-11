@@ -14,11 +14,12 @@ vi.mock("./error-reporter.js", () => ({
 vi.mock("./db.js", () => ({
   insertJobRun: vi.fn(),
   completeJobRun: vi.fn(),
+  getTasksByRunId: vi.fn().mockReturnValue([]),
 }));
 
-import { startJobs, msUntilHour, type Job } from "./scheduler.js";
+import { startJobs, msUntilHour, MAX_CASCADE_DEPTH, type Job } from "./scheduler.js";
 import { reportError } from "./error-reporter.js";
-import { insertJobRun, completeJobRun } from "./db.js";
+import { insertJobRun, completeJobRun, getTasksByRunId } from "./db.js";
 
 describe("msUntilHour", () => {
   beforeEach(() => { vi.useFakeTimers(); });
@@ -517,6 +518,373 @@ describe("scheduler", () => {
     expect(info.get("update-sched-info")?.scheduledHour).toBe(5);
 
     scheduler.stop();
+  });
+
+  it("skipWeekends jobs do not run on Saturday", async () => {
+    const runFn = vi.fn().mockResolvedValue(undefined);
+
+    // 2025-01-04 is a Saturday
+    vi.setSystemTime(new Date("2025-01-04T17:00:00"));
+
+    const scheduler = startJobs([
+      { name: "weekend-skip", intervalMs: 0, scheduledHour: 17, skipWeekends: true, run: runFn },
+    ]);
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(runFn).toHaveBeenCalledTimes(0);
+
+    // Advance to the scheduled hour — should still not run (Saturday)
+    await vi.advanceTimersByTimeAsync(24 * 60 * 60 * 1000);
+    expect(runFn).toHaveBeenCalledTimes(0); // Sunday, still skipped
+
+    scheduler.stop();
+  });
+
+  it("skipWeekends jobs do not run on Sunday", async () => {
+    const runFn = vi.fn().mockResolvedValue(undefined);
+
+    // 2025-01-05 is a Sunday
+    vi.setSystemTime(new Date("2025-01-05T10:00:00"));
+
+    const scheduler = startJobs([
+      { name: "weekend-skip-sun", intervalMs: 0, scheduledHour: 17, skipWeekends: true, run: runFn },
+    ]);
+
+    // Advance to 17:00 Sunday
+    await vi.advanceTimersByTimeAsync(7 * 60 * 60 * 1000);
+    expect(runFn).toHaveBeenCalledTimes(0);
+
+    scheduler.stop();
+  });
+
+  it("skipWeekends jobs run on weekdays", async () => {
+    const runFn = vi.fn().mockResolvedValue(undefined);
+
+    // 2025-01-06 is a Monday
+    vi.setSystemTime(new Date("2025-01-06T10:00:00"));
+
+    const scheduler = startJobs([
+      { name: "weekday-run", intervalMs: 0, scheduledHour: 17, skipWeekends: true, run: runFn },
+    ]);
+
+    // Advance to 17:00 Monday
+    await vi.advanceTimersByTimeAsync(7 * 60 * 60 * 1000);
+    expect(runFn).toHaveBeenCalledTimes(1);
+
+    scheduler.stop();
+  });
+
+  it("manual triggerJob bypasses skipWeekends", async () => {
+    const runFn = vi.fn().mockResolvedValue(undefined);
+
+    // 2025-01-04 is a Saturday
+    vi.setSystemTime(new Date("2025-01-04T12:00:00"));
+
+    const scheduler = startJobs([
+      { name: "weekend-manual", intervalMs: 0, scheduledHour: 17, skipWeekends: true, run: runFn },
+    ]);
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(runFn).toHaveBeenCalledTimes(0);
+
+    // Manual trigger should bypass weekend skip
+    const result = scheduler.triggerJob("weekend-manual");
+    expect(result).toBe("started");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(runFn).toHaveBeenCalledTimes(1);
+
+    scheduler.stop();
+  });
+
+  it("jobs without skipWeekends still run on weekends", async () => {
+    const runFn = vi.fn().mockResolvedValue(undefined);
+
+    // 2025-01-04 is a Saturday
+    vi.setSystemTime(new Date("2025-01-04T10:00:00"));
+
+    const scheduler = startJobs([
+      { name: "no-skip-weekend", intervalMs: 0, scheduledHour: 17, run: runFn },
+    ]);
+
+    // Advance to 17:00 Saturday
+    await vi.advanceTimersByTimeAsync(7 * 60 * 60 * 1000);
+    expect(runFn).toHaveBeenCalledTimes(1);
+
+    scheduler.stop();
+  });
+
+  it("triggers downstream job after delay when tasks were produced", async () => {
+    const upstreamFn = vi.fn().mockResolvedValue(undefined);
+    const downstreamFn = vi.fn().mockResolvedValue(undefined);
+
+    vi.mocked(getTasksByRunId).mockReturnValue([{ id: 1 }] as any);
+
+    const scheduler = startJobs([
+      { name: "upstream", intervalMs: 60000, triggers: ["downstream"], run: upstreamFn },
+      makeJob("downstream", downstreamFn, 60000),
+    ]);
+
+    // First job runs immediately, second is staggered at 2s
+    await vi.advanceTimersByTimeAsync(0);
+    expect(upstreamFn).toHaveBeenCalledTimes(1);
+    expect(downstreamFn).toHaveBeenCalledTimes(0);
+
+    // At 2s, the staggered startup fires downstream
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(downstreamFn).toHaveBeenCalledTimes(1);
+
+    // At 10s, the trigger fires downstream again
+    await vi.advanceTimersByTimeAsync(8000);
+    expect(downstreamFn).toHaveBeenCalledTimes(2);
+
+    vi.mocked(getTasksByRunId).mockReturnValue([]);
+    scheduler.stop();
+  });
+
+  it("does not trigger downstream when no tasks were produced", async () => {
+    const upstreamFn = vi.fn().mockResolvedValue(undefined);
+    const downstreamFn = vi.fn().mockResolvedValue(undefined);
+
+    vi.mocked(getTasksByRunId).mockReturnValue([]);
+
+    const scheduler = startJobs([
+      { name: "upstream", intervalMs: 60000, triggers: ["downstream"], run: upstreamFn },
+      makeJob("downstream", downstreamFn, 60000),
+    ]);
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(upstreamFn).toHaveBeenCalledTimes(1);
+
+    // Advance past the 10s trigger delay — downstream should NOT fire
+    await vi.advanceTimersByTimeAsync(10_000);
+    // downstream only has its staggered start (at 2s), not a trigger
+    expect(downstreamFn).toHaveBeenCalledTimes(1); // staggered start only
+    scheduler.stop();
+  });
+
+  it("does not trigger downstream on job failure", async () => {
+    const upstreamFn = vi.fn().mockRejectedValue(new Error("boom"));
+    const downstreamFn = vi.fn().mockResolvedValue(undefined);
+
+    vi.mocked(getTasksByRunId).mockReturnValue([{ id: 1 }] as any);
+
+    const scheduler = startJobs([
+      { name: "upstream", intervalMs: 60000, triggers: ["downstream"], run: upstreamFn },
+      makeJob("downstream", downstreamFn, 60000),
+    ]);
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(upstreamFn).toHaveBeenCalledTimes(1);
+
+    // Advance past the 10s trigger delay — downstream should NOT fire from trigger
+    await vi.advanceTimersByTimeAsync(10_000);
+    // downstream fires once from its staggered start (at 2s), but not from a trigger
+    expect(downstreamFn).toHaveBeenCalledTimes(1); // staggered start only
+
+    vi.mocked(getTasksByRunId).mockReturnValue([]);
+    scheduler.stop();
+  });
+
+  it("trigger is suppressed during drain", async () => {
+    const upstreamFn = vi.fn().mockResolvedValue(undefined);
+    const downstreamFn = vi.fn().mockResolvedValue(undefined);
+
+    vi.mocked(getTasksByRunId).mockReturnValue([{ id: 1 }] as any);
+
+    const scheduler = startJobs([
+      { name: "upstream", intervalMs: 60000, triggers: ["downstream"], run: upstreamFn },
+      makeJob("downstream", downstreamFn, 60000),
+    ]);
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(upstreamFn).toHaveBeenCalledTimes(1);
+
+    // Start draining before the 10s trigger fires
+    const drainPromise = scheduler.drain();
+    await vi.advanceTimersByTimeAsync(500);
+    await drainPromise;
+
+    // Even after drain, the trigger timer should have been cleared
+    await vi.advanceTimersByTimeAsync(15_000);
+    // downstream should NOT have been triggered (drain cleared timers)
+    expect(downstreamFn).toHaveBeenCalledTimes(0);
+
+    vi.mocked(getTasksByRunId).mockReturnValue([]);
+  });
+
+  it("self-triggering terminates when no work produced", async () => {
+    const selfFn = vi.fn().mockResolvedValue(undefined);
+
+    // First call produces tasks, second does not
+    vi.mocked(getTasksByRunId)
+      .mockReturnValueOnce([{ id: 1 }] as any)
+      .mockReturnValue([]);
+
+    const scheduler = startJobs([
+      { name: "self-trigger", intervalMs: 60000, triggers: ["self-trigger"], run: selfFn },
+    ]);
+
+    // Initial run
+    await vi.advanceTimersByTimeAsync(0);
+    expect(selfFn).toHaveBeenCalledTimes(1);
+
+    // Advance past the 10s trigger delay — should self-trigger
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(selfFn).toHaveBeenCalledTimes(2);
+
+    // Advance again — second run produced no tasks, so no further trigger
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(selfFn).toHaveBeenCalledTimes(2);
+
+    vi.mocked(getTasksByRunId).mockReturnValue([]);
+    scheduler.stop();
+  });
+
+  it("triggered downstream job is skipped when paused", async () => {
+    const upstreamFn = vi.fn().mockResolvedValue(undefined);
+    const downstreamFn = vi.fn().mockResolvedValue(undefined);
+
+    vi.mocked(getTasksByRunId).mockReturnValue([{ id: 1 }] as any);
+
+    const scheduler = startJobs([
+      { name: "upstream", intervalMs: 60000, triggers: ["downstream"], run: upstreamFn },
+      makeJob("downstream", downstreamFn, 60000),
+    ]);
+
+    // Run upstream (immediate), downstream starts staggered at 2s
+    await vi.advanceTimersByTimeAsync(0);
+    expect(upstreamFn).toHaveBeenCalledTimes(1);
+
+    // Pause downstream before the 10s trigger fires
+    scheduler.pauseJob("downstream");
+
+    // Advance past stagger (2s) — paused, so should not run
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(downstreamFn).toHaveBeenCalledTimes(0);
+
+    // Advance past trigger delay (10s) — still paused, trigger should be skipped
+    await vi.advanceTimersByTimeAsync(8000);
+    expect(downstreamFn).toHaveBeenCalledTimes(0);
+
+    vi.mocked(getTasksByRunId).mockReturnValue([]);
+    scheduler.stop();
+  });
+
+  it("triggered downstream job is skipped on weekend when it has skipWeekends", async () => {
+    const upstreamFn = vi.fn().mockResolvedValue(undefined);
+    const downstreamFn = vi.fn().mockResolvedValue(undefined);
+
+    // 2025-01-04 is a Saturday
+    vi.setSystemTime(new Date("2025-01-04T12:00:00"));
+
+    vi.mocked(getTasksByRunId).mockReturnValue([{ id: 1 }] as any);
+
+    const scheduler = startJobs([
+      { name: "upstream", intervalMs: 60000, triggers: ["weekend-downstream"], run: upstreamFn },
+      { name: "weekend-downstream", intervalMs: 60000, skipWeekends: true, run: downstreamFn },
+    ]);
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(upstreamFn).toHaveBeenCalledTimes(1);
+
+    // Advance past stagger (2s) — skipWeekends blocks scheduled tick
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(downstreamFn).toHaveBeenCalledTimes(0);
+
+    // Advance past trigger delay (10s) — trigger should also respect skipWeekends
+    await vi.advanceTimersByTimeAsync(8000);
+    expect(downstreamFn).toHaveBeenCalledTimes(0);
+
+    vi.mocked(getTasksByRunId).mockReturnValue([]);
+    scheduler.stop();
+  });
+
+  it("triggered downstream job returns already-running when in progress", async () => {
+    let resolveDownstream: () => void;
+    const upstreamFn = vi.fn().mockResolvedValue(undefined);
+    const downstreamFn = vi.fn().mockImplementation(
+      () => new Promise<void>((resolve) => { resolveDownstream = resolve; }),
+    );
+
+    vi.mocked(getTasksByRunId).mockReturnValue([{ id: 1 }] as any);
+
+    const scheduler = startJobs([
+      { name: "upstream", intervalMs: 60000, triggers: ["downstream"], run: upstreamFn },
+      makeJob("downstream", downstreamFn, 60000),
+    ]);
+
+    // upstream runs immediately, downstream starts staggered at 2s
+    await vi.advanceTimersByTimeAsync(0);
+    expect(upstreamFn).toHaveBeenCalledTimes(1);
+
+    // Advance to 2s — downstream starts from staggered startup and blocks
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(downstreamFn).toHaveBeenCalledTimes(1);
+    expect(scheduler.jobStates().get("downstream")).toBe(true);
+
+    // Advance to 10s — trigger fires but downstream is still running
+    await vi.advanceTimersByTimeAsync(8000);
+    // downstream should NOT have been called again — it was already running
+    expect(downstreamFn).toHaveBeenCalledTimes(1);
+
+    // Complete downstream
+    resolveDownstream!();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(scheduler.jobStates().get("downstream")).toBe(false);
+
+    vi.mocked(getTasksByRunId).mockReturnValue([]);
+    scheduler.stop();
+  });
+
+  it("cascade depth limit prevents infinite trigger chains", async () => {
+    const selfFn = vi.fn().mockResolvedValue(undefined);
+
+    // Every call produces tasks — would loop forever without depth limit
+    vi.mocked(getTasksByRunId).mockReturnValue([{ id: 1 }] as any);
+
+    const scheduler = startJobs([
+      { name: "infinite-chain", intervalMs: 600_000, triggers: ["infinite-chain"], run: selfFn },
+    ]);
+
+    // Initial run (depth 0)
+    await vi.advanceTimersByTimeAsync(0);
+    expect(selfFn).toHaveBeenCalledTimes(1);
+
+    // Each subsequent trigger fires after 10s; advance enough for all cascade levels
+    for (let i = 1; i <= MAX_CASCADE_DEPTH; i++) {
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(selfFn).toHaveBeenCalledTimes(1 + i);
+    }
+
+    // One more 10s — should NOT trigger again (depth limit reached)
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(selfFn).toHaveBeenCalledTimes(1 + MAX_CASCADE_DEPTH);
+
+    vi.mocked(getTasksByRunId).mockReturnValue([]);
+    scheduler.stop();
+  });
+
+  it("throws on unknown trigger target at startup", () => {
+    const runFn = vi.fn().mockResolvedValue(undefined);
+
+    expect(() =>
+      startJobs([
+        { name: "upstream", intervalMs: 60000, triggers: ["nonexistent"], run: runFn },
+      ]),
+    ).toThrow('Job "upstream" has unknown trigger target: "nonexistent"');
+  });
+
+  it("triggerJob returns 'draining' during drain", async () => {
+    const runFn = vi.fn().mockResolvedValue(undefined);
+    const scheduler = startJobs([makeJob("drain-trigger", runFn, 60000)]);
+
+    await vi.advanceTimersByTimeAsync(0);
+
+    const drainPromise = scheduler.drain();
+    await vi.advanceTimersByTimeAsync(500);
+    await drainPromise;
+
+    expect(scheduler.triggerJob("drain-trigger")).toBe("draining");
   });
 
   it("pausing a currently running job does not interrupt it", async () => {

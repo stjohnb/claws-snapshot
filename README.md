@@ -20,6 +20,8 @@ Three jobs run on simple timers (5 min for issues, 10 min for CI). Each job:
 
 A serial queue ensures only one Claude process runs at a time. Labels (`claws-working`, etc.) coordinate state and prevent duplicate work.
 
+For a deeper look at how the modules connect, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (visual Mermaid diagrams) and [docs/OVERVIEW.md](docs/OVERVIEW.md) (prose).
+
 ## Deployment
 
 Claws runs as a systemd service on a Linux server. An accompanying timer-based updater automatically pulls new GitHub releases, swaps the build artefacts, and restarts the service (with automatic rollback on health-check failure).
@@ -116,8 +118,37 @@ These tools must be installed and authenticated on the host — they are **not**
 
 | Tool | How to authenticate |
 |---|---|
-| `gh` CLI | `gh auth login` — must have access to all repos in `githubOwners` |
+| `gh` CLI | Used as a subprocess; Claws injects per-owner GitHub App installation tokens via `GH_TOKEN`. The host's `gh auth login` is still used by the Claude CLI subprocess (see GitHub App section). |
 | `claude` CLI | Follow [Claude CLI setup](https://docs.anthropic.com/en/docs/claude-cli) |
+
+### GitHub App authentication (required)
+
+Claws authenticates to GitHub as a GitHub App. It mints short-lived per-owner installation tokens and injects them as `GH_TOKEN` / `GITHUB_TOKEN` into every `gh` and `git` subprocess. PRs, comments, and pushes appear under the App's bot identity (`<slug>[bot]`) rather than a personal user.
+
+Claws requires a GitHub App for its own `gh` and `git` calls — startup will fail if `githubAppId` and `githubAppPrivateKeyPath` are not set (or if at least one entry in `githubOwnerAppCredentials` doesn't resolve).
+
+**Setup:**
+
+1. Create a GitHub App (org- or user-level) with these repository permissions: **Contents** (read/write), **Issues** (read/write), **Pull requests** (read/write), **Metadata** (read), **Actions** (read), **Checks** (read), **Commit statuses** (read). Install it on each owner whose repos should be scanned (owners listed in `githubOwners`).
+2. Download the App's private key (`.pem`) and place it somewhere on the Claws host that only the `claws` user can read (e.g. `~/.claws/github-app.pem`, mode 0600).
+3. Configure Claws:
+
+| Config key | Env variable | Description |
+|---|---|---|
+| `githubAppId` | `CLAWS_GITHUB_APP_ID` | Numeric App ID |
+| `githubAppPrivateKeyPath` | `CLAWS_GITHUB_APP_PRIVATE_KEY_PATH` | Absolute path to the App's private key `.pem` file |
+| `githubAppInstallationIds` | — | Optional `Record<owner, installation_id>` overrides; if omitted, Claws resolves installation IDs automatically via `/orgs/{owner}/installation` (falling back to `/users/{owner}/installation`) |
+
+Example `~/.claws/config.json`:
+
+```json
+{
+  "githubAppId": 123456,
+  "githubAppPrivateKeyPath": "/home/claws/.claws/github-app.pem"
+}
+```
+
+**Note:** The Claude CLI subprocess still uses the host's `gh auth` token for anything it invokes itself (it inherits the host's `gh` configuration). Only Claws's own `gh` and `git` calls are re-signed with the installation token.
 
 ### Label workflow
 
@@ -145,8 +176,4 @@ src/
     ├── issue-worker.ts    Implements issues as PRs
     └── ci-fixer.ts        Fixes failing CI on PRs
 ```
-
-## License
-
-[MIT](LICENSE)
 

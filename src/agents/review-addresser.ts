@@ -1,0 +1,145 @@
+import { LABELS, HOME_ASSISTANT_BASE_URL, HOME_ASSISTANT_TOKEN, type Repo } from "../config.js";
+import * as gh from "../github.js";
+import * as claude from "../claude.js";
+import * as log from "../log.js";
+import * as db from "../db.js";
+import type { TaskOutcome } from "../db.js";
+import { buildSuccessOutcome } from "../outcome.js";
+import { getItemTimeoutMs } from "../timeout-handler.js";
+import { processTextForImages } from "../images.js";
+import { guardContent, makeGuardCtx } from "../prompt-guard.js";
+import { FAST_CHECKS_GUIDANCE, RUNNER_POLICY_CONTEXT, homeAssistantContext } from "./agent-context.js";
+import { getModel } from "../model-selector.js";
+import { extractRecommendedModel } from "./pr-reviewer.js";
+import type { Provider } from "../plan-parser.js";
+
+export async function processPR(repo: Repo, pr: gh.PR, reviewData: gh.PRReviewData): Promise<void> {
+  const fullName = repo.fullName;
+  log.info(`[review-addresser] Processing PR #${pr.number} in ${fullName}`);
+
+  await db.withTaskRecording("review-addresser", fullName, pr.number, null, async (taskId) => {
+    const result = await claude.withExistingWorktree(
+      repo, pr.headRefName, "review-addresser",
+      async (wtPath) => {
+        db.updateTaskWorktree(taskId, wtPath, pr.headRefName);
+
+        const imageContext = await processTextForImages([reviewData.formatted], wtPath, repo.owner, { repo: fullName, issueNumber: pr.number, agentName: "Review Addresser" }, reviewData.htmlBodies);
+
+        const guardCtx = makeGuardCtx(fullName, pr.number);
+        const prompt = [
+          `You are addressing PR review comments on a pull request in the repository ${fullName}.`,
+          `PR #${pr.number}: ${guardContent(pr.title, guardCtx("pr-title"))}`,
+          `Branch: ${guardContent(pr.headRefName, guardCtx("pr-branch"))}`,
+          ``,
+          `The following review comments have been left on this PR:`,
+          ``,
+          // Human-authored content in reviewData.formatted is already guarded in getPRReviewComments.
+          reviewData.formatted,
+          ``,
+          `IMPORTANT — handling conflicts between human and automated comments:`,
+          `- Human reviewer comments are AUTHORITATIVE instructions from the repo owner. You MUST follow them exactly, even if you disagree with the reasoning, and even if a Claws automated review comment recommends the opposite.`,
+          `- If a human comment conflicts with an automated Claws review comment, follow the human comment and IGNORE the conflicting automated comment. Do NOT revert a change that a human explicitly directed.`,
+          `- If you believe the human's instruction is genuinely wrong (e.g., introduces a security bug), implement it anyway and raise the concern as text output for human review — do not silently disobey.`,
+          ``,
+          `Please address each review comment by making the necessary code changes.`,
+          `Make commits with clear messages as you work.`,
+          ``,
+          `Text output — when to produce it:`,
+          `- If a review comment asks a QUESTION (e.g. "why did you…", "what about…", "can you explain…", "is X correct?", "did you consider…", "should this…"), you MUST answer it directly in text output, EVEN IF you also addressed it with a code change. A question always needs a written answer — answering only with a commit is not acceptable. State the answer, and if a commit addresses it, say which change you made.`,
+          `- If a review suggestion could not be implemented, explain why.`,
+          `- If an error was encountered during implementation, describe it.`,
+          `If every review comment was a pure change request that you fully addressed via code changes (no questions asked, no problems encountered), do not produce any text output.`,
+          ``,
+          FAST_CHECKS_GUIDANCE,
+          RUNNER_POLICY_CONTEXT,
+          ...(HOME_ASSISTANT_BASE_URL && HOME_ASSISTANT_TOKEN ? [homeAssistantContext()] : []),
+          imageContext,
+        ].join("\n");
+
+        const mcpConfigPath = claude.writeClawsMcpConfig(wtPath);
+        const agentDoc = claude.readRepoAgentDoc(wtPath, "issue-implementer");
+        const timeoutMs = getItemTimeoutMs(fullName, pr.number);
+        const recommendedTier = extractRecommendedModel(reviewData.formatted);
+        const model = getModel(recommendedTier, "tool-use", "claude");
+        db.updateTaskModel(taskId, model);
+        let actualProvider: Provider = "claude";
+        let taskTokensUsed: number | undefined;
+        let taskCostUsd: number | undefined;
+        const claudeOutput = await claude.runClaude(prompt, wtPath, { capability: "tool-use", mcpConfig: mcpConfigPath, timeoutMs, tier: recommendedTier, model, appendSystemPrompt: agentDoc, onProviderUsed: (p) => { actualProvider = p; }, onTokensUsed: (t, c) => { taskTokensUsed = t; taskCostUsd = c; }, agent: "build", envSanitization: "passthrough" });
+        if (taskTokensUsed !== undefined && taskCostUsd !== undefined) {
+          db.updateTaskTokenUsage(taskId, taskTokensUsed, taskCostUsd);
+        }
+
+        let outcome: TaskOutcome = { commits: 0 };
+
+        const hasNewCommits = await claude.hasNewCommits(wtPath, pr.headRefName);
+        if (hasNewCommits) {
+          await claude.pushBranch(wtPath, pr.headRefName, repo.owner);
+          if (pr.headRefName.startsWith("claws/")) {
+            try {
+              const attribution = `*— Addressed with: ${model} (provider: ${actualProvider}) —*`;
+              const [description, currentBody] = await Promise.all([
+                claude.regeneratePRDescription(wtPath, pr.baseRefName, pr, fullName, attribution),
+                gh.getPRBody(fullName, pr.number),
+              ]);
+              const closingMatch = currentBody.match(/\b(Closes|Part of)\s+#\d+/i);
+              const phaseHeaderMatch = currentBody.match(/^##\s+PR\s+\d+\s+of\s+\d+\s*:.*$/m);
+              const prefix = phaseHeaderMatch ? `${phaseHeaderMatch[0]}\n\n` : "";
+              const suffix = closingMatch ? `\n\n${closingMatch[0]}` : "";
+              await gh.updatePR(fullName, pr.number, `${prefix}${description}${suffix}`);
+            } catch (descErr) {
+              log.warn(`[review-addresser] Failed to update PR description for ${fullName}#${pr.number}: ${descErr}`);
+            }
+          }
+          log.info(`[review-addresser] Pushed changes for ${fullName}#${pr.number}`);
+          outcome = await buildSuccessOutcome(wtPath, pr.baseRefName, pr.number, "updated");
+        }
+
+        if (!claudeOutput.trim()) {
+          log.info(`[review-addresser] All review comments addressed without issues for ${fullName}#${pr.number}`);
+        }
+
+        // React 🚀 to each addressed comment (non-PR-review Claws comments and inline review comments)
+        for (const id of reviewData.commentIds) {
+          await gh.addReaction(fullName, id, gh.ADDRESSED_REACTION);
+        }
+        for (const id of reviewData.reviewCommentIds) {
+          await gh.addReviewCommentReaction(fullName, id, gh.ADDRESSED_REACTION);
+        }
+
+        // When no commits were pushed, mark the PR review comment as addressed so it isn't
+        // re-processed next cycle. pr-reviewer overwrites the body on re-review, clearing
+        // this marker automatically.
+        if (!hasNewCommits && reviewData.prReviewComment) {
+          const { id, body, reviewedCommit } = reviewData.prReviewComment;
+          const marker = `${gh.REVIEW_ADDRESSED_MARKER}: ${reviewedCommit}`;
+          if (!body.includes(marker)) {
+            await gh.editIssueComment(fullName, id, gh.stripClawsMarker(body) + "\n" + marker, { agentName: "Reviewer" });
+          }
+        }
+
+        // Only post a comment when Claude reports an issue (not routine summaries)
+        if (claudeOutput.trim()) {
+          await gh.commentOnIssue(fullName, pr.number, claudeOutput.trim(), { agentName: "Review Addresser" });
+          log.info(`[review-addresser] Posted issue comment for ${fullName}#${pr.number}`);
+        }
+
+        // When no commits were pushed and no issues reported, restore Ready label.
+        // Since HEAD is unchanged, pr-reviewer's hasNewCommitsSinceLastReview()
+        // will return false and it will never re-fire — so we must restore Ready here.
+        // When there IS output (an issue), don't add Ready — human attention needed.
+        // When commits were pushed, pr-reviewer will detect the new HEAD next cycle.
+        if (!hasNewCommits && !claudeOutput.trim()) {
+          await gh.addLabel(fullName, pr.number, LABELS.ready);
+        }
+        db.recordTaskComplete(taskId, outcome);
+      },
+    );
+
+    if (result === null) {
+      log.info(`[review-addresser] Branch ${pr.headRefName} no longer exists for PR #${pr.number} in ${fullName} — skipping (likely merged/closed)`);
+      db.recordTaskComplete(taskId, { commits: 0, prNumber: pr.number, prAction: "skipped" });
+    }
+  });
+}
+

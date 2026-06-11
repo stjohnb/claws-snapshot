@@ -1,0 +1,175 @@
+name: History Cleanup
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (report only, no changes pushed)'
+        type: boolean
+        default: true
+      delete_branches:
+        description: 'Delete stale remote branches'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: [self-hosted, linux]
+    steps:
+      - name: Validate prerequisites
+        run: |
+          if [ -z "${{ secrets.SLACK_WEBHOOK_TO_SCRUB }}" ]; then
+            echo "::error::SLACK_WEBHOOK_TO_SCRUB secret is not set. Add it in repo Settings → Secrets → Actions."
+            exit 1
+          fi
+
+      - name: Install git-filter-repo
+        run: |
+          curl -sL https://raw.githubusercontent.com/newren/git-filter-repo/main/git-filter-repo \
+            -o /tmp/git-filter-repo
+          chmod +x /tmp/git-filter-repo
+          echo "/tmp" >> "$GITHUB_PATH"
+
+      - name: Mirror clone repository
+        run: |
+          git clone --mirror "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" work.git
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Delete stale remote branches
+        if: inputs.delete_branches
+        working-directory: work.git
+        run: |
+          branches=$(git for-each-ref --format='%(refname:short)' refs/heads/ | grep -v '^main$' || true)
+          count=$(echo "$branches" | grep -c . || true)
+          echo "Found $count branches to delete (excluding main)"
+
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "### Branches (dry run — would delete $count branches)" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo "$branches" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            deleted=0
+            echo "$branches" | xargs -n 20 | while read -r batch; do
+              for ref in $batch; do
+                git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" --delete "refs/heads/$ref" || true
+                deleted=$((deleted + 1))
+              done
+            done
+            echo "Deleted branches from remote"
+            echo "BRANCHES_DELETED=$count" >> "$GITHUB_ENV"
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prune non-main refs from mirror
+        working-directory: work.git
+        run: |
+          # Remove all local branch refs except main so filter-repo
+          # only rewrites the history we intend to push.
+          for ref in $(git for-each-ref --format='%(refname)' refs/heads/ | grep -v 'refs/heads/main$'); do
+            git update-ref -d "$ref"
+          done
+          remaining=$(git for-each-ref --format='%(refname)' refs/heads/ | wc -l)
+          echo "Remaining branch refs after pruning: $remaining"
+
+      - name: Run git-filter-repo
+        working-directory: work.git
+        run: |
+          # Generate replacements file from secret
+          echo "$SLACK_WEBHOOK==>REDACTED_SLACK_WEBHOOK" > /tmp/replacements.txt
+
+          # Generate mailmap file
+          cat > /tmp/mailmap <<'EOF'
+          opiestjohn <264143558+opiestjohn@users.noreply.github.com> opiestjohn <brendanserver@gmail.com>
+          EOF
+
+          # Count commits before rewrite
+          before=$(git rev-list --all --count)
+
+          # Run filter-repo (single pass, both rewrites)
+          git filter-repo --replace-text /tmp/replacements.txt --mailmap /tmp/mailmap --force
+
+          # Count commits after rewrite
+          after=$(git rev-list --all --count)
+
+          echo "COMMITS_BEFORE=$before" >> "$GITHUB_ENV"
+          echo "COMMITS_AFTER=$after" >> "$GITHUB_ENV"
+
+          # Clean up sensitive temp files
+          rm -f /tmp/replacements.txt /tmp/mailmap
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_TO_SCRUB }}
+
+      - name: Dry run report
+        if: inputs.dry_run
+        working-directory: work.git
+        run: |
+          echo "## History Cleanup — Dry Run Report" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Commits before:** $COMMITS_BEFORE" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Commits after:** $COMMITS_AFTER" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          # Check for remaining webhook references
+          webhook_hits=$(git log --all -p --oneline | grep -cF "$SLACK_WEBHOOK" || true)
+          echo "- **Webhook references remaining:** $webhook_hits" >> "$GITHUB_STEP_SUMMARY"
+
+          # Check for remaining personal email references
+          email_hits=$(git log --all --format='%ae %ce' | grep -c 'brendanserver' || true)
+          echo "- **Personal email references remaining:** $email_hits" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**No changes were pushed.** Re-run with dry_run=false to apply." >> "$GITHUB_STEP_SUMMARY"
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_TO_SCRUB }}
+
+      - name: Force push rewritten history
+        if: ${{ !inputs.dry_run }}
+        working-directory: work.git
+        run: |
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push --force origin refs/heads/main:refs/heads/main
+          git push --force --tags origin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify cleanup
+        if: ${{ !inputs.dry_run }}
+        run: |
+          git clone "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" verify
+          cd verify
+
+          webhook_hits=$(git log --all -p -S "$SLACK_WEBHOOK" --oneline | wc -l)
+          email_hits=$(git log --all --format='%ae' | grep -c 'brendanserver' || true)
+
+          echo "## History Cleanup — Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Branches deleted:** ${BRANCHES_DELETED:-0}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Commits before:** $COMMITS_BEFORE" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Commits after:** $COMMITS_AFTER" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Webhook references found after cleanup:** $webhook_hits" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Personal email references found after cleanup:** $email_hits" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$webhook_hits" -gt 0 ] || [ "$email_hits" -gt 0 ]; then
+            echo "::warning::Some references may still exist. Check the verification results above."
+          fi
+
+          echo "### Post-cleanup checklist" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- [ ] Contact GitHub support for server-side GC (or delete/re-create repo from cleaned mirror)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- [ ] Notify collaborators to re-clone (all local copies have orphaned SHAs)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- [ ] Re-enable branch protection on main (if previously disabled)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- [ ] Make repo public" >> "$GITHUB_STEP_SUMMARY"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_TO_SCRUB }}
+
+      - name: Cleanup working directories
+        if: always()
+        run: rm -rf work.git verify /tmp/git-filter-repo

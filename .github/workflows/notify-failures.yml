@@ -1,0 +1,71 @@
+name: Notify on main build failure
+
+on:
+  workflow_run:
+    workflows: ["CI", "Release"]
+    types: [completed]
+
+permissions:
+  contents: read
+  issues: write
+  actions: read
+
+jobs:
+  notify:
+    runs-on: [self-hosted, linux]
+    concurrency:
+      group: notify-failure-${{ github.event.workflow_run.name }}
+      cancel-in-progress: false
+    if: github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.head_branch == 'main'
+    steps:
+      - name: Create failure issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          REPO: ${{ github.repository }}
+        run: |
+          # On recurrence: edit issue body to bump Occurrences/Last seen instead of commenting.
+          set -euo pipefail
+          gh label create bug --color d73a4a --repo "$REPO" 2>/dev/null || true
+          TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          TITLE="Build failure: ${WORKFLOW_NAME}"
+          existing=$(gh issue list --repo "$REPO" --state open \
+            --search "\"${TITLE}\" in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            body=$(gh issue view "$existing" --repo "$REPO" --json body --jq .body)
+            if printf '%s' "$body" | grep -q '^\*\*First seen:\*\*'; then
+              new_body=$(printf '%s' "$body" | awk -v ts="$TS" '
+                /^\*\*Last seen:\*\*/ { print "**Last seen:** " ts; next }
+                /^\*\*Occurrences:\*\* / { print "**Occurrences:** " ($2 + 1); next }
+                { print }')
+            else
+              new_body="${body}"$'\n\n---\n**First seen:** '"${TS}"$'\n**Last seen:** '"${TS}"$'\n**Occurrences:** 2'
+            fi
+            gh issue edit "$existing" --repo "$REPO" --body "$new_body"
+          else
+            body=$'Workflow **'"${WORKFLOW_NAME}"$'** failed on `main`: '"${RUN_URL}"$'\n\n---\n**First seen:** '"${TS}"$'\n**Last seen:** '"${TS}"$'\n**Occurrences:** 1'
+            gh issue create --repo "$REPO" --title "$TITLE" --body "$body" --label bug
+          fi
+
+  close-on-recovery:
+    runs-on: [self-hosted, linux]
+    concurrency:
+      group: notify-failure-${{ github.event.workflow_run.name }}
+      cancel-in-progress: false
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main'
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Close failure issue if open
+        run: |
+          set -euo pipefail
+          existing=$(gh issue list --repo "$REPO" --label bug --state open \
+            --search "\"Build failure: ${WORKFLOW_NAME}\" in:title" \
+            --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue close "$existing" --repo "$REPO" \
+              --comment "Build recovered — closing automatically."
+          fi

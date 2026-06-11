@@ -13,6 +13,12 @@ Restart=on-failure
 RestartSec=5
 KillSignal=SIGTERM
 TimeoutStopSec=330
+KillMode=process
+MemoryHigh=2.5G
+MemoryMax=3G
+TasksMax=400
+CPUWeight=80
+OOMScoreAdjust=200
 
 [Install]
 WantedBy=multi-user.target

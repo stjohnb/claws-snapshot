@@ -3,6 +3,7 @@ import { mockRepo } from "../test-helpers.js";
 
 vi.mock("../config.js", () => ({
   WORK_DIR: "/home/testuser/.claws",
+  LABELS: { priority: "Priority" },
 }));
 
 vi.mock("../log.js", () => ({
@@ -67,7 +68,7 @@ describe("ubuntu-latest-scanner", () => {
 
     await run([repo]);
 
-    expect(mockClaude.ensureClone).toHaveBeenCalledWith(repo);
+    expect(mockClaude.ensureClone).toHaveBeenCalledWith(repo, { skipFetchIfRecent: true });
   });
 
   it("skips repos with no .github/workflows directory", async () => {
@@ -113,9 +114,9 @@ describe("ubuntu-latest-scanner", () => {
 
     expect(mockGh.createIssue).toHaveBeenCalledWith(
       repo.fullName,
-      "Alert: workflows using non-self-hosted runners",
+      "Alert: workflows using GitHub-hosted runners",
       expect.stringContaining("ubuntu-latest"),
-      [],
+      ["Priority"],
     );
   });
 
@@ -125,7 +126,7 @@ describe("ubuntu-latest-scanner", () => {
       "jobs:\n  build:\n    runs-on: ubuntu-latest\n",
     );
     mockGh.searchIssues.mockResolvedValue([
-      { number: 42, title: "Alert: workflows using non-self-hosted runners" },
+      { number: 42, title: "Alert: workflows using GitHub-hosted runners" },
     ]);
 
     await run([repo]);
@@ -174,7 +175,7 @@ describe("ubuntu-latest-scanner", () => {
       repo2.fullName,
       expect.any(String),
       expect.any(String),
-      [],
+      ["Priority"],
     );
   });
 
@@ -189,7 +190,7 @@ describe("ubuntu-latest-scanner", () => {
     expect(mockGh.createIssue).not.toHaveBeenCalled();
   });
 
-  it("detects expression syntax as non-self-hosted", async () => {
+  it("does not create an issue for expression syntax (indeterminate at static analysis time)", async () => {
     mockFs.readdirSync.mockReturnValue(["ci.yml"]);
     mockFs.readFileSync.mockReturnValue(
       "jobs:\n  build:\n    runs-on: ${{ matrix.os }}\n",
@@ -197,12 +198,119 @@ describe("ubuntu-latest-scanner", () => {
 
     await run([repo]);
 
+    expect(mockGh.createIssue).not.toHaveBeenCalled();
+  });
+
+  it("does not create an issue for macos-latest runner", async () => {
+    mockFs.readdirSync.mockReturnValue(["ci.yml"]);
+    mockFs.readFileSync.mockReturnValue(
+      "jobs:\n  build:\n    runs-on: macos-latest\n",
+    );
+
+    await run([repo]);
+
+    expect(mockGh.createIssue).not.toHaveBeenCalled();
+  });
+
+  it("does not create an issue for versioned macOS runner (macos-14)", async () => {
+    mockFs.readdirSync.mockReturnValue(["ci.yml"]);
+    mockFs.readFileSync.mockReturnValue(
+      "jobs:\n  build:\n    runs-on: macos-14\n",
+    );
+
+    await run([repo]);
+
+    expect(mockGh.createIssue).not.toHaveBeenCalled();
+  });
+
+  it("does not create an issue for macOS runner in array form ([macos-latest, xlarge])", async () => {
+    mockFs.readdirSync.mockReturnValue(["ci.yml"]);
+    mockFs.readFileSync.mockReturnValue(
+      "jobs:\n  build:\n    runs-on: [macos-latest, xlarge]\n",
+    );
+
+    await run([repo]);
+
+    expect(mockGh.createIssue).not.toHaveBeenCalled();
+  });
+
+  it("creates an issue only for ubuntu-latest when mixed with macos-latest in the same file", async () => {
+    mockFs.readdirSync.mockReturnValue(["ci.yml"]);
+    mockFs.readFileSync.mockReturnValue(
+      "jobs:\n  macos-build:\n    runs-on: macos-latest\n  linux-build:\n    runs-on: ubuntu-latest\n",
+    );
+
+    await run([repo]);
+
+    expect(mockGh.createIssue).toHaveBeenCalledTimes(1);
+    const body = mockGh.createIssue.mock.calls[0]![2] as string;
+    expect(body).toContain("ubuntu-latest");
+    expect(body).not.toContain("macos-latest");
+  });
+
+  it("does not create an issue for custom runner name (ryzen)", async () => {
+    mockFs.readdirSync.mockReturnValue(["ci.yml"]);
+    mockFs.readFileSync.mockReturnValue(
+      "jobs:\n  build:\n    runs-on: ryzen\n",
+    );
+
+    await run([repo]);
+
+    expect(mockGh.createIssue).not.toHaveBeenCalled();
+  });
+
+  it("does not create an issue for custom runner in array form ([ryzen, linux])", async () => {
+    mockFs.readdirSync.mockReturnValue(["ci.yml"]);
+    mockFs.readFileSync.mockReturnValue(
+      "jobs:\n  build:\n    runs-on: [ryzen, linux]\n",
+    );
+
+    await run([repo]);
+
+    expect(mockGh.createIssue).not.toHaveBeenCalled();
+  });
+
+  it("creates an issue for ubuntu-latest in array form ([ubuntu-latest])", async () => {
+    mockFs.readdirSync.mockReturnValue(["ci.yml"]);
+    mockFs.readFileSync.mockReturnValue(
+      "jobs:\n  build:\n    runs-on: [ubuntu-latest]\n",
+    );
+
+    await run([repo]);
+
     expect(mockGh.createIssue).toHaveBeenCalledWith(
       repo.fullName,
       expect.any(String),
-      expect.stringContaining("${{ matrix.os }}"),
-      [],
+      expect.stringContaining("ubuntu-latest"),
+      ["Priority"],
     );
+  });
+
+  it("creates an issue for windows runner in array form ([windows-2022, self-hosted])", async () => {
+    mockFs.readdirSync.mockReturnValue(["ci.yml"]);
+    mockFs.readFileSync.mockReturnValue(
+      "jobs:\n  build:\n    runs-on: [windows-2022, self-hosted]\n",
+    );
+
+    await run([repo]);
+
+    expect(mockGh.createIssue).toHaveBeenCalledWith(
+      repo.fullName,
+      expect.any(String),
+      expect.stringContaining("windows-2022"),
+      ["Priority"],
+    );
+  });
+
+  it("does not create an issue for expression syntax in array form (indeterminate at static analysis time)", async () => {
+    mockFs.readdirSync.mockReturnValue(["ci.yml"]);
+    mockFs.readFileSync.mockReturnValue(
+      "jobs:\n  build:\n    runs-on: [${{ matrix.os }}]\n",
+    );
+
+    await run([repo]);
+
+    expect(mockGh.createIssue).not.toHaveBeenCalled();
   });
 
   it("ignores non-yml files in workflows directory", async () => {

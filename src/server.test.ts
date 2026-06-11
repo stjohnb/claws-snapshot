@@ -1,18 +1,42 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import http from "node:http";
+import crypto from "node:crypto";
 
 vi.mock("./config.js", () => ({
   SERVER_PORT: 0,
+  BIND_HOST: "127.0.0.1",
+  ACTIVATION_STATE: "active",
+  isActive: () => true,
   WHATSAPP_ENABLED: false,
-  AUTH_TOKEN: "",
+  INTERNAL_MCP_TOKEN: "test-internal-mcp-token",
   LABELS: {
     refined: "Refined",
     ready: "Ready",
+    problematic: "Claws Problematic",
   },
   LABEL_SPECS: {
     "Refined":              { color: "0075ca", description: "Issue is ready for claws to implement" },
     "Ready":                { color: "0e8a16", description: "Claws has finished — needs human attention" },
   },
+  VALID_AGENT_NAMES: ["planner", "implementer", "ci-fixer", "review-addresser", "reviewer", "merger"],
+  DISABLED_AGENTS: [] as string[],
+  loadConfig: vi.fn().mockReturnValue({
+    slackWebhook: "https://hooks.slack.com/abcdef",
+    githubOwners: ["owner1"],
+    selfRepo: "owner1/repo1",
+    kwyjiboBaseUrl: "https://kwyjibo.vercel.app",
+    kwyjiboApiKey: "",
+    openaiApiKey: "",
+    port: 3000,
+    intervals: { issueWorkerMs: 300000, issueRefinerMs: 300000, ciFixerMs: 600000, reviewAddresserMs: 300000, bugInvestigatorMs: 600000, autoMergerMs: 600000 },
+    schedules: { repoStandardsHour: 2 },
+    logRetentionDays: 14,
+    logRetentionPerJob: 20,
+    whatsappEnabled: false,
+    whatsappAllowedNumbers: [],
+    disabledAgents: [],
+    notifyDashboardActions: true,
+  }),
   getConfigForDisplay: vi.fn().mockReturnValue({
     slackWebhook: "****cdef",
     githubOwners: ["owner1"],
@@ -20,19 +44,41 @@ vi.mock("./config.js", () => ({
     kwyjiboBaseUrl: "https://kwyjibo.vercel.app",
     kwyjiboApiKey: "Not configured",
     openaiApiKey: "Not configured",
-    authToken: "Not configured",
     port: 3000,
     intervals: { issueWorkerMs: 300000, issueRefinerMs: 300000, ciFixerMs: 600000, reviewAddresserMs: 300000, bugInvestigatorMs: 600000, autoMergerMs: 600000 },
-    schedules: { docMaintainerHour: 1, repoStandardsHour: 2, improvementIdentifierHour: 3 },
+    schedules: { repoStandardsHour: 2 },
     logRetentionDays: 14,
     logRetentionPerJob: 20,
     whatsappEnabled: false,
     whatsappAllowedNumbers: [],
+    disabledAgents: [],
+    notifyDashboardActions: true,
   }),
   writeConfig: vi.fn(),
+  getUnknownConfigKeys: vi.fn().mockReturnValue([]),
+  removeConfigKeys: vi.fn(),
   SKIPPED_ITEMS: [],
   PRIORITIZED_ITEMS: [],
   EMAIL_ENABLED: false,
+  NOTIFY_DASHBOARD_ACTIONS: true,
+  SENSITIVE_KEYS: new Set(["slackWebhook", "slackBotToken", "kwyjiboApiKey", "openaiApiKey", "emailAppPassword", "nameyDbUrl"]),
+  DEEP_MERGED_KEYS: new Set(["intervals", "schedules"]),
+  OPENROUTER_API_KEY: "",
+  TOOL_USE_PROVIDER_FALLBACK_ORDER: ["claude"],
+  TEXT_ONLY_PROVIDER_FALLBACK_ORDER: ["opencode"],
+  OIDC_CLIENT_ID: "",
+  OIDC_CLIENT_SECRET: "",
+  OIDC_BASE_URL: "",
+  OIDC_APPLICATION_SLUG: "",
+  OIDC_REDIRECT_URI: "",
+  DISABLED_JOBS_BY_REPO: {},
+  HOME_ASSISTANT_BASE_URL: "",
+  HOME_ASSISTANT_TOKEN: "",
+  FLEET_INFRA_REPO: "St-John-Software/fleet-infra",
+  K3S_MONITOR_ENABLED: false,
+  PROD_K8S_REPO: "St-John-Software/prod-infra",
+  PROD_K8S_MONITOR_ENABLED: false,
+  PROD_K8S_KUBECONFIG_PATH: "",
 }));
 
 vi.mock("./log.js", () => ({
@@ -46,17 +92,34 @@ vi.mock("./version.js", () => ({
 }));
 
 vi.mock("./claude.js", () => ({
-  queueStatus: vi.fn().mockReturnValue({ pending: 2, active: 1 }),
   cancelCurrentTask: vi.fn().mockReturnValue(true),
+  cancelTaskByRunId: vi.fn().mockReturnValue(false),
+  isProviderRateLimited: vi.fn().mockReturnValue(false),
+  getProviderLastUsedAt: vi.fn().mockReturnValue(null),
+  isOpenCodeBinaryAvailable: vi.fn().mockReturnValue(false),
+}));
+
+vi.mock("./worker.js", () => ({
+  workerStatus: vi.fn().mockReturnValue({ workers: 4, running: 1, queued: 2 }),
 }));
 
 vi.mock("./slack.js", () => ({
+  notify: vi.fn(),
   slackStatus: vi.fn().mockReturnValue({ configured: true, lastResult: "ok" }),
   isSlackBotConfigured: vi.fn().mockReturnValue(false),
 }));
 
 vi.mock("./whatsapp.js", () => ({
   whatsappStatus: vi.fn().mockReturnValue({ configured: false, connected: false }),
+  unpair: vi.fn().mockResolvedValue(undefined),
+  isPairing: vi.fn().mockReturnValue(false),
+  startPairing: vi.fn().mockImplementation((listener: (event: { type: string }) => void) => {
+    // Simulate immediate successful connection
+    listener({ type: "connected" });
+    return Promise.resolve();
+  }),
+  stopPairing: vi.fn(),
+  cancelPairing: vi.fn(),
 }));
 
 vi.mock("./jobs/email-monitor.js", () => ({
@@ -68,6 +131,14 @@ vi.mock("./github.js", () => ({
   enrichQueueItemsWithPRStatus: vi.fn().mockResolvedValue(undefined),
   mergePR: vi.fn().mockResolvedValue(undefined),
   removeQueueItem: vi.fn(),
+  listRepos: vi.fn().mockResolvedValue([]),
+  listOpenIssues: vi.fn().mockResolvedValue([]),
+  listPRs: vi.fn().mockResolvedValue([]),
+  listIssuesByLabel: vi.fn().mockResolvedValue([]),
+  addLabel: vi.fn().mockResolvedValue(undefined),
+  removeLabel: vi.fn().mockResolvedValue(undefined),
+  cancelWorkflow: vi.fn().mockResolvedValue(undefined),
+  ALL_QUEUE_CATEGORIES: ["ready", "needs-refinement", "refined", "needs-review-addressing", "auto-mergeable", "needs-triage", "needs-qa", "problematic"],
 }));
 
 vi.mock("./db.js", () => ({
@@ -109,6 +180,19 @@ vi.mock("./db.js", () => ({
   searchRunsByItem: vi.fn().mockReturnValue([]),
   getRunsForIssue: vi.fn().mockReturnValue([]),
   getLogsForRuns: vi.fn().mockReturnValue(new Map()),
+  getAverageTaskDurationMs: vi.fn().mockReturnValue(null),
+  getAllAverageTaskDurations: vi.fn().mockReturnValue({}),
+  getQueueSnapshots: vi.fn().mockReturnValue([]),
+  getLastTaskTimePerRepo: vi.fn().mockReturnValue(new Map()),
+  getRecentTasksForRepo: vi.fn().mockReturnValue([]),
+  getDailyTaskStats: vi.fn().mockReturnValue([]),
+  getLastUsedByProvider: vi.fn().mockReturnValue({ claude: null, codex: null, opencode: null }),
+  getActiveWorkflowRuns: vi.fn().mockReturnValue([]),
+  getWorkflowRunStats: vi.fn().mockReturnValue({ total: 0, succeeded: 0, failed: 0, avgDurationMs: null }),
+  getLastWorkflowRunSync: vi.fn().mockReturnValue(null),
+  getRecentWhatsappEvents: vi.fn().mockReturnValue([]),
+  cancelJobRunIfRunning: vi.fn().mockReturnValue(false),
+  listQueuedWork: vi.fn().mockReturnValue([]),
 }));
 
 import { formatUptime, buildLogsListPage, buildLogDetailPage, buildIssueLogsPage, buildQueuePage } from "./server.js";
@@ -154,6 +238,19 @@ function mockScheduler(): Scheduler {
   };
 }
 
+// Module-level session cookie injected into every request by the helper below.
+// The file-level beforeEach arms it with a valid signed session so the many
+// suites that predate fail-closed auth keep exercising protected routes under
+// OIDC. Auth-specific suites set it to null to opt out.
+let testSessionCookie: string | null = null;
+
+// Mirrors signSession in server.ts so tests can mint valid session cookies.
+function signSession(sub: string, expiresAt: number, secret: string): string {
+  const payload = `${sub}|${expiresAt}`;
+  const hmac = crypto.createHmac("sha256", secret).update(payload).digest("hex");
+  return `${payload}|${hmac}`;
+}
+
 function request(
   server: http.Server,
   method: string,
@@ -170,6 +267,12 @@ function request(
     if (options?.body && !reqHeaders["content-type"]) {
       reqHeaders["content-type"] = "application/x-www-form-urlencoded";
     }
+    if (testSessionCookie) {
+      const existing = reqHeaders["Cookie"] ?? reqHeaders["cookie"];
+      reqHeaders["Cookie"] = existing
+        ? `${existing}; claws_session=${encodeURIComponent(testSessionCookie)}`
+        : `claws_session=${encodeURIComponent(testSessionCookie)}`;
+    }
     const req = http.request(
       { hostname: "127.0.0.1", port: addr.port, path, method, headers: reqHeaders },
       (res) => {
@@ -185,6 +288,26 @@ function request(
     req.end();
   });
 }
+
+// Fail-closed auth: with OIDC unconfigured every authenticated route is denied,
+// so by default we enable OIDC and arm a valid session cookie for all tests.
+// Auth-specific suites override this in their own (later-running) beforeEach.
+const TEST_OIDC_SECRET = "test-oidc-client-secret";
+beforeEach(async () => {
+  const configMod = await import("./config.js");
+  (configMod as Record<string, unknown>).OIDC_CLIENT_ID = "test-client-id";
+  (configMod as Record<string, unknown>).OIDC_CLIENT_SECRET = TEST_OIDC_SECRET;
+  (configMod as Record<string, unknown>).OIDC_BASE_URL = "https://auth.example.com";
+  (configMod as Record<string, unknown>).OIDC_APPLICATION_SLUG = "claws";
+  testSessionCookie = signSession("test-user", Date.now() + 24 * 60 * 60 * 1000, TEST_OIDC_SECRET);
+});
+afterEach(async () => {
+  const configMod = await import("./config.js");
+  for (const k of ["OIDC_CLIENT_ID", "OIDC_CLIENT_SECRET", "OIDC_BASE_URL", "OIDC_APPLICATION_SLUG"]) {
+    (configMod as Record<string, unknown>)[k] = "";
+  }
+  testSessionCookie = null;
+});
 
 describe("formatUptime", () => {
   it("returns '0s' for 0 seconds", () => {
@@ -214,9 +337,11 @@ describe("formatUptime", () => {
 
 describe("HTTP server", () => {
   let server: http.Server;
+  let scheduler: Scheduler;
 
   beforeEach(async () => {
-    server = createServer(mockScheduler());
+    scheduler = mockScheduler();
+    server = createServer(scheduler);
     await new Promise<void>((resolve) => {
       if (server.listening) resolve();
       else server.on("listening", resolve);
@@ -247,9 +372,23 @@ describe("HTTP server", () => {
     expect(body.claudeQueue).toEqual({ pending: 2, active: 1 });
     expect(typeof body.uptime).toBe("number");
     expect(body.slack).toEqual({ configured: true, lastResult: "ok" });
+    expect(body.homeAssistant).toEqual({ configured: false, lastCheck: null, lastError: null });
     expect(body.runningTasks).toEqual([
       { jobName: "issue-worker", repo: "org/repo", itemNumber: 42, startedAt: "2025-01-01 00:00:00" },
     ]);
+    expect(body.queueCategoryCounts).toBeUndefined();
+    expect(body.latestRunStatuses).toBeUndefined();
+  });
+
+  it("GET /status?topology=1 includes topology fields", async () => {
+    const res = await request(server, "GET", "/status?topology=1");
+    expect(res.status).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.status).toBe("ok");
+    expect(body.queueCategoryCounts).toBeDefined();
+    expect(typeof body.queueCategoryCounts).toBe("object");
+    expect(body.latestRunStatuses).toBeDefined();
+    expect(typeof body.latestRunStatuses).toBe("object");
   });
 
   it("GET / returns 200 with HTML and includes Config link", async () => {
@@ -265,6 +404,22 @@ describe("HTTP server", () => {
     expect(res.body).toContain("Connected");
     expect(res.body).not.toContain('http-equiv="refresh"');
     expect(res.body).toContain("fetch('/status')");
+  });
+
+  it("GET /topology returns 200 with SVG topology diagram", async () => {
+    const res = await request(server, "GET", "/topology");
+    expect(res.status).toBe(200);
+    expect(res.headers["content-type"]).toBe("text/html");
+    expect(res.body).toContain("Pipeline Topology");
+    expect(res.body).toContain("<svg");
+    expect(res.body).toContain('href="/topology"');
+    expect(res.body).toContain("issue-dispatcher");
+    expect(res.body).toContain("Planner");
+    expect(res.body).toContain("Implementer");
+    expect(res.body).toContain("CI Fixer");
+    expect(res.body).toContain("Reviewer");
+    expect(res.body).toContain("Merger");
+    expect(res.body).toContain("30000"); // 30s auto-refresh
   });
 
   it("POST /health returns 405", async () => {
@@ -306,7 +461,6 @@ describe("HTTP server", () => {
     expect(res.body).toContain("githubOwners");
     expect(res.body).toContain("Intervals");
     expect(res.body).toContain("Schedules");
-    expect(res.body).toContain("Authentication is disabled");
   });
 
   it("GET /config?saved=1 shows success banner", async () => {
@@ -327,17 +481,59 @@ describe("HTTP server", () => {
   it("POST /config saves values and redirects", async () => {
     const { writeConfig: wc } = await import("./config.js");
     const res = await request(server, "POST", "/config", {
-      body: "selfRepo=new%2Frepo&logRetentionDays=30&interval_issueWorkerMs=10&schedule_docMaintainerHour=3&slackWebhook=&authToken=",
+      body: "selfRepo=new%2Frepo&logRetentionDays=30&interval_issueWorkerMs=10&schedule_repoStandardsHour=3&slackWebhook=&authToken=",
     });
     expect(res.status).toBe(303);
     expect(res.headers.location).toBe("/config?saved=1");
     expect(wc).toHaveBeenCalled();
   });
 
-  it("GET /login redirects to / when auth disabled", async () => {
-    const res = await request(server, "GET", "/login");
+  it("POST /config/remove-unknown-keys removes keys and redirects to /config?saved=1 when keys exist", async () => {
+    const { getUnknownConfigKeys, removeConfigKeys } = await import("./config.js");
+    vi.mocked(getUnknownConfigKeys).mockReturnValue(["oldKey", "legacyKey"]);
+    vi.mocked(removeConfigKeys).mockClear();
+    const res = await request(server, "POST", "/config/remove-unknown-keys");
     expect(res.status).toBe(303);
-    expect(res.headers.location).toBe("/");
+    expect(res.headers.location).toBe("/config?saved=1");
+    expect(removeConfigKeys).toHaveBeenCalledWith(["oldKey", "legacyKey"]);
+    vi.mocked(getUnknownConfigKeys).mockReturnValue([]);
+  });
+
+  it("POST /config/remove-unknown-keys redirects to /config without ?saved=1 when no unknown keys", async () => {
+    const { getUnknownConfigKeys, removeConfigKeys } = await import("./config.js");
+    vi.mocked(getUnknownConfigKeys).mockReturnValue([]);
+    vi.mocked(removeConfigKeys).mockClear();
+    const res = await request(server, "POST", "/config/remove-unknown-keys");
+    expect(res.status).toBe(303);
+    expect(res.headers.location).toBe("/config");
+    expect(removeConfigKeys).not.toHaveBeenCalled();
+  });
+
+  it("POST /config assembles tool-use and text-only fallback orders from per-group params", async () => {
+    const { writeConfig: wc } = await import("./config.js");
+    vi.mocked(wc).mockClear();
+    const res = await request(server, "POST", "/config", {
+      body: "toolUse_primaryProvider=codex&toolUse_fallback_claude=true&textOnly_primaryProvider=opencode&textOnly_fallback_claude=true",
+    });
+    expect(res.status).toBe(303);
+    expect(wc).toHaveBeenCalledWith(expect.objectContaining({
+      toolUseProviderFallbackOrder: ["codex", "claude"],
+      textOnlyProviderFallbackOrder: ["opencode", "claude"],
+    }));
+  });
+
+  it("GET /sessions returns 200 with HTML", async () => {
+    const res = await request(server, "GET", "/sessions");
+    expect(res.status).toBe(200);
+    expect(res.headers["content-type"]).toBe("text/html");
+    expect(res.body).toContain('method="POST" action="/sessions/create"');
+  });
+
+  it("GET /sessions?notice=session-exited returns 200 with HTML (regression test for issue #1281)", async () => {
+    const res = await request(server, "GET", "/sessions?notice=session-exited");
+    expect(res.status).toBe(200);
+    expect(res.headers["content-type"]).toBe("text/html");
+    expect(res.body).toContain('method="POST" action="/sessions/create"');
   });
 
   it("GET / includes Last Run and Next Run columns", async () => {
@@ -376,6 +572,30 @@ describe("HTTP server", () => {
     expect(res.status).toBe(200);
     const body = JSON.parse(res.body);
     expect(body.result).toBe("started");
+  });
+
+  it("POST /trigger/:job returns 404 for unknown job", async () => {
+    scheduler.triggerJob = vi.fn().mockReturnValue("unknown");
+    const res = await request(server, "POST", "/trigger/nonexistent-job");
+    expect(res.status).toBe(404);
+    const body = JSON.parse(res.body);
+    expect(body.result).toBe("unknown");
+  });
+
+  it("POST /trigger/:job returns 409 when already running", async () => {
+    scheduler.triggerJob = vi.fn().mockReturnValue("already-running");
+    const res = await request(server, "POST", "/trigger/issue-worker");
+    expect(res.status).toBe(409);
+    const body = JSON.parse(res.body);
+    expect(body.result).toBe("already-running");
+  });
+
+  it("POST /trigger/:job returns 409 when draining", async () => {
+    scheduler.triggerJob = vi.fn().mockReturnValue("draining");
+    const res = await request(server, "POST", "/trigger/issue-worker");
+    expect(res.status).toBe(409);
+    const body = JSON.parse(res.body);
+    expect(body.result).toBe("draining");
   });
 
   it("POST /cancel returns 200 with cancelled result", async () => {
@@ -495,177 +715,6 @@ describe("HTTP server", () => {
   });
 });
 
-describe("HTTP server with auth", () => {
-  let server: http.Server;
-
-  beforeEach(async () => {
-    // Enable auth by changing the mocked AUTH_TOKEN
-    const configMod = await import("./config.js");
-    (configMod as Record<string, unknown>).AUTH_TOKEN = "test-secret-token";
-    server = createServer(mockScheduler());
-    await new Promise<void>((resolve) => {
-      if (server.listening) resolve();
-      else server.on("listening", resolve);
-    });
-  });
-
-  afterEach(async () => {
-    const configMod = await import("./config.js");
-    (configMod as Record<string, unknown>).AUTH_TOKEN = "";
-    await new Promise<void>((resolve, reject) => {
-      server.close((err) => (err ? reject(err) : resolve()));
-    });
-  });
-
-  it("GET /config returns 401 when no credentials provided", async () => {
-    const res = await request(server, "GET", "/config");
-    expect(res.status).toBe(401);
-  });
-
-  it("GET /config returns 200 with valid Bearer token", async () => {
-    const res = await request(server, "GET", "/config", {
-      headers: { Authorization: "Bearer test-secret-token" },
-    });
-    expect(res.status).toBe(200);
-    expect(res.body).toContain("Save Configuration");
-  });
-
-  it("GET /config returns 200 with valid cookie", async () => {
-    const res = await request(server, "GET", "/config", {
-      headers: { Cookie: "claws_token=test-secret-token" },
-    });
-    expect(res.status).toBe(200);
-    expect(res.body).toContain("Save Configuration");
-  });
-
-  it("GET /config/api returns 401 when no credentials", async () => {
-    const res = await request(server, "GET", "/config/api");
-    expect(res.status).toBe(401);
-  });
-
-  it("POST /trigger/:job requires auth when token configured", async () => {
-    const res = await request(server, "POST", "/trigger/issue-worker");
-    expect(res.status).toBe(401);
-  });
-
-  it("POST /trigger/:job works with valid Bearer token", async () => {
-    const res = await request(server, "POST", "/trigger/issue-worker", {
-      headers: { Authorization: "Bearer test-secret-token" },
-    });
-    expect(res.status).toBe(200);
-  });
-
-  it("POST /pause/:job requires auth when token configured", async () => {
-    const res = await request(server, "POST", "/pause/issue-worker");
-    expect(res.status).toBe(401);
-  });
-
-  it("POST /pause/:job works with valid Bearer token", async () => {
-    const res = await request(server, "POST", "/pause/issue-worker", {
-      headers: { Authorization: "Bearer test-secret-token" },
-    });
-    expect(res.status).toBe(200);
-    const body = JSON.parse(res.body);
-    expect(body.result).toBe("paused");
-  });
-
-  it("POST /cancel requires auth when token configured", async () => {
-    const res = await request(server, "POST", "/cancel");
-    expect(res.status).toBe(401);
-  });
-
-  it("POST /cancel works with valid Bearer token", async () => {
-    const res = await request(server, "POST", "/cancel", {
-      headers: { Authorization: "Bearer test-secret-token" },
-    });
-    expect(res.status).toBe(200);
-    const body = JSON.parse(res.body);
-    expect(body.result).toBe("cancelled");
-  });
-
-  it("GET /login shows login form when auth enabled", async () => {
-    const res = await request(server, "GET", "/login");
-    expect(res.status).toBe(200);
-    expect(res.body).toContain("Login");
-    expect(res.body).toContain("Auth Token");
-  });
-
-  it("POST /login sets cookie on valid token", async () => {
-    const res = await request(server, "POST", "/login", {
-      body: "token=test-secret-token",
-    });
-    expect(res.status).toBe(303);
-    expect(res.headers.location).toBe("/");
-    const cookies = res.headers["set-cookie"];
-    expect(cookies).toBeDefined();
-    expect(cookies!.some(c => c.includes("claws_token="))).toBe(true);
-  });
-
-  it("POST /login shows error on invalid token", async () => {
-    const res = await request(server, "POST", "/login", {
-      body: "token=wrong-token",
-    });
-    expect(res.status).toBe(200);
-    expect(res.body).toContain("Invalid token");
-  });
-
-  it("GET / returns 401 when no credentials provided", async () => {
-    const res = await request(server, "GET", "/");
-    expect(res.status).toBe(401);
-  });
-
-  it("GET /status returns 401 when no credentials provided", async () => {
-    const res = await request(server, "GET", "/status");
-    expect(res.status).toBe(401);
-  });
-
-  it("GET /queue returns 401 when no credentials provided", async () => {
-    const res = await request(server, "GET", "/queue");
-    expect(res.status).toBe(401);
-  });
-
-  it("GET /logs returns 401 when no credentials provided", async () => {
-    const res = await request(server, "GET", "/logs");
-    expect(res.status).toBe(401);
-  });
-
-  it("GET /logs/:runId returns 401 when no credentials provided", async () => {
-    const res = await request(server, "GET", "/logs/abc-123");
-    expect(res.status).toBe(401);
-  });
-
-  it("GET /logs/:runId/tail returns 401 when no credentials provided", async () => {
-    const res = await request(server, "GET", "/logs/abc-123/tail");
-    expect(res.status).toBe(401);
-  });
-
-  it("GET /logs/issue returns 401 when no credentials provided", async () => {
-    const res = await request(server, "GET", "/logs/issue?repo=org/repo&number=1");
-    expect(res.status).toBe(401);
-  });
-
-  it("GET /health returns 200 without credentials (public)", async () => {
-    const res = await request(server, "GET", "/health");
-    expect(res.status).toBe(200);
-    const body = JSON.parse(res.body);
-    expect(body.status).toBe("ok");
-  });
-
-  it("GET / returns 200 with valid Bearer token", async () => {
-    const res = await request(server, "GET", "/", {
-      headers: { Authorization: "Bearer test-secret-token" },
-    });
-    expect(res.status).toBe(200);
-  });
-
-  it("GET /logs returns 200 with valid Bearer token", async () => {
-    const res = await request(server, "GET", "/logs", {
-      headers: { Authorization: "Bearer test-secret-token" },
-    });
-    expect(res.status).toBe(200);
-  });
-});
-
 describe("Theme support", () => {
   let server: http.Server;
 
@@ -739,34 +788,11 @@ describe("Theme support", () => {
   });
 
   it("all pages include theme toggle and setTheme script", async () => {
-    for (const path of ["/", "/logs", "/config", "/queue"]) {
+    for (const path of ["/", "/logs", "/config", "/queue", "/topology"]) {
       const res = await request(server, "GET", path);
       expect(res.status).toBe(200);
       expect(res.body).toContain("theme-select");
       expect(res.body).toContain("setTheme");
-    }
-  });
-
-  it("login page respects theme cookie but has no toggle", async () => {
-    const configMod = await import("./config.js");
-    (configMod as Record<string, unknown>).AUTH_TOKEN = "test-token";
-    const authServer = createServer(mockScheduler());
-    await new Promise<void>((resolve) => {
-      if (authServer.listening) resolve();
-      else authServer.on("listening", resolve);
-    });
-    try {
-      const res = await request(authServer, "GET", "/login", {
-        headers: { Cookie: "claws_theme=light" },
-      });
-      expect(res.status).toBe(200);
-      expect(res.body).toContain('<html lang="en" data-theme="light">');
-      expect(res.body).not.toContain('<select id="theme-select"');
-    } finally {
-      (configMod as Record<string, unknown>).AUTH_TOKEN = "";
-      await new Promise<void>((resolve, reject) => {
-        authServer.close((err) => (err ? reject(err) : resolve()));
-      });
     }
   });
 
@@ -881,7 +907,86 @@ describe("Theme support", () => {
     const html = buildQueuePage(myAttention, empty, "system" as Theme);
     expect(html).toContain("check-fail");
     expect(html).toContain("&#x2718;");
-    expect(html).not.toContain("Squash &amp; Merge");
+    expect(html).toContain("Squash &amp; Merge");
+  });
+
+  it("buildQueuePage shows N/N count when checksPassed/checksTotal present", () => {
+    const myAttention = {
+      items: [
+        { repo: "org/repo", number: 10, title: "Fix bug", category: "ready" as const, updatedAt: "2025-01-01T00:00:00Z", type: "pr" as const, checkStatus: "passing" as const, prNumber: 10, checksPassed: 5, checksTotal: 5 },
+      ],
+      oldestFetchAt: Date.now(),
+    };
+    const empty = { items: [], oldestFetchAt: Date.now() };
+    const html = buildQueuePage(myAttention, empty, "system" as Theme);
+    expect(html).toContain("5/5");
+    expect(html).toContain("check-count");
+  });
+
+  it("buildQueuePage shows type badge for PR items", () => {
+    const myAttention = {
+      items: [
+        { repo: "org/repo", number: 10, title: "Fix bug", category: "ready" as const, updatedAt: "2025-01-01T00:00:00Z", type: "pr" as const },
+      ],
+      oldestFetchAt: Date.now(),
+    };
+    const empty = { items: [], oldestFetchAt: Date.now() };
+    const html = buildQueuePage(myAttention, empty, "system" as Theme);
+    expect(html).toContain(">PR<");
+    expect(html).toContain("type-badge");
+  });
+
+  it("buildQueuePage shows type badge for Issue items without PR", () => {
+    const myAttention = {
+      items: [
+        { repo: "org/repo", number: 10, title: "Fix bug", category: "needs-refinement" as const, updatedAt: "2025-01-01T00:00:00Z", type: "issue" as const },
+      ],
+      oldestFetchAt: Date.now(),
+    };
+    const empty = { items: [], oldestFetchAt: Date.now() };
+    const html = buildQueuePage(myAttention, empty, "system" as Theme);
+    expect(html).toContain(">Issue<");
+    expect(html).toContain("type-badge");
+  });
+
+  it("buildQueuePage shows PR badge for issue items with linked PR", () => {
+    const myAttention = {
+      items: [
+        { repo: "org/repo", number: 10, title: "Fix bug", category: "needs-refinement" as const, updatedAt: "2025-01-01T00:00:00Z", type: "issue" as const, prNumber: 50 },
+      ],
+      oldestFetchAt: Date.now(),
+    };
+    const empty = { items: [], oldestFetchAt: Date.now() };
+    const html = buildQueuePage(myAttention, empty, "system" as Theme);
+    expect(html).toContain(">PR<");
+    expect(html).toContain("type-badge");
+    expect(html).not.toContain(">Issue<");
+  });
+
+  it("buildQueuePage shows clean review status", () => {
+    const myAttention = {
+      items: [
+        { repo: "org/repo", number: 10, title: "Fix bug", category: "ready" as const, updatedAt: "2025-01-01T00:00:00Z", type: "pr" as const, prNumber: 10, reviewStatus: "clean" as const },
+      ],
+      oldestFetchAt: Date.now(),
+    };
+    const empty = { items: [], oldestFetchAt: Date.now() };
+    const html = buildQueuePage(myAttention, empty, "system" as Theme);
+    expect(html).toContain("Reviewed — clean");
+    expect(html).toContain("review-clean");
+  });
+
+  it("buildQueuePage shows N issues found review status", () => {
+    const myAttention = {
+      items: [
+        { repo: "org/repo", number: 10, title: "Fix bug", category: "ready" as const, updatedAt: "2025-01-01T00:00:00Z", type: "pr" as const, prNumber: 10, reviewStatus: "issues" as const, reviewIssueCount: 3 },
+      ],
+      oldestFetchAt: Date.now(),
+    };
+    const empty = { items: [], oldestFetchAt: Date.now() };
+    const html = buildQueuePage(myAttention, empty, "system" as Theme);
+    expect(html).toContain("3 issues found");
+    expect(html).toContain("review-issues");
   });
 
   it("buildQueuePage shows Needs Review Addressing group before Needs Refinement", () => {
@@ -897,6 +1002,55 @@ describe("Theme support", () => {
     const reviewPos = html.indexOf("Needs Review Addressing");
     const refinementPos = html.indexOf("Needs Refinement");
     expect(reviewPos).toBeLessThan(refinementPos);
+  });
+});
+
+describe("POST /queue/refresh", () => {
+  it("calls triggerJob for issue-dispatcher and pr-dispatcher and returns 200 with results", async () => {
+    const sched = mockScheduler();
+    const triggerSpy = vi.fn().mockReturnValue("started");
+    sched.triggerJob = triggerSpy;
+    const s = createServer(sched);
+    await new Promise<void>((resolve) => {
+      if (s.listening) resolve();
+      else s.on("listening", resolve);
+    });
+    try {
+      const res = await request(s, "POST", "/queue/refresh");
+      expect(res.status).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.results).toMatchObject({
+        "issue-dispatcher": "started",
+        "pr-dispatcher": "started",
+      });
+      expect(triggerSpy).toHaveBeenCalledWith("issue-dispatcher");
+      expect(triggerSpy).toHaveBeenCalledWith("pr-dispatcher");
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        s.close((err) => (err ? reject(err) : resolve()));
+      });
+    }
+  });
+
+  it("returns 200 even when triggerJob returns already-running", async () => {
+    const sched = mockScheduler();
+    sched.triggerJob = vi.fn().mockReturnValue("already-running");
+    const s = createServer(sched);
+    await new Promise<void>((resolve) => {
+      if (s.listening) resolve();
+      else s.on("listening", resolve);
+    });
+    try {
+      const res = await request(s, "POST", "/queue/refresh");
+      expect(res.status).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.results["issue-dispatcher"]).toBe("already-running");
+      expect(body.results["pr-dispatcher"]).toBe("already-running");
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        s.close((err) => (err ? reject(err) : resolve()));
+      });
+    }
   });
 });
 
@@ -937,46 +1091,6 @@ describe("POST /queue/merge", () => {
     expect(res.status).toBe(500);
     const body = JSON.parse(res.body);
     expect(body.error).toContain("merge conflict");
-  });
-});
-
-describe("POST /queue/merge with auth", () => {
-  let server: http.Server;
-
-  beforeEach(async () => {
-    const configMod = await import("./config.js");
-    (configMod as Record<string, unknown>).AUTH_TOKEN = "test-secret-token";
-    server = createServer(mockScheduler());
-    await new Promise<void>((resolve) => {
-      if (server.listening) resolve();
-      else server.on("listening", resolve);
-    });
-  });
-
-  afterEach(async () => {
-    const configMod = await import("./config.js");
-    (configMod as Record<string, unknown>).AUTH_TOKEN = "";
-    await new Promise<void>((resolve, reject) => {
-      server.close((err) => (err ? reject(err) : resolve()));
-    });
-  });
-
-  it("returns 401 when no credentials provided", async () => {
-    const res = await request(server, "POST", "/queue/merge", {
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ repo: "org/repo", prNumber: 42 }),
-    });
-    expect(res.status).toBe(401);
-  });
-
-  it("returns 200 with valid Bearer token", async () => {
-    const res = await request(server, "POST", "/queue/merge", {
-      headers: { "content-type": "application/json", Authorization: "Bearer test-secret-token" },
-      body: JSON.stringify({ repo: "org/repo", prNumber: 42 }),
-    });
-    expect(res.status).toBe(200);
-    const body = JSON.parse(res.body);
-    expect(body.result).toBe("merged");
   });
 });
 
@@ -1105,7 +1219,7 @@ describe("Queue page UI features", () => {
     expect(html).toContain("Prioritise");
     expect(html).toContain("Skip");
     expect(html).toContain("skipItem");
-    expect(html).toContain("prioritizeItem");
+    expect(html).toContain("togglePriority");
   });
 
   it("buildQueuePage does not render skip/prioritize buttons for my attention items", () => {
@@ -1267,5 +1381,727 @@ describe("Issue logs page", () => {
     const html = buildLogDetailPage(run, logs, "system" as Theme, tasks as any);
     expect(html).toContain("/logs/issue?repo=org%2Frepo&number=99");
     expect(html).not.toContain("github.com/org/repo/issues/99");
+  });
+});
+
+describe("Dashboard action Slack notifications", () => {
+  let server: http.Server;
+  let notifyFn: ReturnType<typeof vi.fn>;
+
+  beforeEach(async () => {
+    const configMod = await import("./config.js");
+    (configMod as Record<string, unknown>).NOTIFY_DASHBOARD_ACTIONS = true;
+    const slackMod = await import("./slack.js");
+    notifyFn = slackMod.notify as ReturnType<typeof vi.fn>;
+    notifyFn.mockClear();
+    server = createServer(mockScheduler());
+    await new Promise<void>((resolve) => {
+      if (server.listening) resolve();
+      else server.on("listening", resolve);
+    });
+  });
+
+  afterEach(async () => {
+    await new Promise<void>((resolve, reject) => {
+      server.close((err) => (err ? reject(err) : resolve()));
+    });
+  });
+
+  it("sends notification on pause", async () => {
+    await request(server, "POST", "/pause/ci-fixer");
+    expect(notifyFn).toHaveBeenCalledWith(expect.stringContaining('[dashboard] Job "ci-fixer" paused'));
+  });
+
+  it("sends notification on resume", async () => {
+    await request(server, "POST", "/pause/ci-fixer");
+    notifyFn.mockClear();
+    await request(server, "POST", "/pause/ci-fixer");
+    expect(notifyFn).toHaveBeenCalledWith(expect.stringContaining('[dashboard] Job "ci-fixer" resumed'));
+  });
+
+  it("does not send notification for unknown job (404)", async () => {
+    await request(server, "POST", "/pause/nonexistent-job");
+    expect(notifyFn).not.toHaveBeenCalled();
+  });
+
+  it("sends notification on cancel", async () => {
+    await request(server, "POST", "/cancel");
+    expect(notifyFn).toHaveBeenCalledWith(expect.stringContaining("[dashboard] Task cancelled"));
+  });
+
+  it("does not send notification when no active task to cancel", async () => {
+    const { cancelCurrentTask: cancelFn } = await import("./claude.js");
+    (cancelFn as ReturnType<typeof vi.fn>).mockReturnValueOnce(false);
+    await request(server, "POST", "/cancel");
+    expect(notifyFn).not.toHaveBeenCalled();
+  });
+
+  it("sends notification on queue merge", async () => {
+    await request(server, "POST", "/queue/merge", {
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repo: "org/repo", prNumber: 42 }),
+    });
+    expect(notifyFn).toHaveBeenCalledWith(expect.stringContaining("[dashboard] PR org/repo#42 merged"));
+  });
+
+  it("does not send notification when merge fails", async () => {
+    const { mergePR: mergeFn } = await import("./github.js");
+    (mergeFn as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("merge conflict"));
+    await request(server, "POST", "/queue/merge", {
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repo: "org/repo", prNumber: 42 }),
+    });
+    expect(notifyFn).not.toHaveBeenCalled();
+  });
+
+  it("sends notification on queue skip", async () => {
+    await request(server, "POST", "/queue/skip", {
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repo: "org/repo", number: 7 }),
+    });
+    expect(notifyFn).toHaveBeenCalledWith(expect.stringContaining("[dashboard] org/repo#7 skipped"));
+  });
+
+  it("sends notification on queue unskip", async () => {
+    await request(server, "POST", "/queue/unskip", {
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repo: "org/repo", number: 7 }),
+    });
+    expect(notifyFn).toHaveBeenCalledWith(expect.stringContaining("[dashboard] org/repo#7 unskipped"));
+  });
+
+  it("sends notification on queue prioritize", async () => {
+    await request(server, "POST", "/queue/prioritize", {
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repo: "org/repo", number: 7 }),
+    });
+    expect(notifyFn).toHaveBeenCalledWith(expect.stringContaining("[dashboard] org/repo#7 prioritized"));
+  });
+
+  it("sends notification on queue deprioritize", async () => {
+    await request(server, "POST", "/queue/deprioritize", {
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repo: "org/repo", number: 7 }),
+    });
+    expect(notifyFn).toHaveBeenCalledWith(expect.stringContaining("[dashboard] org/repo#7 deprioritized"));
+  });
+
+  it("sends notification on WhatsApp pair success", async () => {
+    const res = await request(server, "GET", "/whatsapp/pair");
+    expect(res.status).toBe(200);
+    expect(notifyFn).toHaveBeenCalledWith(expect.stringContaining("[dashboard] WhatsApp paired"));
+  });
+
+  it("sends notification on WhatsApp unpair", async () => {
+    await request(server, "POST", "/whatsapp/unpair");
+    expect(notifyFn).toHaveBeenCalledWith(expect.stringContaining("[dashboard] WhatsApp unpaired"));
+  });
+
+  it("sends notification on config save with changed fields", async () => {
+    await request(server, "POST", "/config", {
+      body: "logRetentionDays=7&logRetentionPerJob=20&githubOwners=owner1&selfRepo=owner1%2Frepo1&authToken=&notifyDashboardActions=true&enabledAgent_planner=true&enabledAgent_implementer=true&enabledAgent_ci-fixer=true&enabledAgent_review-addresser=true&enabledAgent_reviewer=true&enabledAgent_merger=true",
+    });
+    expect(notifyFn).toHaveBeenCalledWith(expect.stringContaining("[dashboard] Config updated:"));
+    expect(notifyFn).toHaveBeenCalledWith(expect.stringContaining("logRetentionDays"));
+    // Unchanged fields should not appear in the notification
+    expect(notifyFn).not.toHaveBeenCalledWith(expect.stringContaining("selfRepo"));
+  });
+
+  it("does not send notification when NOTIFY_DASHBOARD_ACTIONS is false", async () => {
+    const configMod = await import("./config.js");
+    (configMod as Record<string, unknown>).NOTIFY_DASHBOARD_ACTIONS = false;
+    await request(server, "POST", "/pause/ci-fixer");
+    expect(notifyFn).not.toHaveBeenCalled();
+    await request(server, "POST", "/cancel");
+    expect(notifyFn).not.toHaveBeenCalled();
+    await request(server, "POST", "/queue/skip", {
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repo: "org/repo", number: 7 }),
+    });
+    expect(notifyFn).not.toHaveBeenCalled();
+  });
+
+  it("includes client IP from X-Forwarded-For header", async () => {
+    await request(server, "POST", "/pause/ci-fixer", {
+      headers: { "x-forwarded-for": "192.168.1.100" },
+    });
+    expect(notifyFn).toHaveBeenCalledWith(expect.stringContaining("from 192.168.1.100"));
+  });
+
+  it("GET /repos sorts repos by most recent activity first, inactive repos last (alphabetical)", async () => {
+    const { listRepos: listReposFn } = await import("./github.js");
+    const { getLastTaskTimePerRepo: activityFn } = await import("./db.js");
+    (listReposFn as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      { owner: "org", name: "repo-b", fullName: "org/repo-b" },
+      { owner: "org", name: "repo-a", fullName: "org/repo-a" },
+      { owner: "org", name: "repo-c", fullName: "org/repo-c" },
+    ]);
+    (activityFn as ReturnType<typeof vi.fn>).mockReturnValueOnce(new Map([
+      ["org/repo-a", "2026-01-01 10:00:00"],
+      ["org/repo-c", "2026-01-03 08:00:00"],
+      // repo-b has no recorded activity
+    ]));
+    const res = await request(server, "GET", "/repos");
+    expect(res.status).toBe(200);
+    // repo-c is most recent, then repo-a, then repo-b (no activity)
+    const cIdx = res.body.indexOf("org/repo-c");
+    const aIdx = res.body.indexOf("org/repo-a");
+    const bIdx = res.body.indexOf("org/repo-b");
+    expect(cIdx).toBeLessThan(aIdx);
+    expect(aIdx).toBeLessThan(bIdx);
+  });
+
+  describe("Mark Refined Endpoint", () => {
+    it("POST /queue/mark-refined marks an issue as refined", async () => {
+      const { addLabel, removeQueueItem } = await import("./github.js");
+      const res = await request(
+        server,
+        "POST",
+        "/queue/mark-refined",
+        { body: JSON.stringify({ repo: "test/repo", number: 123 }), headers: { "content-type": "application/json" } },
+      );
+      expect(res.status).toBe(200);
+      expect(res.body).toContain('"result":"ok"');
+      expect(addLabel).toHaveBeenCalledWith("test/repo", 123, "Refined");
+      expect(removeQueueItem).toHaveBeenCalledWith("test/repo", 123);
+    });
+
+    it("POST /queue/mark-refined validates required fields", async () => {
+      const res = await request(
+        server,
+        "POST",
+        "/queue/mark-refined",
+        { body: JSON.stringify({ repo: "test/repo" }), headers: { "content-type": "application/json" } },
+      );
+      expect(res.status).toBe(500);
+      expect(res.body).toContain("Missing repo or number");
+    });
+
+    it("POST /queue/mark-refined handles invalid JSON", async () => {
+      const res = await request(
+        server,
+        "POST",
+        "/queue/mark-refined",
+        { body: "invalid json", headers: { "content-type": "application/json" } },
+      );
+      expect(res.status).toBe(500);
+      expect(res.body).toContain("error");
+    });
+  });
+
+  describe("Problematic PR Endpoints", () => {
+    it("POST /queue/mark-problematic marks a PR as problematic", async () => {
+      const res = await request(
+        server,
+        "POST",
+        "/queue/mark-problematic",
+        { body: JSON.stringify({ repo: "test/repo", number: 123 }), headers: { "content-type": "application/json" } },
+      );
+      expect(res.status).toBe(200);
+      expect(res.body).toContain('"result":"ok"');
+    });
+
+    it("POST /queue/mark-problematic validates required fields", async () => {
+      const res = await request(
+        server,
+        "POST",
+        "/queue/mark-problematic",
+        { body: JSON.stringify({ repo: "test/repo" }), headers: { "content-type": "application/json" } }, // Missing number
+      );
+      expect(res.status).toBe(500);
+      expect(res.body).toContain("Missing repo or number");
+    });
+
+    it("POST /queue/mark-problematic handles invalid JSON", async () => {
+      const res = await request(
+        server,
+        "POST",
+        "/queue/mark-problematic",
+        { body: "invalid json", headers: { "content-type": "application/json" } },
+      );
+      expect(res.status).toBe(500);
+      expect(res.body).toContain("error");
+    });
+
+    it("POST /queue/unmark-problematic unmarks a PR", async () => {
+      const res = await request(
+        server,
+        "POST",
+        "/queue/unmark-problematic",
+        { body: JSON.stringify({ repo: "test/repo", number: 456 }), headers: { "content-type": "application/json" } },
+      );
+      expect(res.status).toBe(200);
+      expect(res.body).toContain('"result":"ok"');
+    });
+
+    it("POST /queue/unmark-problematic validates required fields", async () => {
+      const res = await request(
+        server,
+        "POST",
+        "/queue/unmark-problematic",
+        { body: JSON.stringify({ repo: "test/repo" }), headers: { "content-type": "application/json" } }, // Missing number
+      );
+      expect(res.status).toBe(500);
+      expect(res.body).toContain("Missing repo or number");
+    });
+
+    it("POST /queue/unmark-problematic handles invalid JSON", async () => {
+      const res = await request(
+        server,
+        "POST",
+        "/queue/unmark-problematic",
+        { body: "invalid json", headers: { "content-type": "application/json" } },
+      );
+      expect(res.status).toBe(500);
+      expect(res.body).toContain("error");
+    });
+  });
+});
+
+describe("/runners/cancel endpoint", () => {
+  let server: http.Server;
+
+  beforeEach(async () => {
+    server = createServer(mockScheduler());
+    await new Promise<void>((resolve) => {
+      if (server.listening) resolve();
+      else server.on("listening", resolve);
+    });
+  });
+
+  afterEach(async () => {
+    await new Promise<void>((resolve, reject) => {
+      server.close((err) => (err ? reject(err) : resolve()));
+    });
+  });
+
+  it("POST /runners/cancel returns 200 and calls cancelWorkflow for valid configured repo", async () => {
+    const { listRepos: listReposFn, cancelWorkflow: cancelFn } = await import("./github.js");
+    (listReposFn as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      { owner: "org", name: "repo", fullName: "org/repo" },
+    ]);
+    (cancelFn as ReturnType<typeof vi.fn>).mockClear();
+    
+    const res = await request(server, "POST", "/runners/cancel", {
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repo: "org/repo", runId: "12345" }),
+    });
+    
+    expect(res.status).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.result).toBe("cancelled");
+    expect(cancelFn).toHaveBeenCalledWith("org/repo", "12345");
+  });
+
+  it("POST /runners/cancel returns 403 when repo is not configured", async () => {
+    const { listRepos: listReposFn, cancelWorkflow: cancelFn } = await import("./github.js");
+    (listReposFn as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      { owner: "org", name: "allowed", fullName: "org/allowed" },
+    ]);
+    (cancelFn as ReturnType<typeof vi.fn>).mockClear();
+    
+    const res = await request(server, "POST", "/runners/cancel", {
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repo: "org/unauthorized", runId: "12345" }),
+    });
+    
+    expect(res.status).toBe(403);
+    const body = JSON.parse(res.body);
+    expect(body.error).toContain("Repository not configured");
+    expect(cancelFn).not.toHaveBeenCalled();
+  });
+
+  it("POST /runners/cancel returns 500 when repo is missing", async () => {
+    const res = await request(server, "POST", "/runners/cancel", {
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ runId: "12345" }),
+    });
+    
+    expect(res.status).toBe(500);
+    const body = JSON.parse(res.body);
+    expect(body.error).toContain("Missing repo or runId");
+  });
+
+  it("POST /runners/cancel returns 500 when runId is missing", async () => {
+    const res = await request(server, "POST", "/runners/cancel", {
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repo: "org/repo" }),
+    });
+    
+    expect(res.status).toBe(500);
+    const body = JSON.parse(res.body);
+    expect(body.error).toContain("Missing repo or runId");
+  });
+
+  it("POST /runners/cancel returns 400 when workflow already completed", async () => {
+    const { listRepos: listReposFn, cancelWorkflow: cancelFn } = await import("./github.js");
+    (listReposFn as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      { owner: "org", name: "repo", fullName: "org/repo" },
+    ]);
+    (cancelFn as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("gh run cancel 12345 --repo org/repo failed: Cannot cancel a workflow run that is completed"));
+    
+    const res = await request(server, "POST", "/runners/cancel", {
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repo: "org/repo", runId: "12345" }),
+    });
+    
+    expect(res.status).toBe(400);
+    const body = JSON.parse(res.body);
+    expect(body.error).toBe("Workflow run has already completed");
+  });
+});
+
+describe("HTTP server with OIDC auth", () => {
+  let server: http.Server;
+  const OIDC_SECRET = "test-oidc-client-secret";
+
+  // Mirrors the signSession function in server.ts
+  function signSession(sub: string, expiresAt: number, secret: string): string {
+    const payload = `${sub}|${expiresAt}`;
+    const hmac = crypto.createHmac("sha256", secret).update(payload).digest("hex");
+    return `${payload}|${hmac}`;
+  }
+
+  beforeEach(async () => {
+    const configMod = await import("./config.js");
+    (configMod as Record<string, unknown>).OIDC_CLIENT_ID = "test-client-id";
+    (configMod as Record<string, unknown>).OIDC_CLIENT_SECRET = OIDC_SECRET;
+    (configMod as Record<string, unknown>).OIDC_BASE_URL = "https://auth.example.com";
+    (configMod as Record<string, unknown>).OIDC_APPLICATION_SLUG = "claws";
+    // This suite supplies its own credentials; opt out of the global session injection.
+    testSessionCookie = null;
+    server = createServer(mockScheduler());
+    await new Promise<void>((resolve) => {
+      if (server.listening) resolve();
+      else server.on("listening", resolve);
+    });
+  });
+
+  afterEach(async () => {
+    const configMod = await import("./config.js");
+    (configMod as Record<string, unknown>).OIDC_CLIENT_ID = "";
+    (configMod as Record<string, unknown>).OIDC_CLIENT_SECRET = "";
+    (configMod as Record<string, unknown>).OIDC_BASE_URL = "";
+    (configMod as Record<string, unknown>).OIDC_APPLICATION_SLUG = "";
+    await new Promise<void>((resolve, reject) => {
+      server.close((err) => (err ? reject(err) : resolve()));
+    });
+  });
+
+  it("GET / returns 200 with a valid claws_session cookie", async () => {
+    const expiresAt = Date.now() + 60 * 60 * 1000; // 1 hour from now
+    const sessionValue = signSession("user|with|pipes", expiresAt, OIDC_SECRET);
+    const res = await request(server, "GET", "/", {
+      headers: { Cookie: `claws_session=${encodeURIComponent(sessionValue)}` },
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it("GET / returns 401 with a tampered claws_session cookie", async () => {
+    const expiresAt = Date.now() + 60 * 60 * 1000;
+    const sessionValue = signSession("user123", expiresAt, OIDC_SECRET);
+    // Flip the last character of the HMAC to tamper with it
+    const tampered = sessionValue.slice(0, -1) + (sessionValue.endsWith("a") ? "b" : "a");
+    const res = await request(server, "GET", "/", {
+      headers: { Cookie: `claws_session=${encodeURIComponent(tampered)}` },
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("GET / returns 401 with an expired claws_session cookie", async () => {
+    const expiresAt = Date.now() - 1000; // already expired
+    const sessionValue = signSession("user123", expiresAt, OIDC_SECRET);
+    const res = await request(server, "GET", "/", {
+      headers: { Cookie: `claws_session=${encodeURIComponent(sessionValue)}` },
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("GET / returns 401 with no session cookie in OIDC mode", async () => {
+    const res = await request(server, "GET", "/");
+    expect(res.status).toBe(401);
+  });
+
+  // Regression tests for issue #1326: backslash open-redirect via next= parameter.
+  // These tests complete the full OAuth round-trip so the assertion actually verifies
+  // that the sanitized returnTo value ("/" not "/\evil.example") is used on callback.
+  it("backslash in next= is sanitized: final redirect goes to /", async () => {
+    const loginRes = await request(server, "GET", "/login?next=%2F%5Cevil.example");
+    expect(loginRes.status).toBe(302);
+    const authUrl = new URL(loginRes.headers.location!);
+    const state = authUrl.searchParams.get("state")!;
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ access_token: "tok" }) })
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ sub: "u1", email: "u@example.com" }) }),
+    );
+    const cb = await request(server, "GET", `/auth/callback?state=${state}&code=test`);
+    vi.unstubAllGlobals();
+    expect(cb.headers.location).toBe("/");
+  });
+
+  it("double-slash in next= is sanitized: final redirect goes to /", async () => {
+    const loginRes = await request(server, "GET", "/login?next=%2F%2Fevil.example");
+    expect(loginRes.status).toBe(302);
+    const authUrl = new URL(loginRes.headers.location!);
+    const state = authUrl.searchParams.get("state")!;
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ access_token: "tok" }) })
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ sub: "u1", email: "u@example.com" }) }),
+    );
+    const cb = await request(server, "GET", `/auth/callback?state=${state}&code=test`);
+    vi.unstubAllGlobals();
+    expect(cb.headers.location).toBe("/");
+  });
+
+  it("GET /login?next=/issues/123 redirects to OIDC (benign path accepted)", async () => {
+    const res = await request(server, "GET", "/login?next=%2Fissues%2F123");
+    expect(res.status).toBe(302);
+    const location = res.headers.location ?? "";
+    expect(location).toContain("auth.example.com");
+  });
+
+  it("GET /login authorize URL omits the application slug (Authentik slug-less)", async () => {
+    const res = await request(server, "GET", "/login");
+    expect(res.status).toBe(302);
+    const location = res.headers.location ?? "";
+    expect(location).toContain("/application/o/authorize/");
+    expect(location).not.toContain("/application/o/claws/authorize/");
+    expect(location).toContain("client_id=test-client-id");
+  });
+});
+
+describe("requireApiAuth — MCP token decoupling", () => {
+  let server: http.Server;
+
+  beforeEach(async () => {
+    // This suite exercises the MCP token path with no session present.
+    testSessionCookie = null;
+    server = createServer(mockScheduler());
+    await new Promise<void>((resolve) => {
+      if (server.listening) resolve();
+      else server.on("listening", resolve);
+    });
+  });
+
+  afterEach(async () => {
+    await new Promise<void>((resolve, reject) => {
+      server.close((err) => (err ? reject(err) : resolve()));
+    });
+  });
+
+  it("accepts INTERNAL_MCP_TOKEN on /api/state when no session is present", async () => {
+    const res = await request(server, "GET", "/api/state", {
+      headers: { Authorization: "Bearer test-internal-mcp-token" },
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it("returns 401 on /api/state with wrong token", async () => {
+    const res = await request(server, "GET", "/api/state", {
+      headers: { Authorization: "Bearer wrong-token" },
+    });
+    expect(res.status).toBe(401);
+  });
+});
+
+describe("requireApiAuth — OIDC-only mode", () => {
+  let server: http.Server;
+  const OIDC_SECRET = "test-oidc-client-secret";
+
+  function signSession(sub: string, expiresAt: number, secret: string): string {
+    const payload = `${sub}|${expiresAt}`;
+    const hmac = crypto.createHmac("sha256", secret).update(payload).digest("hex");
+    return `${payload}|${hmac}`;
+  }
+
+  beforeEach(async () => {
+    const configMod = await import("./config.js");
+    (configMod as Record<string, unknown>).OIDC_CLIENT_ID = "test-client-id";
+    (configMod as Record<string, unknown>).OIDC_CLIENT_SECRET = OIDC_SECRET;
+    (configMod as Record<string, unknown>).OIDC_BASE_URL = "https://auth.example.com";
+    (configMod as Record<string, unknown>).OIDC_APPLICATION_SLUG = "claws";
+    // This suite supplies its own credentials; opt out of the global session injection.
+    testSessionCookie = null;
+    server = createServer(mockScheduler());
+    await new Promise<void>((resolve) => {
+      if (server.listening) resolve();
+      else server.on("listening", resolve);
+    });
+  });
+
+  afterEach(async () => {
+    const configMod = await import("./config.js");
+    (configMod as Record<string, unknown>).OIDC_CLIENT_ID = "";
+    (configMod as Record<string, unknown>).OIDC_CLIENT_SECRET = "";
+    (configMod as Record<string, unknown>).OIDC_BASE_URL = "";
+    (configMod as Record<string, unknown>).OIDC_APPLICATION_SLUG = "";
+    await new Promise<void>((resolve, reject) => {
+      server.close((err) => (err ? reject(err) : resolve()));
+    });
+  });
+
+  it("returns 401 on /api/state with no credentials when OIDC is enabled and AUTH_TOKEN is empty", async () => {
+    const res = await request(server, "GET", "/api/state");
+    expect(res.status).toBe(401);
+  });
+
+  it("accepts a valid claws_session cookie on /api/state", async () => {
+    const expiresAt = Date.now() + 60 * 60 * 1000;
+    const sessionValue = signSession("user123", expiresAt, OIDC_SECRET);
+    const res = await request(server, "GET", "/api/state", {
+      headers: { Cookie: `claws_session=${encodeURIComponent(sessionValue)}` },
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it("accepts INTERNAL_MCP_TOKEN on /api/state under OIDC", async () => {
+    const res = await request(server, "GET", "/api/state", {
+      headers: { Authorization: "Bearer test-internal-mcp-token" },
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it("returns 401 on /api/state with a tampered claws_session cookie", async () => {
+    const expiresAt = Date.now() + 60 * 60 * 1000;
+    const sessionValue = signSession("user123", expiresAt, OIDC_SECRET);
+    const tampered = sessionValue.slice(0, -1) + (sessionValue.endsWith("a") ? "b" : "a");
+    const res = await request(server, "GET", "/api/state", {
+      headers: { Cookie: `claws_session=${encodeURIComponent(tampered)}` },
+    });
+    expect(res.status).toBe(401);
+  });
+});
+
+describe("default-deny — every authenticated route returns 401 without credentials", () => {
+  let server: http.Server;
+
+  // Routes that are intentionally public (no auth required).
+  const PUBLIC_ROUTES: Array<[string, string]> = [
+    ["GET", "/health"],
+    ["GET", "/login"],
+    ["GET", "/auth/callback"],
+    ["GET", "/logout"],
+    ["GET", "/static/alpine.js"],
+    ["GET", "/static/tailwind.css"],
+  ];
+
+  // Sample of authenticated routes spanning every group. If a new route is
+  // added without mounting auth middleware, this test will fail.
+  const AUTH_ROUTES: Array<[string, string]> = [
+    // GET pages
+    ["GET", "/"],
+    ["GET", "/status"],
+    ["GET", "/topology"],
+    ["GET", "/ha-upgrader"],
+    ["GET", "/k8s"],
+    ["GET", "/jobs"],
+    ["GET", "/repos"],
+    ["GET", "/repos/owner/name"],
+    ["GET", "/whatsapp"],
+    ["GET", "/whatsapp/events"],
+    ["GET", "/whatsapp/pair"],
+    ["GET", "/sessions"],
+    ["GET", "/sessions/abc"],
+    ["GET", "/sessions/abc/ws"],
+    ["GET", "/config"],
+    ["GET", "/config/api"],
+    ["GET", "/logs"],
+    ["GET", "/logs/issue?repo=org/repo&number=1"],
+    ["GET", "/logs/abc-123"],
+    ["GET", "/logs/abc-123/tail"],
+    ["GET", "/queue"],
+    ["GET", "/runners"],
+    ["GET", "/verify"],
+    ["GET", "/api/activation"],
+    ["GET", "/api/state"],
+    // POSTs
+    ["POST", "/trigger/x"],
+    ["POST", "/pause/x"],
+    ["POST", "/cancel"],
+    ["POST", "/api/verify/run"],
+    ["POST", "/api/client-error"],
+    ["POST", "/api/activation"],
+    ["POST", "/queue/refresh"],
+    ["POST", "/queue/merge"],
+    ["POST", "/queue/skip"],
+    ["POST", "/queue/unskip"],
+    ["POST", "/queue/prioritize"],
+    ["POST", "/queue/deprioritize"],
+    ["POST", "/queue/mark-refined"],
+    ["POST", "/queue/mark-problematic"],
+    ["POST", "/queue/unmark-problematic"],
+    ["POST", "/runners/cancel"],
+    ["POST", "/jobs"],
+    ["POST", "/config/remove-unknown-keys"],
+    ["POST", "/config"],
+    ["POST", "/whatsapp/unpair"],
+    ["POST", "/sessions/create"],
+    ["POST", "/sessions/abc/kill"],
+    ["POST", "/logs/abc-123/cancel"],
+  ];
+
+  beforeEach(async () => {
+    // OIDC is enabled by the global beforeEach; deny everything by sending no session.
+    testSessionCookie = null;
+    server = createServer(mockScheduler());
+    await new Promise<void>((resolve) => {
+      if (server.listening) resolve();
+      else server.on("listening", resolve);
+    });
+  });
+
+  afterEach(async () => {
+    await new Promise<void>((resolve, reject) => {
+      server.close((err) => (err ? reject(err) : resolve()));
+    });
+  });
+
+  it("public routes do not require auth", async () => {
+    for (const [method, path] of PUBLIC_ROUTES) {
+      const res = await request(server, method, path);
+      expect(res.status, `${method} ${path} should be public but got ${res.status}`).not.toBe(401);
+    }
+  });
+
+  it("authenticated routes return 401 without credentials", async () => {
+    for (const [method, path] of AUTH_ROUTES) {
+      const res = await request(server, method, path);
+      expect(res.status, `${method} ${path} should be 401 but got ${res.status}`).toBe(401);
+    }
+  });
+});
+
+describe("fail-closed — no auth when OIDC unconfigured", () => {
+  let server: http.Server;
+
+  beforeEach(async () => {
+    // Clear the OIDC config the global beforeEach armed, and drop the session.
+    const configMod = await import("./config.js");
+    for (const k of ["OIDC_CLIENT_ID", "OIDC_CLIENT_SECRET", "OIDC_BASE_URL", "OIDC_APPLICATION_SLUG"]) {
+      (configMod as Record<string, unknown>)[k] = "";
+    }
+    testSessionCookie = null;
+    server = createServer(mockScheduler());
+    await new Promise<void>((resolve) => {
+      if (server.listening) resolve();
+      else server.on("listening", resolve);
+    });
+  });
+
+  afterEach(async () => {
+    await new Promise<void>((resolve, reject) => {
+      server.close((err) => (err ? reject(err) : resolve()));
+    });
+  });
+
+  it("GET / returns 503 when OIDC is not configured", async () => {
+    const res = await request(server, "GET", "/");
+    expect(res.status).toBe(503);
   });
 });

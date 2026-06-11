@@ -4,6 +4,7 @@ import { mockRepo, mockPR } from "../test-helpers.js";
 vi.mock("../config.js", () => ({
   WORK_DIR: "/home/testuser/.claws",
 }));
+vi.mock("../model-selector.js", () => ({ getModel: () => "sonnet" }));
 
 vi.mock("../log.js", () => ({
   info: vi.fn(),
@@ -15,7 +16,7 @@ vi.mock("../error-reporter.js", () => ({
   reportError: vi.fn(),
 }));
 
-const { mockFs, mockGh, mockClaude, mockDb, mockPlanParser } = vi.hoisted(() => ({
+const { mockFs, mockGh, mockClaude, mockDb, mockPlanParser, mockSlack } = vi.hoisted(() => ({
   mockFs: {
     existsSync: vi.fn(),
     mkdirSync: vi.fn(),
@@ -29,8 +30,7 @@ const { mockFs, mockGh, mockClaude, mockDb, mockPlanParser } = vi.hoisted(() => 
     getIssueComments: vi.fn(),
   },
   mockClaude: {
-    createWorktree: vi.fn(),
-    removeWorktree: vi.fn(),
+    withNewWorktree: vi.fn(),
     enqueue: vi.fn(),
     runClaude: vi.fn(),
     hasNewCommits: vi.fn(),
@@ -42,15 +42,32 @@ const { mockFs, mockGh, mockClaude, mockDb, mockPlanParser } = vi.hoisted(() => 
     randomSuffix: vi.fn().mockReturnValue("ab12"),
     datestamp: vi.fn().mockReturnValue("20260318"),
     git: vi.fn(),
+    getCommitCount: vi.fn().mockResolvedValue(1),
+    getDiffStats: vi.fn().mockResolvedValue({ filesChanged: 1, insertions: 10, deletions: 5 }),
   },
   mockDb: {
     recordTaskStart: vi.fn().mockReturnValue(1),
     updateTaskWorktree: vi.fn(),
+    updateTaskModel: vi.fn(),
+    updateTaskTokenUsage: vi.fn(),
     recordTaskComplete: vi.fn(),
     recordTaskFailed: vi.fn(),
+    markRepoProcessedDaily: vi.fn(),
+    withTaskRecording: vi.fn(async (jobName: string, repo: string, itemNumber: number, triggerLabel: string | null, fn: (taskId: number) => Promise<unknown>) => {
+      const taskId = mockDb.recordTaskStart(jobName, repo, itemNumber, triggerLabel);
+      try {
+        return await fn(taskId);
+      } catch (err) {
+        mockDb.recordTaskFailed(taskId, String(err), { failureCategory: "unknown" });
+        throw err;
+      }
+    }),
   },
   mockPlanParser: {
     findPlanComment: vi.fn(),
+  },
+  mockSlack: {
+    notify: vi.fn(),
   },
 }));
 
@@ -58,7 +75,9 @@ vi.mock("node:fs", () => ({ default: mockFs }));
 vi.mock("../github.js", () => mockGh);
 vi.mock("../claude.js", () => mockClaude);
 vi.mock("../db.js", () => mockDb);
+vi.mock("../smart-schedule.js", () => ({ localDateString: () => "2024-01-15" }));
 vi.mock("../plan-parser.js", () => mockPlanParser);
+vi.mock("../slack.js", () => mockSlack);
 
 import { run } from "./doc-maintainer.js";
 import { reportError } from "../error-reporter.js";
@@ -73,12 +92,11 @@ describe("doc-maintainer", () => {
     mockGh.createPR.mockResolvedValue(100);
     mockGh.listRecentlyClosedIssues.mockResolvedValue([]);
     mockGh.getIssueComments.mockResolvedValue([]);
-    mockClaude.createWorktree.mockResolvedValue("/tmp/worktree");
+    mockClaude.withNewWorktree.mockImplementation(async (_r: unknown, _b: unknown, _n: unknown, fn: (p: string) => Promise<unknown>) => fn("/tmp/worktree"));
     mockClaude.enqueue.mockImplementation((fn: () => Promise<string>) => fn());
     mockClaude.runClaude.mockResolvedValue("docs generated");
     mockClaude.hasNewCommits.mockResolvedValue(true);
     mockClaude.pushBranch.mockResolvedValue(undefined);
-    mockClaude.removeWorktree.mockResolvedValue(undefined);
     mockClaude.getHeadSha.mockResolvedValue("abc123");
     mockClaude.getLastDocMaintainerSha.mockResolvedValue(null);
     mockClaude.getCommitDate.mockResolvedValue(new Date("2025-01-01"));
@@ -93,7 +111,7 @@ describe("doc-maintainer", () => {
     await run([repo]);
 
     expect(mockGh.listPRs).not.toHaveBeenCalled();
-    expect(mockClaude.createWorktree).not.toHaveBeenCalled();
+    expect(mockClaude.withNewWorktree).not.toHaveBeenCalled();
   });
 
   it("skips repo when open docs PR already exists", async () => {
@@ -102,7 +120,7 @@ describe("doc-maintainer", () => {
 
     await run([repo]);
 
-    expect(mockClaude.createWorktree).not.toHaveBeenCalled();
+    expect(mockClaude.withNewWorktree).not.toHaveBeenCalled();
   });
 
   it("skips repo when HEAD matches last doc-maintainer commit", async () => {
@@ -112,7 +130,7 @@ describe("doc-maintainer", () => {
     await run([repo]);
 
     expect(mockClaude.runClaude).not.toHaveBeenCalled();
-    expect(mockDb.recordTaskComplete).toHaveBeenCalledWith(1);
+    expect(mockDb.recordTaskComplete).toHaveBeenCalledWith(1, expect.any(Object));
   });
 
   it("creates docs PR when no previous doc-maintainer commit exists", async () => {
@@ -123,10 +141,12 @@ describe("doc-maintainer", () => {
     expect(mockClaude.runClaude).toHaveBeenCalledWith(
       expect.stringContaining("maintaining documentation"),
       "/tmp/worktree",
+      expect.objectContaining({ model: "sonnet" }),
     );
     expect(mockClaude.generateDocsPRDescription).toHaveBeenCalledWith(
       "/tmp/worktree",
       repo.defaultBranch,
+      expect.any(String),
     );
     expect(mockGh.createPR).toHaveBeenCalledWith(
       repo.fullName,
@@ -134,7 +154,7 @@ describe("doc-maintainer", () => {
       expect.stringContaining("update documentation"),
       "## Summary\nUpdated docs",
     );
-    expect(mockDb.recordTaskComplete).toHaveBeenCalledWith(1);
+    expect(mockDb.recordTaskComplete).toHaveBeenCalledWith(1, expect.any(Object));
   });
 
   it("creates docs PR when HEAD differs from last doc-maintainer commit", async () => {
@@ -162,8 +182,8 @@ describe("doc-maintainer", () => {
 
     await run([repo]);
 
-    expect(mockClaude.removeWorktree).toHaveBeenCalled();
-    expect(mockDb.recordTaskFailed).toHaveBeenCalledWith(1, expect.stringContaining("claude crashed"));
+    expect(mockClaude.withNewWorktree).toHaveBeenCalledTimes(1);
+    expect(mockDb.recordTaskFailed).toHaveBeenCalledWith(1, expect.stringContaining("claude crashed"), expect.any(Object));
   });
 
   it("reports errors without crashing the loop", async () => {
@@ -210,6 +230,7 @@ describe("doc-maintainer", () => {
       expect(mockClaude.runClaude).toHaveBeenCalledWith(
         expect.stringContaining(".plans/"),
         "/tmp/worktree",
+        expect.objectContaining({ model: "sonnet" }),
       );
     });
 
@@ -255,6 +276,7 @@ describe("doc-maintainer", () => {
       expect(mockClaude.runClaude).toHaveBeenCalledWith(
         expect.not.stringContaining(".plans/"),
         "/tmp/worktree",
+        expect.objectContaining({ model: "sonnet" }),
       );
     });
 
@@ -290,6 +312,81 @@ describe("doc-maintainer", () => {
 
       // Should write exactly 10 plan files (the cap)
       expect(mockFs.writeFileSync).toHaveBeenCalledTimes(10);
+    });
+  });
+
+  it("marks repo processed after run", async () => {
+    await run([repo]);
+    expect(mockDb.markRepoProcessedDaily).toHaveBeenCalledWith(
+      "doc-maintainer", repo.fullName, "2024-01-15"
+    );
+  });
+
+  describe("slack summary", () => {
+    it("posts summary when a PR is created", async () => {
+      await run([repo]);
+
+      expect(mockSlack.notify).toHaveBeenCalledTimes(1);
+      expect(mockSlack.notify).toHaveBeenCalledWith(expect.stringContaining("1 PR opened"));
+      expect(mockSlack.notify).toHaveBeenCalledWith(expect.stringContaining("test-org/test-repo"));
+    });
+
+    it("includes plan titles as features covered", async () => {
+      mockGh.listRecentlyClosedIssues.mockResolvedValue([
+        { number: 42, title: "Add auth", body: "body", closedAt: "2025-01-15T00:00:00Z" },
+      ]);
+      mockGh.getIssueComments.mockResolvedValue([
+        { id: 1, body: "## Implementation Plan\nDo the thing", login: "bot" },
+      ]);
+      mockPlanParser.findPlanComment.mockReturnValue("## Implementation Plan\nDo the thing");
+
+      await run([repo]);
+
+      expect(mockSlack.notify).toHaveBeenCalledWith(expect.stringContaining("features:"));
+      expect(mockSlack.notify).toHaveBeenCalledWith(expect.stringContaining("Add auth"));
+    });
+
+    it("posts summary when Claude produces no commits", async () => {
+      mockClaude.hasNewCommits.mockResolvedValue(false);
+
+      await run([repo]);
+
+      expect(mockSlack.notify).toHaveBeenCalledTimes(1);
+      expect(mockSlack.notify).toHaveBeenCalledWith(expect.stringContaining("No-op"));
+    });
+
+    it("does not post summary when all repos lack a local clone", async () => {
+      mockFs.existsSync.mockReturnValue(false);
+
+      await run([repo]);
+
+      expect(mockSlack.notify).not.toHaveBeenCalled();
+    });
+
+    it("does not post summary when all repos are skipped-no-changes", async () => {
+      mockClaude.getHeadSha.mockResolvedValue("abc123");
+      mockClaude.getLastDocMaintainerSha.mockResolvedValue("abc123");
+
+      await run([repo]);
+
+      expect(mockSlack.notify).not.toHaveBeenCalled();
+    });
+
+    it("does not post summary when all repos are skipped-has-pr", async () => {
+      mockGh.listPRs.mockResolvedValue([mockPR({ headRefName: "claws/docs-ab12" })]);
+
+      await run([repo]);
+
+      expect(mockSlack.notify).not.toHaveBeenCalled();
+    });
+
+    it("posts summary when errors occur", async () => {
+      mockClaude.runClaude.mockRejectedValue(new Error("claude crashed"));
+
+      await run([repo]);
+
+      expect(mockSlack.notify).toHaveBeenCalledTimes(1);
+      expect(mockSlack.notify).toHaveBeenCalledWith(expect.stringContaining("Errors:"));
     });
   });
 });

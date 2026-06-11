@@ -4,6 +4,10 @@ import * as claude from "../claude.js";
 import * as log from "../log.js";
 import * as db from "../db.js";
 import { reportError } from "../error-reporter.js";
+import { getItemTimeoutMs, handleTimeoutIfApplicable } from "../timeout-handler.js";
+import { guardContent } from "../prompt-guard.js";
+import { getModel } from "../model-selector.js";
+import { classifyComplexity } from "../classify-complexity.js";
 
 export const REPORT_HEADER = "## Claws Error Investigation Report";
 
@@ -195,25 +199,30 @@ export function buildInvestigationPrompt(
   issue: gh.Issue,
   errorDetails: ClawsErrorDetails,
   otherIssues: gh.Issue[],
+  repo: string,
 ): string {
+  const guardCtx = (source: string, itemNumber: number) => ({ repo, source, itemNumber });
   const sections: string[] = [
     `You are investigating an internal Claws error.`,
     ``,
     `## Error Details`,
     ``,
-    `**Issue #${issue.number}: ${issue.title}**`,
-    `**Fingerprint:** \`${errorDetails.fingerprint}\``,
-    `**Context:** ${errorDetails.context}`,
-    `**Timestamp:** ${errorDetails.timestamp}`,
+    `**Issue #${issue.number}: ${guardContent(issue.title, guardCtx("issue-title", issue.number))}**`,
+    // Guard parsed errorDetails fields individually (belt-and-suspenders): these are
+    // substrings of issue.body, which is also guarded below. Guarding both catches
+    // injection that might survive parser extraction and covers the full body too.
+    `**Fingerprint:** \`${guardContent(errorDetails.fingerprint, guardCtx("error-fingerprint", issue.number))}\``,
+    `**Context:** ${guardContent(errorDetails.context, guardCtx("error-context", issue.number))}`,
+    `**Timestamp:** ${guardContent(errorDetails.timestamp, guardCtx("error-timestamp", issue.number))}`,
     ``,
     `### Stack Trace / Error`,
     `\`\`\``,
-    errorDetails.errorText,
+    guardContent(errorDetails.errorText, guardCtx("error-text", issue.number)),
     `\`\`\``,
     ``,
     `### Full Issue Body`,
     ``,
-    issue.body,
+    guardContent(issue.body, guardCtx("issue-body", issue.number)),
     ``,
     `## Instructions`,
     ``,
@@ -242,8 +251,9 @@ export function buildInvestigationPrompt(
     sections.push(`## Other Open Error Issues`);
     sections.push(``);
     for (const other of otherIssues) {
-      const truncBody = other.body.length > 500 ? other.body.slice(0, 500) + "..." : other.body;
-      sections.push(`### #${other.number}: ${other.title}`);
+      const guardedBody = guardContent(other.body, guardCtx("issue-body", other.number));
+      const truncBody = guardedBody.length > 500 ? guardedBody.slice(0, 500) + "..." : guardedBody;
+      sections.push(`### #${other.number}: ${guardContent(other.title, guardCtx("issue-title", other.number))}`);
       sections.push(truncBody);
       sections.push(``);
     }
@@ -283,6 +293,10 @@ export function parseRelatedIssues(output: string): number[] {
     .filter((n) => !isNaN(n));
 }
 
+export function isReportTruncated(output: string): boolean {
+  return !/RELATED_ISSUES:\s*\S+/.test(output);
+}
+
 async function processIssue(
   repo: string,
   selfRepo: Repo,
@@ -291,42 +305,71 @@ async function processIssue(
 ): Promise<void> {
   log.info(`[triage-claws-errors] Investigating ${repo}#${issue.number}: ${issue.title}`);
 
-  const taskId = db.recordTaskStart("triage-claws-errors", repo, issue.number, null);
-  let wtPath: string | undefined;
+  const branchName = `claws/investigate-error-${issue.number}-${claude.randomSuffix()}`;
 
-  try {
-    const branchName = `claws/investigate-error-${issue.number}-${claude.randomSuffix()}`;
-    wtPath = await claude.createWorktree(selfRepo, branchName, "triage-claws-errors");
-    db.updateTaskWorktree(taskId, wtPath, branchName);
+  await db.withTaskRecording("triage-claws-errors", repo, issue.number, null, async (taskId) => {
+    await claude.withNewWorktree(selfRepo, branchName, "triage-claws-errors", async (wtPath) => {
+      db.updateTaskWorktree(taskId, wtPath, branchName);
 
-    const errorDetails = parseClawsError(issue.body);
-    const prompt = buildInvestigationPrompt(issue, errorDetails, otherIssues);
-    const output = await claude.enqueue(() => claude.runClaude(prompt, wtPath!), gh.hasPriorityLabel(issue.labels));
+      const errorDetails = parseClawsError(issue.body);
+      const prompt = buildInvestigationPrompt(issue, errorDetails, otherIssues, repo);
+      const mcpConfigPath = claude.writeClawsMcpConfig(wtPath);
+      const timeoutMs = getItemTimeoutMs(repo, issue.number);
+      const tier = await classifyComplexity(
+        [
+          `Claws internal error investigation for issue #${issue.number}.`,
+          `Error title: ${issue.title}`,
+          `Fingerprint: ${errorDetails.fingerprint}`,
+          `Error (first 2000 chars):`,
+          errorDetails.errorText.slice(0, 2000),
+        ].join("\n"),
+        wtPath,
+      );
+      const model = getModel(tier, "tool-use", "claude");
+      db.updateTaskModel(taskId, model);
+      log.info(`[triage-claws-errors] Using model "${model}" for ${repo}#${issue.number}`);
+      // Two possible runClaude calls (retry on truncation) — accumulate before writing.
+      let taskTokensUsed: number | undefined;
+      let taskCostUsd: number | undefined;
+      const accumulateUsage = (t: number, c: number) => {
+        taskTokensUsed = (taskTokensUsed ?? 0) + t;
+        taskCostUsd = (taskCostUsd ?? 0) + c;
+      };
+      let output = await claude.runClaude(prompt, wtPath, { capability: "tool-use", mcpConfig: mcpConfigPath, timeoutMs, tier, model, agent: "plan", onTokensUsed: accumulateUsage });
 
-    if (output.trim()) {
-      const relatedNumbers = parseRelatedIssues(output);
-
-      const reportBody = output.replace(/\nRELATED_ISSUES:.*$/m, "").trim();
-      await gh.commentOnIssue(repo, issue.number, `${REPORT_HEADER}\n\n${reportBody}`);
-      log.info(`[triage-claws-errors] Posted investigation report for ${repo}#${issue.number}`);
-
-      if (relatedNumbers.length > 0) {
-        await deduplicateByInvestigation(repo, issue, relatedNumbers);
-        log.info(`[triage-claws-errors] Phase 2 dedup closed ${relatedNumbers.length} related issue(s)`);
+      if (output.trim() && isReportTruncated(output)) {
+        log.warn(`[triage-claws-errors] Investigation output appears truncated for ${repo}#${issue.number} (missing RELATED_ISSUES marker, ${output.length} chars) — retrying once`);
+        output = await claude.runClaude(prompt, wtPath, { capability: "tool-use", mcpConfig: mcpConfigPath, timeoutMs, tier, model, agent: "plan", onTokensUsed: accumulateUsage });
       }
-    } else {
-      log.warn(`[triage-claws-errors] Empty investigation output for ${repo}#${issue.number}`);
-    }
 
-    db.recordTaskComplete(taskId);
-  } catch (err) {
-    db.recordTaskFailed(taskId, String(err));
-    throw err;
-  } finally {
-    if (wtPath) {
-      await claude.removeWorktree(selfRepo, wtPath);
-    }
-  }
+      if (taskTokensUsed !== undefined && taskCostUsd !== undefined) {
+        db.updateTaskTokenUsage(taskId, taskTokensUsed, taskCostUsd);
+      }
+
+      if (output.trim() && isReportTruncated(output)) {
+        log.warn(`[triage-claws-errors] Investigation output still truncated after retry for ${repo}#${issue.number} (${output.length} chars) — skipping report; will retry next cycle`);
+        db.recordTaskComplete(taskId, { commits: 0 });
+        return;
+      }
+
+      if (output.trim()) {
+        const relatedNumbers = parseRelatedIssues(output);
+
+        const reportBody = output.replace(/\nRELATED_ISSUES:.*$/m, "").trim();
+        await gh.commentOnIssue(repo, issue.number, `${REPORT_HEADER}\n\n${reportBody}`);
+        log.info(`[triage-claws-errors] Posted investigation report for ${repo}#${issue.number}`);
+
+        if (relatedNumbers.length > 0) {
+          await deduplicateByInvestigation(repo, issue, relatedNumbers);
+          log.info(`[triage-claws-errors] Phase 2 dedup closed ${relatedNumbers.length} related issue(s)`);
+        }
+      } else {
+        log.warn(`[triage-claws-errors] Empty investigation output for ${repo}#${issue.number}`);
+      }
+
+      db.recordTaskComplete(taskId, { commits: 0 });
+    });
+  });
 }
 
 export async function run(repos: Repo[]): Promise<void> {
@@ -343,10 +386,15 @@ export async function run(repos: Repo[]): Promise<void> {
     const uninvestigated: gh.Issue[] = [];
     for (const issue of clawsErrorIssues) {
       if (gh.isItemSkipped(repo, issue.number)) continue;
+      if (gh.hasIgnoreLabel(issue.labels)) continue;
+      if (!await gh.isAllowedActor(issue.author.login)) {
+        log.info(`[triage-claws-errors] Skipping issue #${issue.number} from non-allowed actor @${issue.author.login}`);
+        continue;
+      }
       const comments = await gh.getIssueComments(repo, issue.number);
       const hasReport = comments.some((c) => c.body.includes(REPORT_HEADER));
       if (!hasReport) {
-        gh.populateQueueCache("needs-triage", repo, { number: issue.number, title: issue.title, type: "issue", updatedAt: issue.updatedAt, priority: gh.hasPriorityLabel(issue.labels) });
+        gh.populateQueueCache("needs-triage", repo, { number: issue.number, title: issue.title, type: "issue", updatedAt: issue.updatedAt, priority: gh.hasPriorityLabel(issue.labels), labels: issue.labels.map((l) => l.name) });
         uninvestigated.push(issue);
       }
     }
@@ -361,8 +409,9 @@ export async function run(repos: Repo[]): Promise<void> {
 
     const tasks = canonical.map((issue, i) => {
       const others = canonical.filter((_, j) => j !== i);
-      return processIssue(repo, selfRepo, issue, others).catch((err) => {
-        reportError("triage-claws-errors:process-issue", `${repo}#${issue.number}`, err);
+      return processIssue(repo, selfRepo, issue, others).catch(async (err) => {
+        await handleTimeoutIfApplicable("triage-claws-errors", repo, issue.number, err);
+        await reportError("triage-claws-errors:process-issue", `${repo}#${issue.number}`, err);
       });
     });
     await Promise.allSettled(tasks);

@@ -1,4 +1,19 @@
+import type { QueueCategory } from "../github.js";
+import * as config from "../config.js";
+import { ERROR_HANDLER_SCRIPT } from "../resources/error-handler.generated.js";
+
 export type Theme = "dark" | "light" | "system";
+
+export const CATEGORY_DISPLAY: Record<QueueCategory, { label: string; color: string }> = {
+  "ready": { label: "Ready", color: "0e8a16" },
+  "needs-refinement": { label: "Needs Refinement", color: "d876e3" },
+  "refined": { label: "Refined", color: "0075ca" },
+  "needs-review-addressing": { label: "Needs Review Addressing", color: "e4e669" },
+  "auto-mergeable": { label: "Auto-Mergeable", color: "0e8a16" },
+  "needs-triage": { label: "Needs Triage", color: "d73a49" },
+  "needs-qa": { label: "Needs QA", color: "1d76db" },
+  "problematic": { label: "Problematic", color: "d73a4a" },
+};
 
 const LIGHT_THEME_VARS = `
     --bg: #ffffff;
@@ -53,48 +68,65 @@ export const PAGE_CSS = `
     }
     [data-theme="light"] {${LIGHT_THEME_VARS}
     }
-    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html { color-scheme: light dark; }
     body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       background: var(--bg);
       color: var(--text);
-      padding: 2rem;
-      max-width: 800px;
+      padding: 1rem;
+      max-width: 1024px;
       margin: 0 auto;
       min-height: 100vh;
       min-height: 100dvh;
     }
-    h1 { color: var(--accent); margin-bottom: 1.5rem; font-size: 1.5rem; }
-    h2 { color: var(--text-secondary); margin: 1.5rem 0 0.75rem; font-size: 1.1rem; }
+    @media (min-width: 768px) {
+      body { padding: 2rem; }
+    }
+    h1 { color: var(--accent); margin-bottom: 1rem; font-size: 1.35rem; font-weight: 700; }
+    h2 { color: var(--text-secondary); margin: 1.25rem 0 0.6rem; font-size: 1rem; font-weight: 600; }
+    @media (min-width: 768px) {
+      h1 { font-size: 1.5rem; margin-bottom: 1.5rem; }
+      h2 { font-size: 1.1rem; margin: 1.5rem 0 0.75rem; }
+    }
     a { color: var(--accent); text-decoration: none; }
     a:hover { text-decoration: underline; }
-    nav { margin-bottom: 1.5rem; font-size: 0.9rem; display: flex; align-items: center; gap: 1rem; }
+    nav {
+      margin-bottom: 1.25rem;
+      font-size: 0.85rem;
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 0.25rem 0.75rem;
+    }
+    nav a { padding: 0.3rem 0.1rem; }
+    @media (min-width: 768px) {
+      nav { font-size: 0.9rem; gap: 0.5rem 1rem; margin-bottom: 1.5rem; }
+    }
     .meta {
       display: grid;
       grid-template-columns: auto 1fr;
       gap: 0.5rem 1rem;
-      margin-bottom: 1.5rem;
-      font-size: 0.9rem;
+      margin-bottom: 1.25rem;
+      font-size: 0.875rem;
     }
     .meta dt { color: var(--text-secondary); }
-    .meta dd { color: var(--text); }
+    .meta dd { color: var(--text); min-width: 0; overflow-wrap: anywhere; }
+    .table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
     table {
       width: 100%;
       border-collapse: collapse;
-      font-size: 0.9rem;
+      font-size: 0.875rem;
     }
     th {
       text-align: left;
       color: var(--text-secondary);
       border-bottom: 1px solid var(--border);
       padding: 0.5rem 0.5rem 0.5rem 0;
+      white-space: nowrap;
     }
     td {
       padding: 0.5rem 0.5rem 0.5rem 0;
       border-bottom: 1px solid var(--border);
-    }
-    @media (max-width: 600px) {
-      body { padding: 1rem; }
     }
     .running {
       color: var(--success);
@@ -145,21 +177,24 @@ export const PAGE_CSS = `
       color: var(--accent);
       border: 1px solid var(--border-hover);
       border-radius: 4px;
-      padding: 0.25rem 0.75rem;
+      padding: 0.35rem 0.75rem;
       cursor: pointer;
       font-size: 0.8rem;
+      min-height: 30px;
     }
     .trigger-btn:hover { background: var(--btn-hover); }
     .trigger-btn:disabled { opacity: 0.6; cursor: default; }
+    .btn-danger { background: var(--danger); color: #fff; border: none; padding: 0.4rem 1rem; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
+    .btn-danger:hover { opacity: 0.85; }
+    .btn-danger:disabled { opacity: 0.5; cursor: default; }
     .status-completed { color: var(--success); }
     .status-failed { color: var(--danger); }
     .status-running { color: var(--warning); }
-    .filter-bar { margin-bottom: 1rem; }
+    .status-cancelled { color: var(--text-secondary); }
+    .filter-bar { margin-bottom: 1rem; display: flex; flex-wrap: wrap; gap: 0.3rem; }
     .filter-bar a {
       display: inline-block;
-      padding: 0.25rem 0.6rem;
-      margin-right: 0.4rem;
-      margin-bottom: 0.4rem;
+      padding: 0.3rem 0.6rem;
       border: 1px solid var(--border-hover);
       border-radius: 4px;
       font-size: 0.8rem;
@@ -188,20 +223,20 @@ export const PAGE_CSS = `
       background: var(--btn-bg);
       border-color: var(--accent);
     }
-    .search-bar { margin-bottom: 0.75rem; display: flex; gap: 0.5rem; }
+    .search-bar { margin-bottom: 0.75rem; display: flex; flex-wrap: wrap; gap: 0.5rem; }
     .search-bar input {
-      padding: 0.35rem 0.6rem; border: 1px solid var(--border); border-radius: 4px;
-      background: var(--bg); color: var(--text); font-size: 0.85rem; flex: 1; max-width: 320px;
+      padding: 0.4rem 0.6rem; border: 1px solid var(--border); border-radius: 4px;
+      background: var(--bg); color: var(--text); font-size: 0.875rem; flex: 1; min-width: 0; max-width: 320px;
     }
     .search-bar button {
-      padding: 0.35rem 0.75rem; border: 1px solid var(--border); border-radius: 4px;
-      background: var(--btn-bg); color: var(--text); cursor: pointer; font-size: 0.85rem;
+      padding: 0.4rem 0.75rem; border: 1px solid var(--border); border-radius: 4px;
+      background: var(--btn-bg); color: var(--text); cursor: pointer; font-size: 0.875rem; min-height: 32px;
     }
     .search-bar button:hover { background: var(--btn-hover); }
     .recent-items { margin-bottom: 0.5rem; display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; }
     .recent-label { font-size: 0.8rem; color: var(--text-secondary); }
     .recent-item-btn {
-      display: inline-block; padding: 0.2rem 0.5rem; border-radius: 12px;
+      display: inline-block; padding: 0.25rem 0.55rem; border-radius: 12px;
       font-size: 0.75rem; text-decoration: none; color: var(--text);
       border: 1px solid var(--border); background: var(--bg-secondary);
     }
@@ -241,20 +276,23 @@ export const PAGE_CSS = `
     }
     .config-form input[type="text"],
     .config-form input[type="number"],
-    .config-form input[type="password"] {
+    .config-form input[type="password"],
+    .config-form textarea {
       width: 100%;
       background: var(--bg-secondary);
       border: 1px solid var(--border-hover);
       border-radius: 4px;
       color: var(--text);
-      padding: 0.4rem 0.6rem;
+      padding: 0.5rem 0.7rem;
       font-size: 0.9rem;
+      font-family: inherit;
     }
-    .config-form input:disabled {
+    .config-form textarea { font-family: "SFMono-Regular", Consolas, Menlo, monospace; font-size: 0.8rem; }
+    .config-form input:disabled, .config-form textarea:disabled {
       opacity: 0.5;
       cursor: not-allowed;
     }
-    .config-form input[type="checkbox"] {
+    .config-form input[type="checkbox"], .config-form input[type="radio"] {
       width: auto;
       margin-right: 0.5rem;
     }
@@ -268,15 +306,23 @@ export const PAGE_CSS = `
       color: var(--warning);
       margin-top: 0.15rem;
     }
+    .config-form fieldset {
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.75rem 1rem;
+      margin: 0.5rem 0;
+    }
+    .config-form fieldset legend { color: var(--text); font-weight: 600; padding: 0 0.4rem; }
     .save-btn {
       margin-top: 1.5rem;
       background: var(--save-bg);
       color: #fff;
       border: 1px solid var(--save-border);
       border-radius: 6px;
-      padding: 0.5rem 1.5rem;
+      padding: 0.6rem 1.5rem;
       cursor: pointer;
       font-size: 0.9rem;
+      min-height: 38px;
     }
     .save-btn:hover { background: var(--save-hover); }
     .banner {
@@ -299,7 +345,7 @@ export const PAGE_CSS = `
     }
     .login-form {
       max-width: 400px;
-      margin: 4rem auto;
+      margin: 3rem auto;
     }
     .login-form input[type="password"] {
       width: 100%;
@@ -307,7 +353,7 @@ export const PAGE_CSS = `
       border: 1px solid var(--border-hover);
       border-radius: 4px;
       color: var(--text);
-      padding: 0.5rem 0.75rem;
+      padding: 0.6rem 0.8rem;
       font-size: 1rem;
       margin-bottom: 1rem;
     }
@@ -323,6 +369,7 @@ export const PAGE_CSS = `
       align-items: center;
       gap: 0.5rem;
       margin-bottom: 0.5rem;
+      flex-wrap: wrap;
     }
     .queue-label {
       display: inline-block;
@@ -337,15 +384,22 @@ export const PAGE_CSS = `
     }
     .queue-item {
       display: flex;
+      flex-wrap: wrap;
       align-items: baseline;
       gap: 0.5rem;
-      padding: 0.3rem 0 0.3rem 1rem;
-      font-size: 0.85rem;
+      padding: 0.4rem 0 0.4rem 0.5rem;
+      font-size: 0.875rem;
       border-bottom: 1px solid var(--border);
     }
-    .queue-item .repo { color: var(--text-secondary); min-width: 6rem; }
-    .queue-item .number { min-width: 3rem; }
-    .queue-item .title { flex: 1; color: var(--text); }
+    .queue-item .repo { color: var(--text-secondary); }
+    .queue-item .number { color: var(--accent); }
+    .queue-item .title { flex: 1 1 100%; color: var(--text); word-break: break-word; }
+    @media (min-width: 768px) {
+      .queue-item { flex-wrap: nowrap; padding-left: 1rem; }
+      .queue-item .repo { min-width: 6rem; }
+      .queue-item .number { min-width: 3rem; }
+      .queue-item .title { flex: 1 1 auto; }
+    }
     .queue-item .time { color: var(--text-subtle); font-size: 0.75rem; white-space: nowrap; }
     .queue-item .check { font-size: 0.85rem; min-width: 1.2rem; text-align: center; }
     .queue-item .check-pass { color: var(--success); }
@@ -359,19 +413,35 @@ export const PAGE_CSS = `
       background: var(--btn-bg);
       color: var(--text-secondary);
     }
+    .pr-label {
+      font-size: 0.65rem;
+      font-weight: 600;
+      padding: 0.1rem 0.4rem;
+      border-radius: 10px;
+      background: var(--btn-bg);
+      color: var(--text-secondary);
+      border: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    .merge-conflict {
+      font-size: 0.75rem;
+      color: var(--danger);
+      white-space: nowrap;
+    }
     .merge-btn {
       font-size: 0.75rem;
-      padding: 0.2rem 0.5rem;
+      padding: 0.3rem 0.6rem;
       border: 1px solid var(--success);
       background: var(--success);
       color: #fff;
       border-radius: 4px;
       cursor: pointer;
       white-space: nowrap;
+      min-height: 30px;
     }
     .merge-btn:hover { opacity: 0.85; }
     .merge-btn:disabled { opacity: 0.5; cursor: default; }
-    .queue-empty { color: var(--text-subtle); font-style: italic; font-size: 0.85rem; padding: 0.5rem 0; }
+    .queue-empty { color: var(--text-subtle); font-style: italic; font-size: 0.875rem; padding: 0.5rem 0; }
     .queue-stale { margin-top: 1.5rem; font-size: 0.75rem; color: var(--text-subtle); }
     #theme-select {
       margin-left: auto;
@@ -379,10 +449,67 @@ export const PAGE_CSS = `
       color: var(--text);
       border: 1px solid var(--border-hover);
       border-radius: 4px;
-      padding: 0.2rem 0.4rem;
+      padding: 0.3rem 0.4rem;
       font-size: 0.8rem;
       cursor: pointer;
+      min-height: 30px;
     }
+    .outcome-card {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      padding: 0.6rem 1rem;
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      margin-bottom: 1rem;
+      font-size: 0.85rem;
+      align-items: center;
+    }
+    .outcome-card.outcome-failed {
+      border-color: var(--danger);
+    }
+    .outcome-stat {
+      display: inline-block;
+      padding: 0.2rem 0.55rem;
+      background: var(--btn-bg);
+      border-radius: 4px;
+      font-size: 0.8rem;
+      white-space: nowrap;
+    }
+    .outcome-stat.outcome-danger { color: var(--danger); }
+    .outcome-stat.outcome-pr { color: var(--accent); }
+    .cancel-btn {
+      padding: 0.35rem 0.8rem;
+      font-size: 0.85rem;
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      cursor: pointer;
+      transition: all 0.2s;
+      color: var(--text);
+      min-height: 32px;
+    }
+    .cancel-btn:hover:not(:disabled) {
+      background: var(--danger);
+      color: white;
+      border-color: var(--danger);
+    }
+    .cancel-btn:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+    .stat-card {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.75rem 1.25rem;
+      min-width: 120px;
+      flex: 1 1 120px;
+    }
+    .stat-card .stat-number { font-size: 1.5rem; font-weight: 700; }
+    .stat-card .stat-label { font-size: 0.8rem; color: var(--text-secondary); }
+    .stat-grid { display: flex; gap: 0.75rem; flex-wrap: wrap; margin-bottom: 1.5rem; }
 `;
 
 export function escapeHtml(s: string): string {
@@ -457,10 +584,58 @@ export function buildNav(theme: Theme): string {
   const selectHtml = options
     .map(v => `<option value="${v}"${v === theme ? " selected" : ""}>${labels[v]}</option>`)
     .join("");
-  return `<nav><a href="/">Dashboard</a><a href="/queue">Queue</a><a href="/logs">Logs</a><a href="/whatsapp">WhatsApp</a><a href="/config">Config</a><select id="theme-select" onchange="setTheme(this.value)">${selectHtml}</select></nav>`;
+  return `<nav><a href="/">Dashboard</a><a href="/queue">Queue</a><a href="/topology">Topology</a><a href="/repos">Repos</a><a href="/jobs">Jobs</a><a href="/ha-upgrader">HA</a><a href="/k8s">K8s</a><a href="/runners">Runners</a><a href="/usage">Usage</a><a href="/logs">Logs</a><a href="/whatsapp">WhatsApp</a><a href="/sessions">Sessions</a><a href="/config">Config</a><a href="/verify">Verify</a><a href="/logout">Logout</a><select id="theme-select" onchange="setTheme(this.value)">${selectHtml}</select></nav>`;
 }
 
+export function buildPageHeader(
+  pageTitle: string | null,
+  theme: Theme,
+  opts: { showNav?: boolean } = { showNav: true },
+): string {
+  const nav = opts.showNav === false ? "" : buildNav(theme);
+  const subtitle = pageTitle ? `<h2>${escapeHtml(pageTitle)}</h2>` : "";
+  const verifyBanner = config.ACTIVATION_STATE === "verify-only"
+    ? `<div style="background:#d93f0b;color:#fff;padding:0.5em 1em;margin:0 0 0.5em 0;font-weight:600;border-radius:4px">VERIFY-ONLY MODE — no jobs are running. <a href="/verify" style="color:#fff;text-decoration:underline">Review connectivity checks</a> before toggling to active.</div>`
+    : "";
+  return `${ERROR_HANDLER_SCRIPT}
+<h1>claws</h1>
+  ${nav}
+  ${verifyBanner}
+  ${subtitle}`;
+}
+
+// Both stylesheets must coexist: PAGE_CSS owns the component class names
+// (.running, .idle, .queue-item, etc.) that live-polling JS references by
+// string; Tailwind utilities are additive on top.
+export const TAILWIND_STYLESHEET = `<link rel="stylesheet" href="/static/tailwind.css">`;
+
 export const THEME_SCRIPT = `<script>function setTheme(v){document.cookie="claws_theme="+v+";Path=/;SameSite=Strict;Max-Age=31536000";if(v==="system"){document.documentElement.removeAttribute("data-theme")}else{document.documentElement.setAttribute("data-theme",v)}}</script>`;
+
+// Pages using this script require `unsafe-eval` in their Content-Security-Policy script-src directive.
+export const ALPINE_SCRIPT = `<script src="/static/alpine.js" defer></script>`;
+
+export const LOCAL_TIME_SCRIPT = `<script>
+(function() {
+  function localizeTimestamps() {
+    var els = document.querySelectorAll('time.local-time');
+    for (var i = 0; i < els.length; i++) {
+      var iso = els[i].getAttribute('datetime');
+      if (!iso) continue;
+      if (!iso.endsWith('Z') && !/[+\-]\d{2}:\d{2}$/.test(iso)) iso += 'Z';
+      try { els[i].textContent = new Date(iso).toLocaleString(); } catch(e) {}
+    }
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', localizeTimestamps);
+  } else {
+    localizeTimestamps();
+  }
+})();
+</script>`;
+
+export function timestampHtml(iso: string): string {
+  return `<time datetime="${escapeHtml(iso)}" class="local-time">${escapeHtml(iso)}</time>`;
+}
 
 export function slackLabel(slack: {
   configured: boolean;
@@ -500,4 +675,102 @@ export function whatsappLabel(wa: {
   if (wa.connected) return { text: "Connected", cls: "running", link: true };
   if (wa.pairingRequired) return { text: "Pairing required", cls: "slack-error", link: true };
   return { text: "Disconnected", cls: "slack-error", link: true };
+}
+
+export interface AiProviderStatus {
+  configured: boolean;
+  rateLimited: boolean;
+  rateLimitedUntil?: number; // timestamp when cooldown expires (if rateLimited)
+  lastUsedAt: string | null; // ISO string or null
+  isPrimary?: boolean;
+  /**
+   * OpenRouter only. Two independent sources of "configured":
+   *   - clawsKeyConfigured: claws has CLAWS_OPENROUTER_API_KEY set and injects
+   *     it into opencode spawns.
+   *   - opencodeCliAvailable: the `opencode` CLI binary is installed and can
+   *     use its own `opencode auth login` credentials.
+   * Either one is sufficient to run workflows; the dashboard shows both so
+   * operators can tell which path is active.
+   */
+  clawsKeyConfigured?: boolean;
+  opencodeCliAvailable?: boolean;
+}
+
+function formatRateLimitCooldown(until: number): string {
+  const remainingMs = Math.max(0, until - Date.now());
+  const totalSecs = Math.ceil(remainingMs / 1000);
+  const mins = Math.floor(totalSecs / 60);
+  const secs = totalSecs % 60;
+  if (mins > 0) return `${mins}m ${secs}s`;
+  return `${secs}s`;
+}
+
+export function providerLabel(s: AiProviderStatus, sourceSuffix = ""): { text: string; cls: string } {
+  const primary = s.isPrimary ? " (primary)" : "";
+  if (!s.configured) return { text: `Not configured${primary}`, cls: "idle" };
+  if (s.rateLimited && s.rateLimitedUntil) {
+    return { text: `Rate limited (${formatRateLimitCooldown(s.rateLimitedUntil)})${primary}${sourceSuffix}`, cls: "slack-error" };
+  }
+  if (s.rateLimited) return { text: `Rate limited${primary}${sourceSuffix}`, cls: "slack-error" };
+  if (s.lastUsedAt) return { text: `Active${primary}${sourceSuffix}`, cls: "running" };
+  return { text: `Idle${primary}${sourceSuffix}`, cls: "idle" };
+}
+
+export function anthropicLabel(s: AiProviderStatus): { text: string; cls: string } {
+  return providerLabel(s);
+}
+
+export function openaiLabel(s: AiProviderStatus): { text: string; cls: string } {
+  return providerLabel(s);
+}
+
+/**
+ * Label for the opencode provider (which routes through OpenRouter via the
+ * opencode CLI). The "configured" status has two independent sources —
+ * claws-supplied CLAWS_OPENROUTER_API_KEY and the opencode CLI's own
+ * `opencode auth login` credentials — and we surface both.
+ */
+export function opencodeLabel(s: AiProviderStatus): { text: string; cls: string } {
+  const sources: string[] = [];
+  if (s.clawsKeyConfigured) sources.push("claws key");
+  if (s.opencodeCliAvailable) sources.push("opencode CLI");
+  const sourceSuffix = sources.length > 0 ? ` · via ${sources.join(" + ")}` : "";
+  return providerLabel(s, sourceSuffix);
+}
+
+/**
+ * Label for the direct-OpenRouter HTTP provider. Configured iff claws has
+ * CLAWS_OPENROUTER_API_KEY — the opencode CLI's own auth does not help here
+ * since the direct path calls OpenRouter's API straight from claws.
+ */
+export function openrouterLabel(s: AiProviderStatus): { text: string; cls: string } {
+  return providerLabel(s);
+}
+
+export function homeAssistantLabel(ha: {
+  configured: boolean;
+  lastCheck: string | null;
+  lastError: string | null;
+}): { text: string; cls: string } {
+  if (!ha.configured) return { text: "Not configured", cls: "idle" };
+  if (ha.lastError) return { text: "Error", cls: "slack-error" };
+  if (ha.lastCheck) return { text: "Connected", cls: "running" };
+  return { text: "Configured (untested)", cls: "slack-untested" };
+}
+
+export function k8sIntegrationLabel(s: {
+  enabled: boolean;
+  lastRunAt: string | null;
+  lastError: string | null;
+  nodesNotReady: number;
+  podAlertCount: number;
+  nodeAlertCount: number;
+  fluxAlertCount: number;
+} | null): { text: string; cls: string } {
+  if (!s || !s.enabled) return { text: "Disabled", cls: "idle" };
+  if (s.lastError) return { text: "Error", cls: "slack-error" };
+  if (!s.lastRunAt) return { text: "Configured (untested)", cls: "slack-untested" };
+  if (s.nodesNotReady > 0 || s.podAlertCount > 0 || s.nodeAlertCount > 0 || s.fluxAlertCount > 0)
+    return { text: "Degraded", cls: "slack-error" };
+  return { text: "Healthy", cls: "running" };
 }

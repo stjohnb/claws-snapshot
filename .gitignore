@@ -2,3 +2,5 @@ node_modules/
 dist/
 *.env
 config.json
+.mcp-claws.json
+*.log

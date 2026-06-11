@@ -1,9 +1,13 @@
 import { ImapFlow } from "imapflow";
+import { simpleParser } from "mailparser";
 import nodemailer from "nodemailer";
 import * as config from "../config.js";
 import * as claude from "../claude.js";
 import * as log from "../log.js";
 import { reportError } from "../error-reporter.js";
+import { guardContent, makeGuardCtx } from "../prompt-guard.js";
+import { getModel } from "../model-selector.js";
+import { sleep } from "../util.js";
 
 let emailStatus = {
   configured: false,
@@ -29,7 +33,7 @@ export async function run(): Promise<void> {
 
   emailStatus.configured = true;
 
-  const client = new ImapFlow({
+  const imapConfig = {
     host: "imap.gmail.com",
     port: 993,
     secure: true,
@@ -37,18 +41,32 @@ export async function run(): Promise<void> {
       user: config.EMAIL_USER,
       pass: config.EMAIL_APP_PASSWORD,
     },
-    logger: false,
-  });
+    logger: false as const,
+    connectionTimeout: 30_000,
+  };
+
+  let client!: ImapFlow;
 
   try {
-    await client.connect();
+    for (let attempt = 0; attempt < 2; attempt++) {
+      client = new ImapFlow(imapConfig);
+      try {
+        await client.connect();
+        break;
+      } catch (err) {
+        if (attempt === 0) {
+          log.warn(`[email-monitor] IMAP connect failed, retrying in 5s: ${err}`);
+          await sleep(5000);
+        } else {
+          throw err;
+        }
+      }
+    }
     await client.mailboxOpen("INBOX");
 
-    // Search for unseen emails from the veg box sender with matching subject
+    // Search for all unseen emails — Claude extraction classifies content
     const searchResult = await client.search({
       seen: false,
-      from: config.EMAIL_VEG_BOX_SENDER,
-      subject: "Veg Content",
     });
 
     emailStatus.lastCheck = new Date().toISOString();
@@ -56,12 +74,12 @@ export async function run(): Promise<void> {
 
     const messages = searchResult || [];
     if (messages.length === 0) {
-      log.info("[email-monitor] No new veg box emails found");
+      log.info("[email-monitor] No new unread emails found");
       await client.logout();
       return;
     }
 
-    log.info(`[email-monitor] Found ${messages.length} veg box email(s)`);
+    log.info(`[email-monitor] Found ${messages.length} unread email(s)`);
 
     for (const uid of messages) {
       try {
@@ -84,10 +102,11 @@ export async function run(): Promise<void> {
 async function processVegBoxEmail(client: ImapFlow, uid: number): Promise<void> {
   const msg = await client.fetchOne(uid, { source: true });
   if (!msg) throw new Error(`Could not fetch email UID ${uid}`);
-  const rawSource = msg.source?.toString("utf-8") ?? "";
+  const source = (msg as { source?: Buffer }).source;
+  if (!source) throw new Error(`Could not fetch email UID ${uid}`);
 
-  // Extract plain text body from the raw email source
-  const emailBody = extractPlainText(rawSource);
+  const parsed = await simpleParser(source);
+  const emailBody = parsed.text;
 
   if (!emailBody) {
     log.warn(`[email-monitor] Could not extract text body from email UID ${uid}`);
@@ -95,20 +114,21 @@ async function processVegBoxEmail(client: ImapFlow, uid: number): Promise<void> 
     return;
   }
 
-  // Step 1: Extract Regular Veg Size items via Claude
+  // Step 1: Extract vegetable list via Claude
+  const guardCtx = makeGuardCtx("email-monitor", uid);
   const extractPrompt = [
-    "You are reading the body of a weekly vegetable box email from Helen's Bay Organic.",
-    "Extract ONLY the items listed under the \"Regular Veg Size\" section.",
+    "You are reading the body of an email that may contain a weekly vegetable box list.",
+    "Look for any list of vegetables in the email. If there are multiple size sections",
+    "(e.g. Regular, Large), prefer the Regular size list. If there are no size sections,",
+    "extract whatever vegetable list you can find.",
     "Return the items as a plain list, one item per line, with no bullet points or numbers.",
-    "If you cannot find a \"Regular Veg Size\" section or similar, return exactly: NOT_FOUND",
+    "If this email does not contain a vegetable list, return exactly: NOT_FOUND",
     "",
     "Email body:",
-    emailBody,
+    guardContent(emailBody, guardCtx("email-body")),
   ].join("\n");
 
-  const vegListResult = await claude.enqueue(() =>
-    claude.runClaude(extractPrompt, process.cwd()),
-  );
+  const vegListResult = await claude.runClaude(extractPrompt, process.cwd(), { capability: "text-only", tier: "sonnet", agent: "plan" });
 
   const vegList = vegListResult.trim();
 
@@ -134,9 +154,7 @@ async function processVegBoxEmail(client: ImapFlow, uid: number): Promise<void> 
     vegList,
   ].join("\n");
 
-  const recipes = await claude.enqueue(() =>
-    claude.runClaude(recipePrompt, process.cwd()),
-  );
+  const recipes = await claude.runClaude(recipePrompt, process.cwd(), { capability: "text-only", tier: "sonnet", agent: "plan" });
 
   // Step 3: Send recipe email
   const today = new Date().toISOString().slice(0, 10);
@@ -158,46 +176,6 @@ async function processVegBoxEmail(client: ImapFlow, uid: number): Promise<void> 
 
   // Mark as read so we don't reprocess
   await client.messageFlagsAdd(uid, ["\\Seen"]);
-}
-
-function extractPlainText(rawSource: string): string {
-  // Try to find the plain text part in a multipart message
-  // Look for Content-Type: text/plain section
-  const boundaryMatch = rawSource.match(/boundary="([^"]+)"/);
-  if (boundaryMatch) {
-    const boundary = boundaryMatch[1];
-    const parts = rawSource.split("--" + boundary);
-    for (const part of parts) {
-      if (part.includes("text/plain")) {
-        // Extract content after the headers (double newline)
-        const headerEnd = part.indexOf("\r\n\r\n");
-        if (headerEnd < 0) continue;
-        let content = part.slice(headerEnd + 4);
-        // Remove trailing boundary marker
-        const nextBoundary = content.indexOf("--" + boundary);
-        if (nextBoundary > 0) content = content.slice(0, nextBoundary);
-        // Handle quoted-printable encoding
-        if (part.includes("quoted-printable")) {
-          content = decodeQuotedPrintable(content);
-        }
-        return content.trim();
-      }
-    }
-  }
-
-  // Fallback: try to extract body after headers
-  const headerEnd = rawSource.indexOf("\r\n\r\n");
-  if (headerEnd >= 0) {
-    return rawSource.slice(headerEnd + 4).trim();
-  }
-
-  return rawSource;
-}
-
-function decodeQuotedPrintable(input: string): string {
-  return input
-    .replace(/=\r?\n/g, "") // Remove soft line breaks
-    .replace(/=([0-9A-Fa-f]{2})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
 }
 
 async function sendEmail(subject: string, body: string): Promise<void> {

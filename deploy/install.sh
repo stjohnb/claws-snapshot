@@ -13,6 +13,12 @@ if ! command -v gh &>/dev/null; then
   exit 1
 fi
 
+# Must have tmux available (used to keep terminal sessions alive across restarts)
+if ! command -v tmux &>/dev/null; then
+  echo "Error: tmux is required. Install it with: sudo apt install tmux" >&2
+  exit 1
+fi
+
 # Create install directory
 log "Creating $INSTALL_DIR (owned by $USER_NAME)"
 sudo mkdir -p "$INSTALL_DIR"
@@ -65,9 +71,15 @@ if [[ ! -f "$ENV_FILE" ]]; then
 # CLAWS_SLACK_WEBHOOK=https://hooks.slack.com/services/T.../B.../xxx
 # KWYJIBO_BASE_URL=https://kwyjibo.vercel.app
 # KWYJIBO_AUTOMATION_API_KEY=
+# Required: GitHub App authentication. Without these, Claws will fail to start.
+# Create a GitHub App per the README, then set:
+CLAWS_GITHUB_APP_ID=
+CLAWS_GITHUB_APP_PRIVATE_KEY_PATH=
+# Required: prevents task truncation when Claude output exceeds the default limit
+CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000
 CONF
   chmod 600 "$ENV_FILE"
-  log "Created $ENV_FILE — edit it to set environment overrides"
+  log "Created $ENV_FILE — edit it to set environment overrides (CLAUDE_CODE_MAX_OUTPUT_TOKENS is pre-set)"
 fi
 
 # Enable and start

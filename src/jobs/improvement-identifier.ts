@@ -1,3 +1,6 @@
+// Unified code reviewer: analyzes codebases for security issues (files GitHub issues)
+// and improvement opportunities (files GitHub issues) in a single Claude analysis call.
+import { z } from "zod";
 import fs from "node:fs";
 import path from "node:path";
 import { WORK_DIR, type Repo } from "../config.js";
@@ -6,36 +9,70 @@ import * as claude from "../claude.js";
 import * as log from "../log.js";
 import * as db from "../db.js";
 import { reportError } from "../error-reporter.js";
+import * as smartSchedule from "../smart-schedule.js";
+import { guardContent, makeGuardCtx } from "../prompt-guard.js";
+import { getModel } from "../model-selector.js";
+import { classifyComplexity } from "../classify-complexity.js";
+import { extractJsonCandidates } from "../json-extract.js";
 
 const MAX_IMPROVEMENTS_PER_RUN = 10;
+const MAX_FINDINGS_PER_RUN = 5;
 
-function buildPrompt(fullName: string, openIssueTitles: string[], openPRTitles: string[]): string {
+export function buildPrompt(fullName: string, openIssueTitles: string[], openPRTitles: string[], isPrivate: boolean): string {
+  const guardCtx = makeGuardCtx(fullName, 0);
   const issueList =
     openIssueTitles.length > 0
-      ? openIssueTitles.map((t) => `  - ${t}`).join("\n")
+      ? openIssueTitles.map((t) => `  - ${guardContent(t, guardCtx("issue-title"))}`).join("\n")
       : "  (none)";
 
   const prList =
     openPRTitles.length > 0
-      ? openPRTitles.map((t) => `  - ${t}`).join("\n")
+      ? openPRTitles.map((t) => `  - ${guardContent(t, guardCtx("pr-title"))}`).join("\n")
       : "  (none)";
 
   return [
-    `You are analyzing the repository ${fullName} for opportunities to improve the codebase.`,
+    `You are analyzing the repository ${fullName} for security issues and improvement opportunities.`,
     ``,
     `Read the codebase thoroughly. If \`docs/OVERVIEW.md\` exists, read it first`,
     `(and any linked documents) for context about the architecture and patterns.`,
+    ``,
+    `### Security findings`,
+    ``,
+    `Look for concrete security vulnerabilities such as:`,
+    `- Injection vectors (command, SQL, prompt, HTML/XSS) in user-input paths`,
+    `- Authentication/authorization gaps on sensitive routes or operations`,
+    `- Hardcoded secrets, credentials, tokens, or keys committed to the repo`,
+    `- Path-traversal, SSRF, unsafe deserialization`,
+    `- Insecure file/permission handling (world-writable, predictable temp paths)`,
+    `- Crypto misuse (weak algorithms, predictable IVs, missing authenticated encryption)`,
+    `- Logging or error messages that may leak secrets/PII`,
+    `- Dependencies with known CVEs (where obvious — do not invent CVEs)`,
+    `- Missing input validation at trust boundaries (HTTP handlers, message queue consumers, file readers, external command builders)`,
+    ``,
+    `Security guidelines:`,
+    `- Only report findings with a concrete exploit path. Do NOT speculate about defense-in-depth without a real risk.`,
+    `- Do NOT suggest style/lint or "best practice" changes unrelated to a real risk.`,
+    `- Do NOT suggest adding security headers/CSP unless the app actually serves user-facing HTML without them.`,
+    `- Do NOT suggest changes requiring secret rotation, infra changes, or out-of-repo coordination — mention these in the body if relevant, but only file findings whose fix is a code change inside the repo.`,
+    `- Do NOT suggest security improvements already tracked in the open issues/PRs listed below.`,
+    `- "No findings" is perfectly acceptable — do not manufacture suggestions.`,
+    `- Each finding should reference exact files and line numbers and describe both the vulnerability and the fix.`,
+    `- Findings are visible in PRs — describe the vulnerability concretely but do not include working exploit payloads.`,
+    ...(isPrivate
+      ? [`- This repository is PRIVATE. Do NOT report threats that only apply to repositories accepting untrusted external or fork pull requests — in particular, do NOT recommend gating self-hosted GitHub Actions runners against fork PRs, restricting \`pull_request\` triggers for fork code execution, or similar fork-PR hardening. A private repository cannot receive pull requests from forks opened by users without write access, so untrusted fork code never runs on its runners. Such findings are not applicable here — skip them entirely.`]
+      : []),
+    ``,
+    `### Improvements`,
     ``,
     `Look for meaningful opportunities such as:`,
     `- Code that could be consolidated (duplicate or near-duplicate logic)`,
     `- Overcomplicated code that could be simplified`,
     `- Dead code or unused exports/dependencies`,
     `- Performance issues or inefficiencies`,
-    `- Security concerns`,
     `- Missing error handling at system boundaries`,
     `- Stale TODOs or FIXMEs that should be addressed`,
     ``,
-    `Guidelines:`,
+    `Improvement guidelines:`,
     `- Be conservative. Only suggest improvements that provide clear, tangible value.`,
     `- Do NOT suggest stylistic changes, comment additions, or trivial refactors.`,
     `- Do NOT suggest adding type annotations, docstrings, or documentation.`,
@@ -53,6 +90,12 @@ function buildPrompt(fullName: string, openIssueTitles: string[], openPRTitles: 
     ``,
     "```json",
     `{`,
+    `  "securityFindings": [`,
+    `    {`,
+    `      "title": "Short descriptive title (imperative mood)",`,
+    `      "body": "Detailed description with file references, the vulnerability, and the fix"`,
+    `    }`,
+    `  ],`,
     `  "improvements": [`,
     `    {`,
     `      "title": "Short descriptive title (imperative mood)",`,
@@ -62,65 +105,102 @@ function buildPrompt(fullName: string, openIssueTitles: string[], openPRTitles: 
     `}`,
     "```",
     ``,
-    `If no improvements are worth suggesting, respond with:`,
+    `Empty arrays are acceptable for either field. Do not manufacture entries.`,
+    ``,
+    `If no findings or improvements are worth reporting, respond with:`,
     "```json",
-    `{ "improvements": [] }`,
+    `{ "securityFindings": [], "improvements": [] }`,
     "```",
   ].join("\n");
 }
 
-function buildImplementationPrompt(fullName: string, improvement: Improvement): string {
-  return [
-    `You are implementing a specific improvement in the repository ${fullName}.`,
-    ``,
-    `**Improvement: ${improvement.title}**`,
-    improvement.body,
-    ``,
-    `If \`docs/OVERVIEW.md\` exists, read it first (and any linked documents) for context.`,
-    ``,
-    `Implement this improvement. Make clean, focused commits with clear messages.`,
-    `Do not make changes beyond what is described above.`,
-  ].join("\n");
-}
 
-interface Improvement {
-  title: string;
-  body: string;
-}
+const ReviewItemSchema = z.object({ title: z.string(), body: z.string() });
+const ResponseSchema = z.object({
+  securityFindings: z.array(z.unknown()).optional(),
+  improvements: z.array(z.unknown()).optional(),
+});
 
-export function parseImprovements(output: string): Improvement[] {
-  // Try extracting from a JSON code fence first
-  const fenceMatch = output.match(/```json\s*([\s\S]*?)```/);
-  const jsonStr = fenceMatch ? fenceMatch[1].trim() : null;
+type ReviewItem = z.infer<typeof ReviewItemSchema>;
 
-  // Fall back to finding raw JSON object
-  const rawMatch = jsonStr ?? (output.match(/\{[\s\S]*"improvements"[\s\S]*\}/)?.[0] ?? null);
+export function parseReviewOutput(
+  output: string,
+  onFailure?: (err: unknown, candidates: string[]) => void,
+): { securityFindings: ReviewItem[]; improvements: ReviewItem[] } {
+  const candidates = extractJsonCandidates(output);
 
-  if (!rawMatch) {
-    log.warn("[improvement-identifier] Could not find JSON in Claude output");
-    return [];
+  if (candidates.length === 0) {
+    const err = new Error("No JSON candidates found in Claude output");
+    log.warn(`[improvement-identifier] ${err.message}`);
+    onFailure?.(err, []);
+    return { securityFindings: [], improvements: [] };
   }
 
+  let lastErr: unknown;
+  for (const candidate of candidates) {
+    try {
+      const result = ResponseSchema.safeParse(JSON.parse(candidate));
+      if (!result.success) {
+        lastErr = new Error(`Schema validation failed: ${result.error.message}`);
+        continue;
+      }
+      const securityFindings = (result.data.securityFindings ?? [])
+        .map((item) => ReviewItemSchema.safeParse(item))
+        .filter((r): r is z.ZodSafeParseSuccess<ReviewItem> => r.success)
+        .map((r) => r.data);
+      const improvements = (result.data.improvements ?? [])
+        .map((item) => ReviewItemSchema.safeParse(item))
+        .filter((r): r is z.ZodSafeParseSuccess<ReviewItem> => r.success)
+        .map((r) => r.data);
+      return { securityFindings, improvements };
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+
+  log.warn(`[improvement-identifier] Failed to parse JSON: ${lastErr}`);
+  onFailure?.(lastErr, candidates);
+  return { securityFindings: [], improvements: [] };
+}
+
+// Kept separate for traceability in GitHub issues and PR footers
+const FOOTER_SECURITY = "\n\n---\n*Automated security review by claws improvement-identifier*";
+const FOOTER_IMPROVEMENT = "\n\n---\n*Automated improvement suggestion by claws improvement-identifier*";
+
+// Dedup-searches by title, creates an issue if none found. Returns true if an issue was created.
+async function fileIssueIfAbsent(
+  fullName: string,
+  title: string,
+  body: string,
+  reportContext: string,
+): Promise<boolean> {
   try {
-    const parsed = JSON.parse(rawMatch) as { improvements?: unknown[] };
-    if (!Array.isArray(parsed.improvements)) return [];
-
-    return parsed.improvements.filter(
-      (item): item is Improvement =>
-        typeof item === "object" &&
-        item !== null &&
-        typeof (item as Improvement).title === "string" &&
-        typeof (item as Improvement).body === "string",
-    );
+    const existingIssues = await gh.searchIssues(fullName, title);
+    const existingPRs = await gh.searchPRs(fullName, title);
+    if (existingIssues.length > 0 || existingPRs.length > 0) {
+      log.info(`[improvement-identifier] Skipping "${title}" — similar issue or PR already exists`);
+      return false;
+    }
+    const issueNumber = await gh.createIssue(fullName, title, body, []);
+    log.info(`[improvement-identifier] Created issue #${issueNumber} for "${title}" in ${fullName}`);
+    return true;
   } catch (err) {
-    log.warn(`[improvement-identifier] Failed to parse JSON: ${err}`);
-    return [];
+    reportError(reportContext, `${fullName}: ${title}`, err);
+    return false;
   }
 }
 
-const FOOTER = "\n\n---\n*Automated improvement by claws improvement-identifier*";
+export async function processRepo(repo: Repo): Promise<void> {
+  try {
+    await processRepoInner(repo);
+  } catch (err) {
+    reportError("improvement-identifier:process-repo", repo.fullName, err);
+  } finally {
+    db.markRepoProcessedDaily("improvement-identifier", repo.fullName, smartSchedule.localDateString());
+  }
+}
 
-async function processRepo(repo: Repo): Promise<void> {
+async function processRepoInner(repo: Repo): Promise<void> {
   const fullName = repo.fullName;
 
   // Skip repos without local clones
@@ -129,103 +209,109 @@ async function processRepo(repo: Repo): Promise<void> {
 
   // Fetch open issue titles and PR titles for dedup context
   const openIssues = await gh.listOpenIssues(fullName);
-  const openIssueTitles = openIssues.map((i) => i.title);
   const openPRs = await gh.listPRs(fullName);
 
-  // Skip if improvement PRs are already open
-  if (openPRs.some((pr) => pr.headRefName.startsWith("claws/improve-"))) {
-    log.info(`[improvement-identifier] Skipping ${fullName} — open improvement PR(s) exist`);
+  const existingSecurityIssue = openIssues.some((i) => i.title.startsWith("security: "));
+  const existingImprovementPR = openPRs.some((pr) => pr.headRefName.startsWith("claws/improve-"));
+
+  // Both queues already full — analysis would be wasted
+  if (existingSecurityIssue && existingImprovementPR) {
+    log.info(`[improvement-identifier] Skipping ${fullName} — open security issue(s) and improvement PR(s) exist`);
     return;
   }
 
+  const isPrivate = await gh.isRepoPrivate(fullName);
+
+  const openIssueTitles = openIssues.map((i) => i.title);
   const openPRTitles = openPRs.map((p) => p.title);
 
-  // Phase 1: Analysis — identify improvements via Claude
+  // Phase 1: Analysis — identify security findings and improvements via a single Claude call
   const analysisBranch = `claws/improve-${claude.randomSuffix()}`;
-  const analysisTaskId = db.recordTaskStart("improvement-identifier", fullName, 0, null);
-  let analysisWt: string | undefined;
-  let improvements: Improvement[];
+  const { securityFindings: rawFindings, improvements: rawImprovements } = await db.withTaskRecording("improvement-identifier", fullName, 0, null, async (analysisTaskId) => {
+    return await claude.withNewWorktree(repo, analysisBranch, "improvement-identifier", async (analysisWt) => {
+      db.updateTaskWorktree(analysisTaskId, analysisWt, analysisBranch);
 
-  try {
-    analysisWt = await claude.createWorktree(repo, analysisBranch, "improvement-identifier");
-    db.updateTaskWorktree(analysisTaskId, analysisWt, analysisBranch);
+      log.info(`[improvement-identifier] Analyzing ${fullName}`);
+      const prompt = buildPrompt(fullName, openIssueTitles, openPRTitles, isPrivate);
+      const analysisMcpConfig = claude.writeClawsMcpConfig(analysisWt);
+      const analysisTier = await classifyComplexity(
+        `Analyzing repository ${fullName} to identify security issues and improvement opportunities.`,
+        analysisWt,
+      );
+      // Analysis phase is text-only but stays pinned to Claude — Qwen (OpenCode/
+      // OpenRouter direct) consistently emits malformed JSON for this task, which
+      // blocks every downstream phase.
+      const model = getModel(analysisTier, "text-only", "claude");
+      db.updateTaskModel(analysisTaskId, model);
+      log.info(`[improvement-identifier] Using model "${model}" for analysis of ${fullName}`);
+      let analysisTokensUsed: number | undefined;
+      let analysisCostUsd: number | undefined;
+      const output = await claude.runClaude(prompt, analysisWt, { capability: "text-only", mcpConfig: analysisMcpConfig, tier: analysisTier, model, provider: "claude", agent: "plan", onTokensUsed: (t, c) => { analysisTokensUsed = t; analysisCostUsd = c; } });
+      if (analysisTokensUsed !== undefined && analysisCostUsd !== undefined) {
+        db.updateTaskTokenUsage(analysisTaskId, analysisTokensUsed, analysisCostUsd);
+      }
 
-    log.info(`[improvement-identifier] Analyzing ${fullName}`);
-    const prompt = buildPrompt(fullName, openIssueTitles, openPRTitles);
-    const output = await claude.enqueue(() => claude.runClaude(prompt, analysisWt!));
+      const result = parseReviewOutput(output, (err, candidates) => {
+        const head = candidates[0]?.slice(0, 500) ?? "(no JSON candidates)";
+        reportError(
+          "improvement-identifier:parse-findings",
+          `${fullName}: ${err}\n--- output head ---\n${head}`,
+          err instanceof Error ? err : new Error(String(err)),
+        );
+      });
+      db.recordTaskComplete(analysisTaskId, { commits: 0 });
+      return result;
+    });
+  });
 
-    improvements = parseImprovements(output);
-    db.recordTaskComplete(analysisTaskId);
-  } catch (err) {
-    db.recordTaskFailed(analysisTaskId, String(err));
-    throw err;
-  } finally {
-    if (analysisWt) {
-      await claude.removeWorktree(repo, analysisWt);
+  // Cap at configured limits
+  const cappedFindings = rawFindings.slice(0, MAX_FINDINGS_PER_RUN);
+  if (rawFindings.length > MAX_FINDINGS_PER_RUN) {
+    log.info(`[improvement-identifier] Capping at ${MAX_FINDINGS_PER_RUN} security findings for ${fullName} (${rawFindings.length} identified)`);
+  }
+  const cappedImprovements = rawImprovements.slice(0, MAX_IMPROVEMENTS_PER_RUN);
+  if (rawImprovements.length > MAX_IMPROVEMENTS_PER_RUN) {
+    log.info(`[improvement-identifier] Capping at ${MAX_IMPROVEMENTS_PER_RUN} improvements for ${fullName} (${rawImprovements.length} identified)`);
+  }
+
+  // Phase 2A: File security findings (always runs first, before improvements)
+  let securityFindingsFiled = 0;
+  if (!existingSecurityIssue) {
+    for (const finding of cappedFindings) {
+      const created = await fileIssueIfAbsent(
+        fullName,
+        `security: ${finding.title}`,
+        finding.body + FOOTER_SECURITY,
+        "improvement-identifier:create-security-issue",
+      );
+      if (created) securityFindingsFiled++;
     }
   }
 
-  if (improvements.length === 0) {
+  // Phase 2B: Implement improvements (skipped on security-priority ticks)
+  if (existingImprovementPR) {
+    log.info(`[improvement-identifier] Skipping improvement implementation for ${fullName} — open improvement PR(s) exist`);
+    return;
+  }
+  if (securityFindingsFiled > 0) {
+    log.info(`[improvement-identifier] Security findings filed in ${fullName} — skipping improvement implementation this tick (will resume next tick)`);
+    return;
+  }
+  if (cappedImprovements.length === 0) {
     log.info(`[improvement-identifier] No improvements identified for ${fullName}`);
     return;
   }
 
-  // Phase 2: Implementation — implement each improvement as a PR (concurrently)
-  const capped = improvements.slice(0, MAX_IMPROVEMENTS_PER_RUN);
-  if (improvements.length > MAX_IMPROVEMENTS_PER_RUN) {
-    log.info(`[improvement-identifier] Capping at ${MAX_IMPROVEMENTS_PER_RUN} improvements for ${fullName} (${improvements.length} identified)`);
+  for (const improvement of cappedImprovements) {
+    await fileIssueIfAbsent(
+      fullName,
+      improvement.title,
+      improvement.body + FOOTER_IMPROVEMENT,
+      "improvement-identifier:create-improvement-issue",
+    );
   }
-
-  const tasks = capped.map(async (improvement) => {
-    // Dedup check against both issues and PRs
-    const existingIssues = await gh.searchIssues(fullName, improvement.title);
-    const existingPRs = await gh.searchPRs(fullName, improvement.title);
-    if (existingIssues.length > 0 || existingPRs.length > 0) {
-      log.info(
-        `[improvement-identifier] Skipping "${improvement.title}" — similar issue or PR already exists`,
-      );
-      return;
-    }
-
-    const implBranch = `claws/improve-${claude.randomSuffix()}`;
-    const implTaskId = db.recordTaskStart("improvement-identifier", fullName, 0, null);
-    let implWt: string | undefined;
-
-    try {
-      implWt = await claude.createWorktree(repo, implBranch, "improvement-identifier");
-      db.updateTaskWorktree(implTaskId, implWt, implBranch);
-
-      const implPrompt = buildImplementationPrompt(fullName, improvement);
-      await claude.enqueue(() => claude.runClaude(implPrompt, implWt!));
-
-      if (await claude.hasNewCommits(implWt, repo.defaultBranch)) {
-        await claude.pushBranch(implWt, implBranch);
-        const prBody = improvement.body + FOOTER;
-        await gh.createPR(fullName, implBranch, `refactor: ${improvement.title}`, prBody);
-        log.info(`[improvement-identifier] Created PR for "${improvement.title}" in ${fullName}`);
-      } else {
-        log.warn(`[improvement-identifier] No commits produced for "${improvement.title}" in ${fullName}`);
-      }
-
-      db.recordTaskComplete(implTaskId);
-    } catch (err) {
-      db.recordTaskFailed(implTaskId, String(err));
-      reportError("improvement-identifier:implement", `${fullName}: ${improvement.title}`, err);
-    } finally {
-      if (implWt) {
-        await claude.removeWorktree(repo, implWt);
-      }
-    }
-  });
-
-  await Promise.allSettled(tasks);
 }
 
 export async function run(repos: Repo[]): Promise<void> {
-  const tasks = repos.map((repo) =>
-    processRepo(repo).catch((err) =>
-      reportError("improvement-identifier:process-repo", repo.fullName, err),
-    ),
-  );
-  await Promise.allSettled(tasks);
+  await Promise.allSettled(repos.map((repo) => processRepo(repo)));
 }

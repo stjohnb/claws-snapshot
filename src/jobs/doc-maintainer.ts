@@ -5,8 +5,12 @@ import * as gh from "../github.js";
 import * as claude from "../claude.js";
 import * as log from "../log.js";
 import * as db from "../db.js";
+import * as smartSchedule from "../smart-schedule.js";
+import { buildSuccessOutcome } from "../outcome.js";
 import { reportError } from "../error-reporter.js";
-import { findPlanComment } from "../plan-parser.js";
+import { notify } from "../slack.js";
+import { findPlanComment, type Provider } from "../plan-parser.js";
+import { getModel } from "../model-selector.js";
 
 function buildDocPrompt(fullName: string, planCount = 0): string {
   const lines = [
@@ -56,122 +60,186 @@ function buildDocPrompt(fullName: string, planCount = 0): string {
   return lines.join("\n");
 }
 
-async function processRepo(repo: Repo): Promise<void> {
+interface ProcessResult {
+  repo: string;
+  status:
+    | "pr-created"
+    | "no-commits"
+    | "skipped-no-clone"
+    | "skipped-has-pr"
+    | "skipped-no-changes"
+    | "error";
+  prNumber?: number;
+  planTitles?: string[];
+}
+
+export async function processRepo(repo: Repo): Promise<ProcessResult> {
+  try {
+    return await processRepoInner(repo);
+  } catch (err) {
+    reportError("doc-maintainer:process-repo", repo.fullName, err);
+    return { repo: repo.fullName, status: "error" };
+  } finally {
+    db.markRepoProcessedDaily("doc-maintainer", repo.fullName, smartSchedule.localDateString());
+  }
+}
+
+async function processRepoInner(repo: Repo): Promise<ProcessResult> {
   const fullName = repo.fullName;
 
   // Step 0: Skip repos claws isn't working with
   const repoDir = path.join(WORK_DIR, "repos", repo.owner, repo.name);
-  if (!fs.existsSync(repoDir)) return;
+  if (!fs.existsSync(repoDir)) return { repo: fullName, status: "skipped-no-clone" };
 
   // Step 1: Check for existing open docs PR
   const prs = await gh.listPRs(fullName);
   const hasDocsPR = prs.some((pr) => pr.headRefName.startsWith("claws/docs-"));
   if (hasDocsPR) {
     log.info(`[doc-maintainer] Skipping ${fullName} — open docs PR exists`);
-    return;
+    return { repo: fullName, status: "skipped-has-pr" };
   }
 
   // Step 2: Check if maintenance is needed
   const branchName = `claws/docs-${claude.datestamp()}-${claude.randomSuffix()}`;
-  const taskId = db.recordTaskStart("doc-maintainer", fullName, 0, null);
-  let wtPath: string | undefined;
 
-  try {
-    wtPath = await claude.createWorktree(repo, branchName, "doc-maintainer");
-    db.updateTaskWorktree(taskId, wtPath, branchName);
+  return await db.withTaskRecording("doc-maintainer", fullName, 0, null, async (taskId) => {
+    return await claude.withNewWorktree(repo, branchName, "doc-maintainer", async (wtPath): Promise<ProcessResult> => {
+      db.updateTaskWorktree(taskId, wtPath, branchName);
 
-    const headSha = await claude.getHeadSha(wtPath);
-    const lastDocSha = await claude.getLastDocMaintainerSha(wtPath);
+      const headSha = await claude.getHeadSha(wtPath);
+      const lastDocSha = await claude.getLastDocMaintainerSha(wtPath);
 
-    if (lastDocSha && lastDocSha === headSha) {
-      log.info(`[doc-maintainer] Skipping ${fullName} — no changes since last doc update`);
-      db.recordTaskComplete(taskId);
-      return;
-    }
+      if (lastDocSha && lastDocSha === headSha) {
+        log.info(`[doc-maintainer] Skipping ${fullName} — no changes since last doc update`);
+        db.recordTaskComplete(taskId, { commits: 0 });
+        return { repo: fullName, status: "skipped-no-changes" };
+      }
 
-    // Step 3: Fetch recently-closed issues with implementation plans
-    const sinceDate = lastDocSha
-      ? await claude.getCommitDate(wtPath, lastDocSha)
-      : new Date(Date.now() - 7 * 24 * 60 * 60 * 1000); // fallback: 7 days
+      // Step 3: Fetch recently-closed issues with implementation plans
+      const sinceDate = lastDocSha
+        ? await claude.getCommitDate(wtPath, lastDocSha)
+        : new Date(Date.now() - 7 * 24 * 60 * 60 * 1000); // fallback: 7 days
 
-    const closedIssues = await gh.listRecentlyClosedIssues(fullName, sinceDate);
+      const closedIssues = await gh.listRecentlyClosedIssues(fullName, sinceDate);
 
-    const MAX_PLANS = 10;
-    const MAX_PLAN_LENGTH = 5_000;
-    const plans: { number: number; title: string; plan: string }[] = [];
-    for (const issue of closedIssues) {
-      if (plans.length >= MAX_PLANS) break;
-      const comments = await gh.getIssueComments(fullName, issue.number);
-      const plan = findPlanComment(comments);
-      if (plan) {
-        const truncated = plan.length > MAX_PLAN_LENGTH
-          ? plan.slice(0, MAX_PLAN_LENGTH) + "\n\n[... truncated]"
-          : plan;
-        if (plan.length > MAX_PLAN_LENGTH) {
-          log.warn(`[doc-maintainer] Truncated plan for issue #${issue.number} (${plan.length} chars)`);
+      const MAX_PLANS = 10;
+      const MAX_PLAN_LENGTH = 5_000;
+      const plans: { number: number; title: string; plan: string }[] = [];
+      for (const issue of closedIssues) {
+        if (plans.length >= MAX_PLANS) break;
+        const comments = await gh.getIssueComments(fullName, issue.number);
+        const plan = findPlanComment(comments);
+        if (plan) {
+          const truncated = plan.length > MAX_PLAN_LENGTH
+            ? plan.slice(0, MAX_PLAN_LENGTH) + "\n\n[... truncated]"
+            : plan;
+          if (plan.length > MAX_PLAN_LENGTH) {
+            log.warn(`[doc-maintainer] Truncated plan for issue #${issue.number} (${plan.length} chars)`);
+          }
+          plans.push({ number: issue.number, title: issue.title, plan: truncated });
         }
-        plans.push({ number: issue.number, title: issue.title, plan: truncated });
       }
-    }
 
-    // Write plans to temporary .plans/ directory
-    if (plans.length > 0) {
+      // Write plans to temporary .plans/ directory
+      if (plans.length > 0) {
+        const plansDir = path.join(wtPath, ".plans");
+        fs.mkdirSync(plansDir, { recursive: true });
+        for (const p of plans) {
+          const content = `# Issue #${p.number}: ${p.title}\n\n${p.plan}`;
+          fs.writeFileSync(path.join(plansDir, `${p.number}.md`), content);
+        }
+        log.info(`[doc-maintainer] Wrote ${plans.length} plan(s) to .plans/ for ${fullName}`);
+      }
+
+      // Step 4: Generate/update documentation
+      log.info(`[doc-maintainer] Generating docs for ${fullName}`);
+      const prompt = buildDocPrompt(fullName, plans.length);
+      const model = getModel("sonnet", "tool-use", "claude");
+      db.updateTaskModel(taskId, model);
+      let actualProvider: Provider = "claude";
+      let taskTokensUsed: number | undefined;
+      let taskCostUsd: number | undefined;
+      await claude.runClaude(prompt, wtPath, { capability: "tool-use", tier: "sonnet", model, onProviderUsed: (p) => { actualProvider = p; }, onTokensUsed: (t, c) => { taskTokensUsed = t; taskCostUsd = c; } });
+      if (taskTokensUsed !== undefined && taskCostUsd !== undefined) {
+        db.updateTaskTokenUsage(taskId, taskTokensUsed, taskCostUsd);
+      }
+
+      // Clean up temporary plans directory (must not be committed)
       const plansDir = path.join(wtPath, ".plans");
-      fs.mkdirSync(plansDir, { recursive: true });
-      for (const p of plans) {
-        const content = `# Issue #${p.number}: ${p.title}\n\n${p.plan}`;
-        fs.writeFileSync(path.join(plansDir, `${p.number}.md`), content);
+      if (fs.existsSync(plansDir)) {
+        fs.rmSync(plansDir, { recursive: true });
+        try {
+          await claude.git(["rm", "-rf", "--cached", ".plans"], wtPath);
+        } catch {
+          // Not staged, that's fine
+        }
       }
-      log.info(`[doc-maintainer] Wrote ${plans.length} plan(s) to .plans/ for ${fullName}`);
-    }
 
-    // Step 4: Generate/update documentation
-    log.info(`[doc-maintainer] Generating docs for ${fullName}`);
-    const prompt = buildDocPrompt(fullName, plans.length);
-    await claude.enqueue(() => claude.runClaude(prompt, wtPath!));
-
-    // Clean up temporary plans directory (must not be committed)
-    const plansDir = path.join(wtPath!, ".plans");
-    if (fs.existsSync(plansDir)) {
-      fs.rmSync(plansDir, { recursive: true });
-      try {
-        await claude.git(["rm", "-rf", "--cached", ".plans"], wtPath!);
-      } catch {
-        // Not staged, that's fine
+      // Step 5: Push and create PR
+      if (await claude.hasNewCommits(wtPath, repo.defaultBranch)) {
+        const attribution = `*— Docs generated with: ${model} (provider: ${actualProvider}) —*`;
+        const description = await claude.generateDocsPRDescription(wtPath, repo.defaultBranch, attribution);
+        await claude.pushBranch(wtPath, branchName, repo.owner);
+        const prNumber = await gh.createPR(
+          fullName,
+          branchName,
+          `docs: update documentation for ${repo.name}`,
+          description,
+        );
+        log.info(`[doc-maintainer] Created docs PR #${prNumber} for ${fullName}`);
+        db.recordTaskComplete(taskId, await buildSuccessOutcome(wtPath, repo.defaultBranch, prNumber, "created"));
+        return { repo: fullName, status: "pr-created", prNumber, planTitles: plans.map((p) => p.title) };
+      } else {
+        log.warn(`[doc-maintainer] No commits produced for ${fullName}`);
+        db.recordTaskComplete(taskId, { commits: 0 });
+        return { repo: fullName, status: "no-commits", planTitles: plans.map((p) => p.title) };
       }
-    }
+    });
+  });
+}
 
-    // Step 5: Push and create PR
-    if (await claude.hasNewCommits(wtPath, repo.defaultBranch)) {
-      const description = await claude.generateDocsPRDescription(wtPath, repo.defaultBranch);
-      await claude.pushBranch(wtPath, branchName);
-      const prNumber = await gh.createPR(
-        fullName,
-        branchName,
-        `docs: update documentation for ${repo.name}`,
-        description,
-      );
-      log.info(`[doc-maintainer] Created docs PR #${prNumber} for ${fullName}`);
-    } else {
-      log.warn(`[doc-maintainer] No commits produced for ${fullName}`);
-    }
+function postSummary(results: ProcessResult[]): void {
+  const created = results.filter((r) => r.status === "pr-created");
+  const noCommits = results.filter((r) => r.status === "no-commits");
+  const noChanges = results.filter((r) => r.status === "skipped-no-changes");
+  const hasPr = results.filter((r) => r.status === "skipped-has-pr");
+  const errors = results.filter((r) => r.status === "error");
 
-    db.recordTaskComplete(taskId);
-  } catch (err) {
-    db.recordTaskFailed(taskId, String(err));
-    throw err;
-  } finally {
-    if (wtPath) {
-      await claude.removeWorktree(repo, wtPath);
-    }
+  if (created.length === 0 && errors.length === 0 && noCommits.length === 0) {
+    return;
   }
+
+  const s = (n: number) => (n === 1 ? "" : "s");
+  const attempted = results.filter((r) => r.status !== "skipped-no-clone");
+  const lines: string[] = [
+    `📚 Doc maintainer: ${created.length} PR${s(created.length)} opened across ${attempted.length} repo${s(attempted.length)}`,
+  ];
+
+  for (const r of created) {
+    const featurePart =
+      r.planTitles && r.planTitles.length > 0
+        ? ` — features: ${r.planTitles.join("; ")}`
+        : " — no recent feature plans";
+    lines.push(`• ${r.repo} #${r.prNumber}${featurePart}`);
+  }
+
+  if (noCommits.length > 0) {
+    lines.push(`• No-op (Claude produced no commits): ${noCommits.map((r) => r.repo).join(", ")}`);
+  }
+  if (hasPr.length > 0) {
+    lines.push(`• Skipped (open docs PR): ${hasPr.map((r) => r.repo).join(", ")}`);
+  }
+  if (noChanges.length > 0) {
+    lines.push(`• Skipped (no code changes since last doc update): ${noChanges.map((r) => r.repo).join(", ")}`);
+  }
+  if (errors.length > 0) {
+    lines.push(`• Errors: ${errors.map((r) => r.repo).join(", ")}`);
+  }
+
+  notify(lines.join("\n"));
 }
 
 export async function run(repos: Repo[]): Promise<void> {
-  const tasks = repos.map((repo) =>
-    processRepo(repo).catch((err) =>
-      reportError("doc-maintainer:process-repo", repo.fullName, err),
-    ),
-  );
-  await Promise.allSettled(tasks);
+  const results = await Promise.all(repos.map((repo) => processRepo(repo)));
+  postSummary(results);
 }

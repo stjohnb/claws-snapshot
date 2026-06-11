@@ -1,12 +1,19 @@
+import { z } from "zod";
 import { type Repo } from "../config.js";
 import * as claude from "../claude.js";
 import * as gh from "../github.js";
 import * as log from "../log.js";
 import { reportError } from "../error-reporter.js";
-import { transcribe, isAvailable as transcribeAvailable } from "../transcribe.js";
+import { getModel } from "../model-selector.js";
+import { transcribe, isAvailable as transcribeAvailable, WhisperRateLimitError } from "../transcribe.js";
 import { sendMessage, type WhatsAppMessage, type MessageHandler } from "../whatsapp.js";
 
 const MAX_BODY_LENGTH = 10_000;
+
+const WhatsAppClaudeResponseSchema = z.object({
+  repo: z.string().nullable(),
+  title: z.string(),
+});
 
 export function createHandler(
   listRepos: () => Promise<Repo[]>,
@@ -22,7 +29,7 @@ export function createHandler(
         if (!transcribeAvailable()) {
           await sendMessage(
             msg.from,
-            "Voice notes aren't supported yet — OPENAI_API_KEY is not configured. Please send a text message instead.",
+            "Voice notes aren't supported yet — transcription is not configured. Please send a text message instead.",
           );
           return;
         }
@@ -74,9 +81,7 @@ export function createHandler(
         "Keep the title concise (under 80 chars).",
       ].join("\n");
 
-      const claudeResult = await claude.enqueue(() =>
-        claude.runClaude(prompt, process.cwd()),
-      );
+      const claudeResult = await claude.runClaude(prompt, process.cwd(), { capability: "text-only", tier: "sonnet", agent: "plan" });
 
       // Parse Claude's response
       let parsed: { repo: string | null; title: string };
@@ -86,7 +91,7 @@ export function createHandler(
           .replace(/^```(?:json)?\s*/m, "")
           .replace(/```\s*$/m, "")
           .trim();
-        parsed = JSON.parse(cleaned);
+        parsed = WhatsAppClaudeResponseSchema.parse(JSON.parse(cleaned));
       } catch {
         log.warn(`[whatsapp-handler] Failed to parse Claude response: ${claudeResult.slice(0, 500)}`);
         await sendMessage(msg.from, "I had trouble understanding your message. Could you try rephrasing it?");
@@ -126,12 +131,20 @@ export function createHandler(
       );
       log.info(`[whatsapp-handler] Created issue ${issueUrl}`);
     } catch (err) {
-      log.error(`[whatsapp-handler] Error processing message: ${err}`);
       reportError("whatsapp-handler:process-message", msg.from, err).catch(() => {});
-      await sendMessage(
-        msg.from,
-        "Something went wrong while creating your issue. Please try again later.",
-      );
+      if (err instanceof WhisperRateLimitError) {
+        log.warn(`[whatsapp-handler] Whisper rate-limited: ${err}`);
+        await sendMessage(
+          msg.from,
+          "Voice note transcription is temporarily busy — please try again in a moment.",
+        );
+      } else {
+        log.error(`[whatsapp-handler] Error processing message: ${err}`);
+        await sendMessage(
+          msg.from,
+          "Something went wrong while creating your issue. Please try again later.",
+        );
+      }
     }
   };
 }
