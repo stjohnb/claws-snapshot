@@ -1,11 +1,18 @@
 import { execFile } from "node:child_process";
-import { GITHUB_OWNERS, LABELS, LABEL_SPECS, SKIPPED_ITEMS, PRIORITIZED_ITEMS, type Repo } from "./config.js";
+import { z } from "zod";
+import { GITHUB_OWNERS, LABELS, LABEL_SPECS, SKIPPED_ITEMS, PRIORITIZED_ITEMS, ALLOWED_ACTORS, CI_FIXER_MAX_ATTEMPTS, CI_FIXER_WINDOW_MS, writeConfig, SELF_REPO, type Repo, type ConfigFile } from "./config.js";
 import * as log from "./log.js";
+import { formatMs } from "./format.js";
 import { notify } from "./slack.js";
 import { reportError } from "./error-reporter.js";
+import { guardContent, makeGuardCtx } from "./prompt-guard.js";
+import type { WorkflowRunRow } from "./db.js";
+import { getInstallationTokenForOwner, extractOwnerFromGhArgs, buildEnvForGh, getAppBotLogin, listInstallationRepositories, registerOnResetCallback } from "./github-app.js";
+import { sleep } from "./util.js";
+import { retryWithBackoff } from "./retry.js";
 
 const RATE_LIMIT_RE = /rate limit/i;
-const TRANSIENT_RE = /\b(400|500|502|503|504|ETIMEDOUT|ECONNRESET|ECONNREFUSED|connection reset)\b|Could not resolve to a|TLS handshake timeout|Something went wrong/i;
+const TRANSIENT_RE = /\b(400|401|500|502|503|504|ETIMEDOUT|ECONNRESET|ECONNREFUSED|connection reset)\b|Could not resolve to a|TLS handshake timeout|Something went wrong|i\/o timeout|invalid character/i;
 const MAX_RETRIES = 3;
 
 // ── Circuit breaker (rate limit protection) ──
@@ -25,8 +32,8 @@ export function isRateLimited(): boolean {
 
 function setRateLimited(cooldownMs = 60_000): void {
   rateLimitedUntil = Date.now() + cooldownMs;
-  log.warn(`[github] Rate limit detected — blocking API calls for ${cooldownMs / 1000}s`);
-  notify(`[WARN] GitHub API rate limit hit — blocking calls for ${cooldownMs / 1000}s`);
+  log.warn(`[github] Rate limit detected — blocking API calls for ${formatMs(cooldownMs)}`);
+  notify(`[WARN] GitHub API rate limit hit — blocking calls for ${formatMs(cooldownMs)}`);
 }
 
 export function clearRateLimitState(): void {
@@ -79,33 +86,52 @@ class TTLCache<T> {
     this.inFlight.set(key, promise);
     return promise;
   }
+
+  clear(): void {
+    this.cache.clear();
+    this.inFlight.clear();
+  }
 }
 
 const apiCache = new TTLCache<unknown>();
 
 export function clearApiCache(): void {
   // Exposed for tests
-  (apiCache as any).cache.clear();
-  (apiCache as any).inFlight.clear();
+  apiCache.clear();
 }
-
-/** Hidden HTML comment appended to every comment Claws posts, used to filter out its own comments. */
-export const CLAWS_COMMENT_MARKER = "<!-- claws-automated -->";
 
 /** Visible header prepended to every comment Claws posts so conversations read naturally. */
 export const CLAWS_VISIBLE_HEADER = "*— Automated by Claws —*";
+
+/** GitHub reaction used by review-addresser to mark comments as addressed. */
+export const ADDRESSED_REACTION = "rocket";
+
+/** Pattern to extract reviewed-commit SHA from a Claws PR review comment. */
+const REVIEWED_COMMIT_PATTERN = /Reviewed commit: `([0-9a-f]+)`/;
+
+/** Marker appended by review-addresser when review is addressed without code changes. */
+export const REVIEW_ADDRESSED_MARKER = "review-addressed";
+const REVIEW_ADDRESSED_PATTERN = /(?:<!-- )?review-addressed: ([0-9a-f]+)(?: -->)?/;
 
 /** Previous visible header — kept for backward compatibility with old comments. */
 const LEGACY_VISIBLE_HEADER = "*— Automated by CLAWS —*";
 
 /** Check whether a comment body was posted by Claws. */
 export function isClawsComment(body: string): boolean {
-  return body.includes(CLAWS_COMMENT_MARKER);
+  // Detect via visible header (new comments) or legacy HTML marker (old comments)
+  return (
+    /\*— Automated by Claws(?:\s*·\s*[\w\s-]+)?\s*—\*/.test(body) ||
+    body.includes("<!-- claws-automated -->")
+  );
 }
 
-/** Strip the hidden Claws marker and visible header from a comment body. */
+/** Strip the Claws marker and visible header (with optional agent name) from a comment body. */
 export function stripClawsMarker(body: string): string {
-  return body.replace(CLAWS_COMMENT_MARKER, "").replace(CLAWS_VISIBLE_HEADER, "").replace(LEGACY_VISIBLE_HEADER, "").trim();
+  return body
+    .replace("<!-- claws-automated -->", "") // backward compat
+    .replace(/\*— Automated by Claws(?:\s*·\s*[\w\s-]+)?\s*—\*/g, "")
+    .replace(LEGACY_VISIBLE_HEADER, "")
+    .trim();
 }
 
 // ── Repo cache (shared across all jobs) ──
@@ -128,7 +154,14 @@ export type QueueCategory =
   | "refined"
   | "needs-review-addressing"
   | "auto-mergeable"
-  | "needs-triage";
+  | "needs-triage"
+  | "needs-qa"
+  | "problematic";
+
+export const ALL_QUEUE_CATEGORIES: readonly QueueCategory[] = [
+  "ready", "needs-refinement", "refined", "needs-review-addressing",
+  "auto-mergeable", "needs-triage", "needs-qa", "problematic",
+];
 
 export interface QueueItem {
   repo: string;
@@ -140,9 +173,21 @@ export interface QueueItem {
   checkStatus?: "passing" | "failing" | "pending";
   prNumber?: number;
   prioritized?: boolean;
+  labels?: string[];
+  mergeableState?: "MERGEABLE" | "CONFLICTING" | "UNKNOWN";
+  checksPassed?: number;
+  checksTotal?: number;
+  reviewStatus?: "clean" | "issues" | "none";
+  reviewIssueCount?: number;
 }
 
 const queueCache = new Map<string, { item: QueueItem; fetchedAt: number }>();
+
+/** How long a queue cache entry is considered fresh. Entries older than this
+ * are evicted on read. Longer than the slowest dispatcher interval (10 min
+ * for qa-phase / ci-fixer / triage) so a single transient scan failure does
+ * not wipe the cache. */
+export const QUEUE_ENTRY_TTL_MS = 20 * 60 * 1000;
 
 export function isItemSkipped(repo: string, number: number): boolean {
   return SKIPPED_ITEMS.some((i) => i.repo === repo && i.number === number);
@@ -156,16 +201,177 @@ export function hasPriorityLabel(labels: { name: string }[]): boolean {
   return labels.some((l) => l.name === LABELS.priority);
 }
 
+export function hasIgnoreLabel(labels: { name: string }[]): boolean {
+  return labels.some((l) => l.name === LABELS.clawsIgnore);
+}
+
+export function isDispatchSkippable(repoFullName: string, item: { number: number; labels: { name: string }[] }): boolean {
+  return isItemSkipped(repoFullName, item.number) || hasIgnoreLabel(item.labels);
+}
+
+// gh CLI returns "app/<slug>" for GitHub App authors in `--json author` output,
+// while the REST /app endpoint (used by getAppBotLogin) returns `<slug>[bot]`.
+// Normalize to the `[bot]` form so comparisons work regardless of which API
+// produced the login.
+function normalizeBotLogin(login: string): string {
+  if (login.startsWith("app/")) return `${login.slice("app/".length)}[bot]`;
+  return login;
+}
+
+/** Returns true if the login is in the configured allowedActors list or is Claws' own login. */
+export async function isAllowedActor(login: string): Promise<boolean> {
+  const normalized = normalizeBotLogin(login);
+  if (ALLOWED_ACTORS.includes(login) || ALLOWED_ACTORS.includes(normalized)) return true;
+  const self = await getSelfLogin(SELF_REPO.split("/")[0]);
+  return normalized === normalizeBotLogin(self);
+}
+
+const CI_FAILURE_ALERT_BOT_LOGINS = ["github-actions[bot]", "app/github-actions"];
+
+/**
+ * Title conventions used by repos' notify-on-failure CI workflows. Adding a new
+ * convention is a one-line edit here. Each entry is tested case-sensitively
+ * against the issue title; `prefix` matches the start, `exact` matches the whole
+ * title. The legacy `[main] <workflow> failed on main` shape is handled
+ * separately below because it constrains both ends of the title.
+ */
+const CI_ALERT_TITLE_MATCHERS: Array<{ prefix?: string; exact?: string }> = [
+  { prefix: "Build failure:" },
+  { prefix: "Cypress:" },
+  { prefix: "Lighthouse regression" },
+  { prefix: "Database backup:" },
+  { exact: "Docker publish failure" },
+];
+
+/**
+ * True for CI-failure alert issues auto-filed by a repo's notify-on-failure CI
+ * workflow. Authored by the GitHub Actions bot (not an allowed actor), but the
+ * refine-and-fix flow is meant to pick them up, so the dispatcher's actor gate
+ * grants them an exception. Requires BOTH a github-actions bot author AND a
+ * recognised CI-alert title convention — so a human-titled issue can't slip past
+ * the actor gate. Recognised conventions:
+ *   - `[main] <workflow> failed on main` (legacy notify-failures.yml)
+ *   - `Build failure: …`
+ *   - `Cypress: …`
+ *   - `Lighthouse regression …`
+ *   - `Database backup: …` (namey database-backup failure alert)
+ *   - `Docker publish failure` (GHCR docker-publish failure alert)
+ */
+export function isCiFailureAlertIssue(issue: { title: string; author: { login: string } }): boolean {
+  if (!CI_FAILURE_ALERT_BOT_LOGINS.includes(issue.author.login)) return false;
+  const title = issue.title;
+  // Legacy notify-failures convention: `[main] <workflow> failed on main`.
+  if (title.startsWith("[main] ") && title.endsWith(" failed on main")) return true;
+  return CI_ALERT_TITLE_MATCHERS.some((m) =>
+    (m.prefix !== undefined && title.startsWith(m.prefix)) ||
+    (m.exact !== undefined && title === m.exact),
+  );
+}
+
+/**
+ * True if the issue's author is the GitHub Actions bot — in either the
+ * gh-CLI `app/github-actions` form or the REST `github-actions[bot]` form.
+ * CI-alert bots are never treated as disallowed human actors: their issues
+ * (build failures, Lighthouse/Cypress regressions, etc.) are bot
+ * notifications, not human work items, so the dispatcher skips them silently
+ * rather than flagging an untrusted actor. Distinct from
+ * `isCiFailureAlertIssue`, which additionally opts `[main] … failed on main`
+ * issues INTO the refine-and-fix flow.
+ */
+export function isCiAlertBotAuthor(issue: { author: { login: string } }): boolean {
+  return CI_FAILURE_ALERT_BOT_LOGINS.includes(issue.author.login);
+}
+
+export function skipItem(repo: string, number: number): void {
+  const items = [...(SKIPPED_ITEMS as Array<{ repo: string; number: number }>)];
+  if (!items.some((i) => i.repo === repo && i.number === number)) {
+    items.push({ repo, number });
+    writeConfig({ skippedItems: items });
+  }
+  removeQueueItem(repo, number);
+}
+
+export async function postProblematicPRComment(
+  repo: string,
+  prNumber: number,
+  reason: string,
+  attemptCount: number,
+  recentErrors: Array<{ error: string; timestamp: string }>,
+): Promise<void> {
+  const body = [
+    `### 🚫 PR Marked as Problematic`,
+    `problematic-pr-marked`,
+    "",
+    `This PR has been automatically marked as problematic after **${attemptCount} failed CI fix attempts**.`,
+    "",
+    `**Reason:** ${reason}`,
+    "",
+    `Manual intervention is required to resolve the CI failures. The CI fixer will not make further automatic attempts.`,
+    "",
+    recentErrors.length > 0 ? "**Recent errors:**" : "",
+    ...recentErrors.map((e, i) => {
+      const timestamp = e.timestamp.includes("T") ? e.timestamp : e.timestamp.replace(" ", "T") + "Z";
+      const formattedDate = new Date(timestamp).toLocaleString();
+      const truncatedError = e.error.length > 1000 ? e.error.slice(0, 1000) + "\n... (truncated)" : e.error;
+      const lines = [
+        `<details>`,
+        `<summary>Attempt ${recentErrors.length - i} (${formattedDate})</summary>`,
+        "",
+        "```",
+        truncatedError,
+        "```",
+        "</details>",
+      ];
+      return lines.join("\n");
+    }),
+    "",
+    `To retry after manual fixes, remove the \`${LABELS.problematic}\` label.`,
+  ].filter(Boolean).join("\n");
+
+  await commentOnIssue(repo, prNumber, body, { agentName: "CI Fixer" });
+}
+
 export function removeQueueItem(repo: string, number: number): void {
   for (const key of queueCache.keys()) {
     if (key.endsWith(`:${repo}:${number}`)) queueCache.delete(key);
   }
 }
 
-export function populateQueueCache(category: QueueCategory, repo: string, item: { number: number; title: string; type: "issue" | "pr"; updatedAt?: string; priority?: boolean }): void {
+/**
+ * Evict queue-cache entries for `repo` in `categories` (optionally restricted
+ * to one item `type`) whose item number is NOT in `keep`. Dispatchers call this
+ * at the end of a full repo scan with the set of numbers they (re)populated this
+ * cycle, so items that dropped out — closed, merged, relabelled, feedback
+ * addressed — are removed immediately instead of lingering until
+ * QUEUE_ENTRY_TTL_MS. `type` keeps issue-dispatcher and pr-dispatcher from
+ * clobbering each other's entries in the shared "ready" category.
+ */
+export function reconcileQueueCache(
+  repo: string,
+  categories: readonly QueueCategory[],
+  keep: ReadonlySet<number>,
+  type?: "issue" | "pr",
+): void {
+  const catSet = new Set(categories);
+  for (const [key, entry] of queueCache) {
+    if (entry.item.repo !== repo) continue;
+    if (!catSet.has(entry.item.category)) continue;
+    if (type && entry.item.type !== type) continue;
+    if (!keep.has(entry.item.number)) queueCache.delete(key);
+  }
+}
+
+export function populateQueueCache(category: QueueCategory, repo: string, item: { number: number; title: string; type: "issue" | "pr"; updatedAt?: string; priority?: boolean; labels?: string[] }): void {
   if (isItemSkipped(repo, item.number)) return;
-  const key = `${category}:${repo}:${item.number}`;
-  queueCache.set(key, {
+  const newKey = `${category}:${repo}:${item.number}`;
+  // Evict any entry for the same (repo, number) under a different category
+  // so category transitions (e.g. needs-refinement → refined) cleanly replace
+  // rather than accumulate.
+  const suffix = `:${repo}:${item.number}`;
+  for (const key of queueCache.keys()) {
+    if (key !== newKey && key.endsWith(suffix)) queueCache.delete(key);
+  }
+  queueCache.set(newKey, {
     item: {
       repo,
       number: item.number,
@@ -174,30 +380,45 @@ export function populateQueueCache(category: QueueCategory, repo: string, item: 
       updatedAt: item.updatedAt ?? "",
       type: item.type,
       prioritized: isItemPrioritized(repo, item.number) || item.priority === true,
+      labels: item.labels,
     },
     fetchedAt: Date.now(),
   });
 }
 
-export function getQueueSnapshot(categories: QueueCategory[]): { items: QueueItem[]; oldestFetchAt: number | null } {
-  const seen = new Set<string>();
-  const items: QueueItem[] = [];
-  let oldestFetchAt: number | null = null;
+export function getQueueSnapshot(categories: readonly QueueCategory[]): { items: QueueItem[]; oldestFetchAt: number | null } {
   const catSet = new Set(categories);
+  const now = Date.now();
 
+  // Pass 1: evict TTL-expired entries across all categories.
+  for (const [key, entry] of queueCache) {
+    if (now - entry.fetchedAt > QUEUE_ENTRY_TTL_MS) queueCache.delete(key);
+  }
+
+  // Pass 2: for each (repo, number), keep only the freshest entry in the
+  // requested categories. Prior implementation deduped by insertion order,
+  // which preferred the OLDER entry — the root cause of stale categories
+  // appearing after a transition.
+  const best = new Map<string, { item: QueueItem; fetchedAt: number }>();
   for (const [, entry] of queueCache) {
     if (!catSet.has(entry.item.category)) continue;
+    const dedup = `${entry.item.repo}:${entry.item.number}`;
+    const existing = best.get(dedup);
+    if (!existing || entry.fetchedAt > existing.fetchedAt) {
+      best.set(dedup, entry);
+    }
+  }
+
+  const items: QueueItem[] = [];
+  let oldestFetchAt: number | null = null;
+  for (const entry of best.values()) {
     if (oldestFetchAt === null || entry.fetchedAt < oldestFetchAt) {
       oldestFetchAt = entry.fetchedAt;
     }
-    const dedup = `${entry.item.repo}:${entry.item.number}`;
-    if (seen.has(dedup)) continue;
-    seen.add(dedup);
     items.push({ ...entry.item });
   }
 
   items.sort((a, b) => {
-    // Prioritized items first
     if (a.prioritized && !b.prioritized) return -1;
     if (!a.prioritized && b.prioritized) return 1;
     return (b.updatedAt || "").localeCompare(a.updatedAt || "");
@@ -209,18 +430,44 @@ export function clearQueueCache(): void {
   queueCache.clear();
 }
 
-let _selfLogin: string | null = null;
+const _selfLoginByOwner = new Map<string, string>();
 
 export function clearSelfLoginCache(): void {
-  _selfLogin = null;
+  _selfLoginByOwner.clear();
 }
 
-export async function getSelfLogin(): Promise<string> {
-  if (!_selfLogin) {
-    const raw = await gh(["api", "user", "--jq", ".login"]);
-    _selfLogin = raw.trim();
+registerOnResetCallback(clearSelfLoginCache);
+
+export async function getSelfLogin(owner?: string): Promise<string> {
+  const key = owner ?? "";
+  const cached = _selfLoginByOwner.get(key);
+  if (cached) return cached;
+  const login = await getAppBotLogin(owner);
+  _selfLoginByOwner.set(key, login);
+  return login;
+}
+
+export async function isRepoPrivate(repo: string): Promise<boolean> {
+  try {
+    const raw = await gh(["api", `repos/${repo}`, "--jq", ".private"]);
+    return raw.trim() === "true";
+  } catch (err) {
+    if (err instanceof RateLimitError) throw err;
+    log.warn(`isRepoPrivate(${repo}): defaulting to false — ${err}`);
+    return false;
   }
-  return _selfLogin;
+}
+
+async function resolveEnvForGhArgs(args: string[]): Promise<NodeJS.ProcessEnv | undefined> {
+  const owner = extractOwnerFromGhArgs(args);
+  if (!owner) return undefined;
+  try {
+    const token = await getInstallationTokenForOwner(owner);
+    return buildEnvForGh(token);
+  } catch (err) {
+    log.warn(`[github-app] gh token fetch failed for ${owner}: ${err instanceof Error ? err.message : String(err)}`);
+    return undefined;
+  }
 }
 
 function gh(args: string[]): Promise<string> {
@@ -235,62 +482,133 @@ function gh(args: string[]): Promise<string> {
     notify("[INFO] GitHub API rate limit passed — resuming operations");
   }
 
-  return new Promise((resolve, reject) => {
-    let attempt = 0;
-
-    function run() {
-      execFile("gh", args, { maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
-        if (err) {
-          const msg = stderr || err.message;
-
-          // Rate limit — trip circuit breaker, reject immediately (no retry)
-          if (RATE_LIMIT_RE.test(msg)) {
-            setRateLimited();
-            reject(new RateLimitError(`gh ${args.join(" ")} failed: ${msg}`));
-            return;
+  return retryWithBackoff(
+    async () => {
+      const env = await resolveEnvForGhArgs(args);
+      return new Promise<string>((resolve, reject) => {
+        execFile("gh", args, { maxBuffer: 10 * 1024 * 1024, env }, (err, stdout, stderr) => {
+          if (err) {
+            const msg = stderr || err.message;
+            if (RATE_LIMIT_RE.test(msg)) {
+              setRateLimited();
+              reject(Object.assign(new RateLimitError(`gh ${args.join(" ")} failed: ${msg}`), { stderr }));
+              return;
+            }
+            reject(Object.assign(new Error(`gh ${args.join(" ")} failed: ${msg}`), { stderr }));
+          } else {
+            resolve(stdout);
           }
-
-          // Transient errors — retry with exponential backoff
-          const isTransient = TRANSIENT_RE.test(msg) || !stderr.trim();
-          if (attempt < MAX_RETRIES && isTransient) {
-            attempt++;
-            const delay = 1000 * 2 ** (attempt - 1); // 1s, 2s, 4s
-            log.warn(`gh ${args[0]} transient error (attempt ${attempt}/${MAX_RETRIES}), retrying in ${delay}ms`);
-            setTimeout(run, delay);
-            return;
-          }
-          reject(new Error(`gh ${args.join(" ")} failed: ${msg}`));
-        } else {
-          resolve(stdout);
-        }
+        });
       });
-    }
-
-    run();
-  });
+    },
+    MAX_RETRIES,
+    (err: Error) => {
+      const ghErr = err as Error & { stderr?: string };
+      return TRANSIENT_RE.test(err.message) || (ghErr.stderr !== undefined && !ghErr.stderr.trim());
+    },
+    `gh ${args[0]}`,
+  );
 }
 
-function safeJsonParse<T>(raw: string, context: string): T {
+// `gh --json` returns "" when there are no results for a list query — so the
+// empty-string fallback to [] is correct. For object-returning calls, an empty
+// stdout would fail Zod validation (an array doesn't match an object schema),
+// surfacing the unexpected gh behaviour instead of crashing on JSON.parse("").
+function safeJsonParse<T>(schema: z.ZodType<T>, raw: string, context: string): T {
+  const trimmed = raw.trim();
+  let parsed: unknown;
   try {
-    return JSON.parse(raw) as T;
+    parsed = trimmed === "" ? [] : JSON.parse(trimmed);
   } catch {
     throw new Error(`Failed to parse JSON from gh ${context}: ${raw.slice(0, 200)}`);
   }
+  try {
+    return schema.parse(parsed);
+  } catch (e) {
+    if (e instanceof z.ZodError) {
+      throw new Error(`Unexpected shape from gh ${context}: ${e.message}`);
+    }
+    throw e;
+  }
 }
 
-function ghJson<T>(args: string[]): Promise<T> {
-  return gh([...args, "--json"]).then((out) => safeJsonParse<T>(out, args[0]));
-}
+// ── gh JSON schemas ──
+
+const LabelNameSchema = z.object({ name: z.string() });
+const AuthorSchema = z.object({ login: z.string() });
+
+const SearchResultSchema = z.object({
+  number: z.number(),
+  title: z.string(),
+});
+
+const IssueSchema = z.object({
+  number: z.number(),
+  title: z.string(),
+  body: z.string(),
+  labels: z.array(LabelNameSchema),
+  author: AuthorSchema,
+  updatedAt: z.string().optional(),
+});
+
+const PrSchema = z.object({
+  number: z.number(),
+  title: z.string(),
+  headRefName: z.string(),
+  baseRefName: z.string(),
+  labels: z.array(LabelNameSchema),
+  author: AuthorSchema,
+  updatedAt: z.string().optional(),
+  body: z.string().optional(),
+  // Not requested by every `pr list --json` call site (e.g. listMergedPRsForIssue
+  // omits it), so the schema permits its absence.
+  isCrossRepository: z.boolean().optional(),
+});
+
+const ReactionSchema = z.object({
+  id: z.number(),
+  user: AuthorSchema,
+  content: z.string(),
+});
+
+const BranchPrSchema = z.object({
+  number: z.number(),
+  state: z.string(),
+  mergedAt: z.string().optional(),
+  closedAt: z.string().optional(),
+});
+
+const WorkflowRunSchema = z.object({
+  run_id: z.number(),
+  workflow_name: z.string(),
+  status: z.string(),
+  conclusion: z.string().nullable(),
+  event: z.string(),
+  head_branch: z.string().nullable(),
+  created_at: z.string(),
+  run_started_at: z.string().nullable(),
+  updated_at: z.string(),
+});
+
+const IssueCommentRawSchema = z.object({
+  id: z.number(),
+  body: z.string(),
+  body_html: z.string().optional(),
+  user: AuthorSchema,
+});
+
+const PrCheckSchema = z.object({
+  name: z.string(),
+  state: z.string(),
+});
+
+const FailedCheckSchema = z.object({
+  name: z.string(),
+  state: z.string(),
+  link: z.string(),
+});
 
 // ── Repo discovery ──
-
-interface GhRepoEntry {
-  nameWithOwner: string;
-  name: string;
-  owner: { login: string };
-  defaultBranchRef: { name: string } | null;
-  isArchived: boolean;
-}
 
 export async function listRepos(): Promise<Repo[]> {
   // Return cached result if still fresh
@@ -326,24 +644,14 @@ async function fetchRepos(): Promise<Repo[]> {
 
   for (const owner of GITHUB_OWNERS) {
     try {
-      const raw = await gh([
-        "repo",
-        "list",
-        owner,
-        "--no-archived",
-        "--source",
-        "--limit",
-        "200",
-        "--json",
-        "nameWithOwner,name,owner,defaultBranchRef,isArchived",
-      ]);
-      const entries: GhRepoEntry[] = safeJsonParse(raw, "repo list");
+      const entries = await listInstallationRepositories(owner);
       for (const e of entries) {
+        if (e.isArchived) continue;
         repos.push({
-          owner: e.owner.login,
+          owner: e.owner,
           name: e.name,
-          fullName: e.nameWithOwner,
-          defaultBranch: e.defaultBranchRef?.name ?? "main",
+          fullName: e.fullName,
+          defaultBranch: e.defaultBranch,
         });
       }
     } catch (err) {
@@ -374,7 +682,7 @@ export async function searchIssues(
     "--",
     titleQuery,
   ]);
-  return safeJsonParse(raw, "search issues") as { number: number; title: string }[];
+  return safeJsonParse(z.array(SearchResultSchema), raw, "search issues");
 }
 
 export async function searchPRs(
@@ -395,7 +703,7 @@ export async function searchPRs(
     "--",
     titleQuery,
   ]);
-  return safeJsonParse(raw, "search prs") as { number: number; title: string }[];
+  return safeJsonParse(z.array(SearchResultSchema), raw, "search prs");
 }
 
 export async function createIssue(
@@ -439,9 +747,9 @@ export async function listOpenIssues(
       "--repo", repo,
       "--state", "open",
       "--limit", "100",
-      "--json", "number,title,body,labels,updatedAt",
+      "--json", "number,title,body,labels,author,updatedAt",
     ]);
-    return safeJsonParse(raw, "issue list") as Issue[];
+    return safeJsonParse(z.array(IssueSchema), raw, "issue list");
   }) as Promise<Issue[]>;
 }
 
@@ -485,7 +793,7 @@ export async function listLabels(repo: string): Promise<string[]> {
     "--limit", "100",
     "--json", "name",
   ]);
-  const labels = safeJsonParse(raw, "label list") as { name: string }[];
+  const labels = safeJsonParse(z.array(LabelNameSchema), raw, "label list");
   return labels.map((l) => l.name);
 }
 
@@ -531,6 +839,7 @@ export interface Issue {
   title: string;
   body: string;
   labels: { name: string }[];
+  author: { login: string };
   updatedAt?: string;
 }
 
@@ -546,10 +855,28 @@ export async function listIssuesByLabel(repo: string, label: string): Promise<Is
       "--state",
       "open",
       "--json",
-      "number,title,body,labels,updatedAt",
+      "number,title,body,labels,author,updatedAt",
     ]);
-    return safeJsonParse(raw, "issue list by label") as Issue[];
+    return safeJsonParse(z.array(IssueSchema), raw, "issue list by label");
   }) as Promise<Issue[]>;
+}
+
+export async function listDuplicateIssuesOf(repo: string, canonicalNumber: number): Promise<Issue[]> {
+  const raw = await gh([
+    "issue",
+    "list",
+    "--repo",
+    repo,
+    "--label",
+    LABELS.duplicate,
+    "--state",
+    "open",
+    "--search",
+    `"claws-duplicate-of:${canonicalNumber}" in:comments`,
+    "--json",
+    "number,title,body,labels,author,updatedAt",
+  ]);
+  return safeJsonParse(z.array(IssueSchema), raw, "listDuplicateIssuesOf");
 }
 
 export async function getIssueBody(repo: string, issueNumber: number): Promise<string> {
@@ -562,14 +889,47 @@ export async function getIssueBody(repo: string, issueNumber: number): Promise<s
     "--json",
     "body",
   ]);
-  const parsed = safeJsonParse(raw, "issue view") as { body: string };
+  const parsed = safeJsonParse(z.object({ body: z.string() }), raw, "issue view");
   return parsed.body;
 }
 
-export async function commentOnIssue(repo: string, issueNumber: number, body: string): Promise<void> {
-  const fullBody = CLAWS_VISIBLE_HEADER + "\n\n" + body + "\n" + CLAWS_COMMENT_MARKER;
+export async function getIssueBodyHtml(repo: string, issueNumber: number): Promise<string> {
+  const raw = await gh([
+    "api",
+    `repos/${repo}/issues/${issueNumber}`,
+    "-H", "Accept: application/vnd.github.full+json",
+  ]);
+  const parsed = safeJsonParse(z.object({ body_html: z.string().nullish() }), raw, "issue body_html");
+  return parsed.body_html ?? "";
+}
+
+export async function getIssueState(
+  repo: string,
+  issueNumber: number,
+): Promise<{ state: string; stateReason: string | null }> {
+  const raw = await gh([
+    "issue", "view", String(issueNumber),
+    "--repo", repo,
+    "--json", "state,stateReason",
+  ]);
+  return safeJsonParse(
+    z.object({ state: z.string(), stateReason: z.string().nullable() }),
+    raw,
+    "issue view state",
+  );
+}
+
+export async function commentOnIssue(repo: string, issueNumber: number, body: string, opts?: { agentName?: string }): Promise<void> {
+  const header = opts?.agentName
+    ? `*— Automated by Claws · ${opts.agentName} —*`
+    : CLAWS_VISIBLE_HEADER;
+  const fullBody = header + "\n\n" + body;
   await gh(["issue", "comment", String(issueNumber), "--repo", repo, "--body", fullBody]);
   apiCache.invalidate(`issue-comments:${repo}:${issueNumber}`);
+}
+
+export async function editIssue(repo: string, issueNumber: number, body: string): Promise<void> {
+  await gh(["issue", "edit", String(issueNumber), "--repo", repo, "--body", body]);
 }
 
 export async function closeIssue(
@@ -585,6 +945,7 @@ export async function closeIssue(
 export interface IssueComment {
   id: number;
   body: string;
+  body_html: string;
   login: string;
 }
 
@@ -593,14 +954,18 @@ export async function getIssueComments(repo: string, issueNumber: number): Promi
     const raw = await gh([
       "api",
       `repos/${repo}/issues/${issueNumber}/comments`,
+      "-H", "Accept: application/vnd.github.full+json",
     ]);
-    const comments = safeJsonParse(raw, "issue comments") as { id: number; body: string; user: { login: string } }[];
-    return comments.filter((c) => c.body.trim()).map((c) => ({ id: c.id, body: c.body, login: c.user.login }));
+    const comments = safeJsonParse(z.array(IssueCommentRawSchema), raw, "issue comments");
+    return comments.filter((c) => c.body.trim()).map((c) => ({ id: c.id, body: c.body, body_html: c.body_html ?? "", login: c.user.login }));
   }) as Promise<IssueComment[]>;
 }
 
-export async function editIssueComment(repo: string, commentId: number, body: string): Promise<void> {
-  const fullBody = CLAWS_VISIBLE_HEADER + "\n\n" + body + "\n" + CLAWS_COMMENT_MARKER;
+export async function editIssueComment(repo: string, commentId: number, body: string, opts?: { agentName?: string }): Promise<void> {
+  const header = opts?.agentName
+    ? `*— Automated by Claws · ${opts.agentName} —*`
+    : CLAWS_VISIBLE_HEADER;
+  const fullBody = header + "\n\n" + body;
   await gh([
     "api", "--method", "PATCH",
     `repos/${repo}/issues/comments/${commentId}`,
@@ -620,6 +985,16 @@ export interface PR {
   author: { login: string };
   updatedAt?: string;
   body?: string;
+  isCrossRepository?: boolean;
+}
+
+// Wrapper to allow future expansion (e.g. checking headRepositoryOwner)
+export function isForkPR(pr: PR): boolean {
+  return pr.isCrossRepository === true;
+}
+
+export function isDependabotPR(pr: PR): boolean {
+  return pr.author.login === "dependabot[bot]" || pr.author.login === "app/dependabot";
 }
 
 export async function createPR(
@@ -662,9 +1037,9 @@ export async function listPRs(repo: string): Promise<PR[]> {
       "--limit",
       "200",
       "--json",
-      "number,title,headRefName,baseRefName,labels,author",
+      "number,title,headRefName,baseRefName,labels,author,isCrossRepository,updatedAt",
     ]);
-    return safeJsonParse(raw, "pr list") as PR[];
+    return safeJsonParse(z.array(PrSchema), raw, "pr list");
   }) as Promise<PR[]>;
 }
 
@@ -673,11 +1048,11 @@ export async function listMergedPRsForIssue(repo: string, issueNumber: number): 
     "pr", "list",
     "--repo", repo,
     "--state", "merged",
-    "--search", String(issueNumber),
+    "--search", `head:claws/issue-${issueNumber}-`,
     "--limit", "100",
     "--json", "number,title,headRefName,baseRefName,labels,author,body",
   ]);
-  const prs = safeJsonParse(raw, "pr list merged") as PR[];
+  const prs = safeJsonParse(z.array(PrSchema), raw, "pr list merged");
   const branchPrefix = `claws/issue-${issueNumber}-`;
   return prs.filter((pr) => pr.headRefName.startsWith(branchPrefix));
 }
@@ -691,22 +1066,23 @@ export async function getOpenPRForIssue(repo: string, issueNumber: number): Prom
 export async function getPRMergeableState(
   repo: string,
   prNumber: number,
+  maxAttempts = 5,
+  delayMs = 3000,
 ): Promise<"MERGEABLE" | "CONFLICTING" | "UNKNOWN"> {
-  const raw = await gh([
-    "pr", "view", String(prNumber),
-    "--repo", repo,
-    "--json", "mergeable",
-  ]);
-  const parsed = safeJsonParse(raw, "pr view") as { mergeable: string };
-  return parsed.mergeable as "MERGEABLE" | "CONFLICTING" | "UNKNOWN";
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const raw = await gh(["pr", "view", String(prNumber), "--repo", repo, "--json", "mergeable"]);
+    const parsed = safeJsonParse(z.object({ mergeable: z.string() }), raw, "pr view");
+    const state = parsed.mergeable as "MERGEABLE" | "CONFLICTING" | "UNKNOWN";
+    if (state !== "UNKNOWN") return state;
+    if (attempt < maxAttempts - 1) await sleep(delayMs);
+  }
+  return "UNKNOWN";
 }
 
 // ── Checks ──
 
-export interface CheckRun {
-  name: string;
-  status: string;
-  conclusion: string;
+function normalizeCheckState(s: string): string {
+  return s.toUpperCase();
 }
 
 const FAILED_STATES = new Set([
@@ -737,37 +1113,87 @@ export async function getPRCheckStatus(
         "name,state",
       ]);
     } catch (err) {
-      if (err instanceof Error && /no checks reported/i.test(err.message)) {
+      if (err instanceof Error && /no checks reported|invalid character/i.test(err.message)) {
         return "none";
       }
       throw err;
     }
-    const checks = JSON.parse(raw) as { name: string; state: string }[];
-    if (checks.some((c) => FAILED_STATES.has(c.state))) return "failing";
-    if (checks.length > 0 && checks.every((c) => PASSING_STATES.has(c.state))) return "passing";
+    const checks = safeJsonParse(z.array(PrCheckSchema), raw, "pr checks");
+    if (checks.some((c) => FAILED_STATES.has(normalizeCheckState(c.state)))) return "failing";
+    if (checks.length > 0 && checks.every((c) => PASSING_STATES.has(normalizeCheckState(c.state)))) return "passing";
     if (checks.length === 0) return "none";
     return "pending";
   }) as Promise<"passing" | "failing" | "pending" | "none">;
 }
 
-export async function prChecksFailing(repo: string, prNumber: number): Promise<boolean> {
-  try {
-    return (await getPRCheckStatus(repo, prNumber)) === "failing";
-  } catch {
-    return false;
-  }
+export async function getPRChecksSummary(
+  repo: string,
+  prNumber: number,
+): Promise<{ status: "passing" | "failing" | "pending" | "none"; passed: number; total: number }> {
+  return apiCache.dedupedFetch(`pr-checks-sum:${repo}:${prNumber}`, 30_000, async () => {
+    let raw: string;
+    try {
+      raw = await gh(["pr", "checks", String(prNumber), "--repo", repo, "--json", "name,state"]);
+    } catch (err) {
+      if (err instanceof Error && /no checks reported|invalid character/i.test(err.message)) {
+        return { status: "none" as const, passed: 0, total: 0 };
+      }
+      throw err;
+    }
+    const checks = safeJsonParse(z.array(PrCheckSchema), raw, "pr checks");
+    const total = checks.length;
+    const passed = checks.filter((c) => PASSING_STATES.has(normalizeCheckState(c.state))).length;
+    const failedCount = checks.filter((c) => FAILED_STATES.has(normalizeCheckState(c.state))).length;
+    let status: "passing" | "failing" | "pending" | "none";
+    if (total === 0) status = "none";
+    else if (failedCount > 0) status = "failing";
+    else if (passed === total) status = "passing";
+    else status = "pending";
+    return { status, passed, total };
+  }) as Promise<{ status: "passing" | "failing" | "pending" | "none"; passed: number; total: number }>;
 }
 
-export async function prChecksPassing(repo: string, prNumber: number): Promise<boolean> {
-  try {
-    return (await getPRCheckStatus(repo, prNumber)) === "passing";
-  } catch {
-    return false;
-  }
+const REVIEW_HEADER_TEXT = "## PR Review";
+const REVIEW_CLEAN_MARKER = "review-result: clean";
+
+export async function getPRReviewStatus(
+  repo: string,
+  prNumber: number,
+): Promise<{ status: "clean" | "issues" | "none"; issueCount: number }> {
+  return apiCache.dedupedFetch(`pr-review-status:${repo}:${prNumber}`, 60_000, async () => {
+    try {
+      const comments = await getIssueComments(repo, prNumber);
+      let latest: { body: string } | null = null;
+      for (const c of comments) {
+        if (isClawsComment(c.body) && c.body.includes(REVIEW_HEADER_TEXT)) latest = { body: c.body };
+      }
+      if (!latest) return { status: "none" as const, issueCount: 0 };
+      if (latest.body.includes(REVIEW_CLEAN_MARKER)) return { status: "clean" as const, issueCount: 0 };
+
+      const stripped = stripClawsMarker(latest.body)
+        .replace(/## PR Review\s*/, "")
+        .replace(/\*Review #\d+\*\s*/, "")
+        .replace(/Reviewed commit: `[0-9a-f]+`/, "")
+        .replace(/(?:<!-- )?review-iteration: \d+(?: -->)?/g, "")
+        .replace(/<details>[\s\S]*?<\/details>/g, "")
+        .trim();
+      if (!stripped || /^Reviewed\s*—\s*no issues found\.?$/i.test(stripped)) {
+        return { status: "clean" as const, issueCount: 0 };
+      }
+      const numbered = (stripped.match(/^\s*\d+\.\s/gm) ?? []).length;
+      const headings = (stripped.match(/^#{2,4}\s+\S/gm) ?? []).length;
+      const issueCount = numbered > 0 ? numbered : headings;
+      return { status: "issues" as const, issueCount };
+    } catch {
+      return { status: "none" as const, issueCount: 0 };
+    }
+  }) as Promise<{ status: "clean" | "issues" | "none"; issueCount: number }>;
 }
 
-export async function updatePRBody(repo: string, prNumber: number, body: string): Promise<void> {
-  await gh(["pr", "edit", "--repo", repo, String(prNumber), "--body", body]);
+export async function updatePR(repo: string, prNumber: number, body: string, title?: string): Promise<void> {
+  const args = ["pr", "edit", "--repo", repo, String(prNumber), "--body", body];
+  if (title) args.push("--title", title);
+  await gh(args);
 }
 
 export async function mergePR(repo: string, prNumber: number): Promise<void> {
@@ -793,6 +1219,7 @@ export async function addReviewCommentReaction(repo: string, commentId: number, 
 }
 
 export interface Reaction {
+  id: number;
   user: { login: string };
   content: string;
 }
@@ -800,23 +1227,31 @@ export interface Reaction {
 export async function getCommentReactions(repo: string, commentId: number): Promise<Reaction[]> {
   return apiCache.dedupedFetch(`comment-reactions:${repo}:${commentId}`, 60_000, async () => {
     const raw = await gh(["api", `repos/${repo}/issues/comments/${commentId}/reactions`]);
-    return safeJsonParse(raw, "comment reactions") as Reaction[];
+    return safeJsonParse(z.array(ReactionSchema), raw, "comment reactions");
   }) as Promise<Reaction[]>;
 }
 
-export async function getPRReviewDecision(repo: string, prNumber: number): Promise<string> {
-  const raw = await gh(["pr", "view", "--repo", repo, String(prNumber), "--json", "reviewDecision"]);
-  const parsed = safeJsonParse(raw, "pr review decision") as { reviewDecision: string };
-  return parsed.reviewDecision ?? "";
-}
-
-export async function getPRLatestCommitDate(repo: string, prNumber: number): Promise<string> {
+export async function listCompareCommits(
+  repo: string,
+  base: string,
+  head: string,
+): Promise<{ sha: string; subject: string }[]> {
   const raw = await gh([
     "api",
-    `repos/${repo}/pulls/${prNumber}/commits`,
-    "--jq", ".[-1].commit.committer.date",
+    `repos/${repo}/compare/${base}...${head}`,
+    "--jq", '{ commits: [.commits[] | { sha: .sha, message: .commit.message }] }',
   ]);
-  return raw.trim();
+  const parsed = safeJsonParse(
+    z.object({
+      commits: z.array(z.object({ sha: z.string(), message: z.string() })),
+    }),
+    raw,
+    "compare commits",
+  );
+  return parsed.commits.map((c) => ({
+    sha: c.sha,
+    subject: c.message.split("\n", 1)[0]!.trim(),
+  }));
 }
 
 function isMergeFromBase(
@@ -833,50 +1268,66 @@ function isMergeFromBase(
 }
 
 export async function hasValidLGTM(repo: string, prNumber: number, baseBranch: string): Promise<boolean> {
-  const commitsRaw = await gh([
-    "api",
-    `repos/${repo}/pulls/${prNumber}/commits`,
-    "--paginate",
-  ]);
+  try {
+    const commitsRaw = await gh([
+      "api",
+      `repos/${repo}/pulls/${prNumber}/commits`,
+      "--paginate",
+    ]);
 
-  const commits = safeJsonParse(commitsRaw, "pr commits for LGTM") as {
-    commit: { message: string; committer: { date: string } };
-    parents: { sha: string }[];
-  }[];
+    const commits = safeJsonParse(
+      z.array(z.object({
+        commit: z.object({
+          message: z.string(),
+          committer: z.object({ date: z.string() }),
+        }),
+        parents: z.array(z.object({ sha: z.string() })),
+      })),
+      commitsRaw,
+      "pr commits for LGTM",
+    );
 
-  const nonMergeCommits = commits.filter(
-    (c) => !isMergeFromBase({ message: c.commit.message, parents: c.parents }, baseBranch),
-  );
+    const nonMergeCommits = commits.filter(
+      (c) => !isMergeFromBase({ message: c.commit.message, parents: c.parents }, baseBranch),
+    );
 
-  const raw = await gh([
-    "api",
-    `repos/${repo}/issues/${prNumber}/comments`,
-    "--paginate",
-  ]);
-  const comments = safeJsonParse(raw, "issue comments for LGTM") as {
-    body: string;
-    user: { login: string };
-    created_at: string;
-  }[];
+    const raw = await gh([
+      "api",
+      `repos/${repo}/issues/${prNumber}/comments`,
+      "--paginate",
+    ]);
+    const comments = safeJsonParse(
+      z.array(z.object({
+        body: z.string(),
+        user: AuthorSchema,
+        created_at: z.string(),
+      })),
+      raw,
+      "issue comments for LGTM",
+    );
 
-  // Find the latest valid LGTM comment (exact match, case-insensitive)
-  let latestLGTM: { created_at: string } | null = null;
-  for (const comment of comments) {
-    if (comment.body.trim().toUpperCase() !== "LGTM") continue;
-    if (isClawsComment(comment.body)) continue;
-    if (!latestLGTM || comment.created_at > latestLGTM.created_at) {
-      latestLGTM = comment;
+    // Find the latest valid LGTM comment (exact match, case-insensitive)
+    let latestLGTM: { created_at: string } | null = null;
+    for (const comment of comments) {
+      if (comment.body.trim().toUpperCase() !== "LGTM") continue;
+      if (isClawsComment(comment.body)) continue;
+      if (!latestLGTM || comment.created_at > latestLGTM.created_at) {
+        latestLGTM = comment;
+      }
     }
+
+    if (!latestLGTM) return false;
+
+    // If all commits are merge-from-base, LGTM is still valid
+    if (nonMergeCommits.length === 0) return true;
+
+    // LGTM is only valid if posted after the latest non-merge commit
+    const commitDate = nonMergeCommits.at(-1)!.commit.committer.date;
+    return latestLGTM.created_at > commitDate;
+  } catch (err) {
+    log.warn(`hasValidLGTM for PR #${prNumber} in ${repo}: ${err}`);
+    return false;
   }
-
-  if (!latestLGTM) return false;
-
-  // If all commits are merge-from-base, LGTM is still valid
-  if (nonMergeCommits.length === 0) return true;
-
-  // LGTM is only valid if posted after the latest non-merge commit
-  const commitDate = nonMergeCommits.at(-1)!.commit.committer.date;
-  return latestLGTM.created_at > commitDate;
 }
 
 /**
@@ -913,7 +1364,30 @@ async function getResolvedCommentIds(
     }`;
 
     const raw = await gh(["api", "graphql", "-f", `query=${query}`]);
-    const data = JSON.parse(raw);
+    const data = safeJsonParse(
+      z.object({
+        data: z.object({
+          repository: z.object({
+            pullRequest: z.object({
+              reviewThreads: z.object({
+                pageInfo: z.object({
+                  hasNextPage: z.boolean(),
+                  endCursor: z.string().nullable(),
+                }),
+                nodes: z.array(z.object({
+                  isResolved: z.boolean(),
+                  comments: z.object({
+                    nodes: z.array(z.object({ databaseId: z.number() })),
+                  }),
+                })),
+              }),
+            }),
+          }),
+        }),
+      }),
+      raw,
+      "graphql review threads",
+    );
     const threads = data.data.repository.pullRequest.reviewThreads;
 
     for (const thread of threads.nodes) {
@@ -935,39 +1409,69 @@ export interface PRReviewData {
   formatted: string;
   commentIds: number[];
   reviewCommentIds: number[];
+  /** HTML bodies for all comments in formatted — used for image-URL extraction only; not passed to the model. */
+  htmlBodies: string[];
+  /** The Claws PR review comment needing addressing, if any. */
+  prReviewComment?: { id: number; body: string; reviewedCommit: string };
 }
 
 export async function getPRReviewComments(repo: string, prNumber: number): Promise<PRReviewData> {
-  const empty: PRReviewData = { formatted: "", commentIds: [], reviewCommentIds: [] };
+  const empty: PRReviewData = { formatted: "", commentIds: [], reviewCommentIds: [], htmlBodies: [], prReviewComment: undefined };
   try {
-    const selfLogin = await getSelfLogin();
+    const owner = repo.split("/")[0];
+    const selfLogin = await getSelfLogin(owner);
+
+    // Fetch PR body HTML for image-URL extraction (pre-signed URLs are in body_html, not body).
+    let prBodyHtml = "";
+    try {
+      const prRaw = await gh([
+        "api", `repos/${repo}/pulls/${prNumber}`,
+        "-H", "Accept: application/vnd.github.full+json",
+      ]);
+      const prParsed = safeJsonParse(z.object({ body_html: z.string().nullish() }), prRaw, "pr body_html");
+      prBodyHtml = prParsed.body_html ?? "";
+    } catch (prHtmlErr) {
+      log.warn(`getPRReviewComments: failed to fetch PR body HTML for ${repo}#${prNumber}: ${prHtmlErr}`);
+    }
 
     // Fetch reviews (top-level review bodies with their status)
     const reviewsRaw = await gh([
       "api",
       `repos/${repo}/pulls/${prNumber}/reviews`,
       "--paginate",
+      "-H", "Accept: application/vnd.github.full+json",
     ]);
-    const reviews = JSON.parse(reviewsRaw) as {
-      user: { login: string };
-      state: string;
-      body: string;
-    }[];
+    const reviews = safeJsonParse(
+      z.array(z.object({
+        user: AuthorSchema,
+        state: z.string(),
+        body: z.string(),
+        body_html: z.string().nullish(),
+      })),
+      reviewsRaw,
+      "pr reviews",
+    );
 
     // Fetch inline review comments (comments on specific code lines)
     const commentsRaw = await gh([
       "api",
       `repos/${repo}/pulls/${prNumber}/comments`,
       "--paginate",
+      "-H", "Accept: application/vnd.github.full+json",
     ]);
-    const allComments = JSON.parse(commentsRaw) as {
-      id: number;
-      user: { login: string };
-      path: string;
-      line: number | null;
-      body: string;
-      diff_hunk: string;
-    }[];
+    const allComments = safeJsonParse(
+      z.array(z.object({
+        id: z.number(),
+        user: AuthorSchema,
+        path: z.string(),
+        line: z.number().nullable(),
+        body: z.string(),
+        body_html: z.string().nullish(),
+        diff_hunk: z.string(),
+      })),
+      commentsRaw,
+      "pr review comments",
+    );
 
     // Filter out comments that belong to resolved review threads.
     const resolvedIds = await getResolvedCommentIds(repo, prNumber);
@@ -978,69 +1482,175 @@ export async function getPRReviewComments(repo: string, prNumber: number): Promi
       "api",
       `repos/${repo}/issues/${prNumber}/comments`,
       "--paginate",
+      "-H", "Accept: application/vnd.github.full+json",
     ]);
-    const issueComments = JSON.parse(issueCommentsRaw) as {
-      id: number;
-      user: { login: string };
-      body: string;
-    }[];
+    const issueComments = safeJsonParse(
+      z.array(z.object({
+        id: z.number(),
+        user: AuthorSchema,
+        body: z.string(),
+        body_html: z.string().nullish(),
+      })),
+      issueCommentsRaw,
+      "pr issue comments",
+    );
 
-    const parts: string[] = [];
+    const humanParts: string[] = [];
+    const clawsReviewParts: string[] = [];
+    const clawsOtherParts: string[] = [];
+    // HTML bodies for image-URL extraction only; not passed to the model.
+    const htmlBodies: string[] = [];
+    if (prBodyHtml) htmlBodies.push(prBodyHtml);
     const commentIds: number[] = [];
     const reviewCommentIds: number[] = [];
+    let headSha: string | undefined;
+    let prReviewComment: PRReviewData["prReviewComment"];
 
     // Add review bodies that have content
+    const guardCtx = makeGuardCtx(repo, prNumber);
     for (const review of reviews) {
       if (review.body?.trim()) {
-        parts.push(`Review by @${review.user.login} (${review.state}):\n${review.body}`);
+        // Claws doesn't write top-level review bodies via the reviews API, so all are human-authored.
+        const body = guardContent(review.body, guardCtx("review-body"));
+        humanParts.push(`Review by @${review.user.login} (${review.state}):\n${body}`);
+        if (review.body_html) htmlBodies.push(review.body_html);
       }
     }
 
-    // Check which inline comments already have a 👍 from Claws
+    // Check which inline comments already have a 🚀 from Claws (addressed)
     for (const comment of comments) {
-      // Check for existing 👍 reaction from Claws
-      let hasClawsReaction = false;
+      let hasClawsAddressed = false;
       try {
         const reactionsRaw = await gh(["api", `repos/${repo}/pulls/comments/${comment.id}/reactions`]);
-        const reactions = JSON.parse(reactionsRaw) as Reaction[];
-        hasClawsReaction = reactions.some((r) => r.user.login === selfLogin && r.content === "+1");
+        const reactions = safeJsonParse(z.array(ReactionSchema), reactionsRaw, "pr review comment reactions");
+        hasClawsAddressed = reactions.some((r) => r.user.login === selfLogin && r.content === ADDRESSED_REACTION);
       } catch { /* treat as no reaction */ }
-      if (hasClawsReaction) continue;
+      if (hasClawsAddressed) continue;
 
       const location = comment.line ? `${comment.path}:${comment.line}` : comment.path;
-      parts.push(
+      // Inline review comments are always human-authored (Claws doesn't write inline review comments).
+      const commentBody = guardContent(comment.body, guardCtx("review-comments"));
+      humanParts.push(
         `Inline comment by @${comment.user.login} on ${location}:\n` +
-          `\`\`\`\n${comment.diff_hunk}\n\`\`\`\n${comment.body}`,
+          `\`\`\`\n${comment.diff_hunk}\n\`\`\`\n${commentBody}`,
       );
+      if (comment.body_html) htmlBodies.push(comment.body_html);
       reviewCommentIds.push(comment.id);
     }
 
-    // Add non-Claws, non-bot issue-tab comments without 👍 from Claws
+    // Add non-Claws, non-bot issue-tab comments without 🚀 from Claws
+    // Human comments don't need 👍 — posting is the instruction
     for (const comment of issueComments) {
       if (!comment.body?.trim()) continue;
       if (comment.body.trim().toUpperCase() === "LGTM") continue;
-      if (isClawsComment(comment.body)) {
-        parts.push(`Comment by @${comment.user.login} (automated by Claws):\n${stripClawsMarker(comment.body)}`);
+      if (comment.user.login === selfLogin && isClawsComment(comment.body)) {
+        const isReviewComment = comment.body.includes("## PR Review");
+
+        if (isReviewComment) {
+          // SHA-based filtering — no rocket reaction needed for PR review comments
+          const commitMatch = comment.body.match(REVIEWED_COMMIT_PATTERN);
+          if (commitMatch) {
+            // Lazy-fetch HEAD SHA only when we encounter a PR review comment
+            if (!headSha) headSha = await getPRHeadSHA(repo, prNumber);
+            const reviewedCommit = commitMatch[1];
+
+            // Skip stale reviews (reviewed a different commit than current HEAD)
+            if (!headSha.startsWith(reviewedCommit)) continue;
+
+            // Skip reviews already addressed without code changes
+            const addressedMatch = comment.body.match(REVIEW_ADDRESSED_PATTERN);
+            if (addressedMatch && addressedMatch[1] === reviewedCommit) continue;
+          }
+
+          // Skip clean reviews — no work for the addresser
+          if (comment.body.includes(REVIEW_CLEAN_MARKER)) continue;
+
+          const stripped = stripClawsMarker(comment.body);
+          const cleanedReviewBody = stripped
+            .replace(/## PR Review\s*/, "")
+            .replace(REVIEWED_COMMIT_PATTERN, "")
+            .replace(REVIEW_ADDRESSED_PATTERN, "")
+            .replace(/(?:<!-- )?review-iteration: \d+(?: -->)?/g, "")
+            .replace(/\*Review #\d+\*\s*/, "")
+            .replace(/###?\s+Review of PR\s*#?\s*\d*\s*/g, "")
+            .trim();
+          const isCleanReview =
+            !cleanedReviewBody ||
+            /^Reviewed\s*—\s*no issues found\.?$/i.test(cleanedReviewBody) ||
+            /^This PR has no net changes/i.test(cleanedReviewBody);
+
+          if (!isCleanReview) {
+            clawsReviewParts.push(`Comment by @${comment.user.login} (automated by Claws):\n${stripped}`);
+            if (comment.body_html) htmlBodies.push(comment.body_html);
+            prReviewComment = {
+              id: comment.id,
+              body: comment.body,
+              reviewedCommit: commitMatch ? commitMatch[1] : "",
+            };
+          }
+          continue;
+        }
+
+        // Non-review Claws comments: rocket-based addressing check
+        let hasClawsAddressed = false;
+        let hasHumanApproval = false;
+        try {
+          const reactions = await getCommentReactions(repo, comment.id);
+          hasClawsAddressed = reactions.some((r) => r.user.login === selfLogin && r.content === ADDRESSED_REACTION);
+          hasHumanApproval = reactions.some((r) => r.content === "+1" && !r.user.login.endsWith("[bot]"));
+        } catch { /* treat as no reaction */ }
+        if (hasClawsAddressed) continue;
+
+        const stripped = stripClawsMarker(comment.body);
+        clawsOtherParts.push(`Comment by @${comment.user.login} (automated by Claws):\n${stripped}`);
+        if (comment.body_html) htmlBodies.push(comment.body_html);
+
+        if (hasHumanApproval) {
+          commentIds.push(comment.id);
+        }
         continue;
       }
       if (comment.user.login.endsWith("[bot]")) continue;
 
-      // Check for existing 👍 reaction from Claws
-      let hasClawsReaction = false;
+      // Check for existing 🚀 reaction from Claws (addressed)
+      let hasClawsAddressed = false;
       try {
         const reactions = await getCommentReactions(repo, comment.id);
-        hasClawsReaction = reactions.some((r) => r.user.login === selfLogin && r.content === "+1");
+        hasClawsAddressed = reactions.some((r) => r.user.login === selfLogin && r.content === ADDRESSED_REACTION);
       } catch { /* treat as no reaction */ }
-      if (hasClawsReaction) continue;
+      if (hasClawsAddressed) continue;
 
-      parts.push(`Comment by @${comment.user.login}:\n${comment.body}`);
+      humanParts.push(`Comment by @${comment.user.login}:\n${guardContent(comment.body, guardCtx("review-comments"))}`);
+      if (comment.body_html) htmlBodies.push(comment.body_html);
       commentIds.push(comment.id);
     }
 
+    const sections: string[] = [];
+    if (humanParts.length > 0) {
+      sections.push(
+        `=== HUMAN REVIEWER COMMENTS (AUTHORITATIVE — must be followed) ===\n\n` +
+        humanParts.join("\n\n---\n\n"),
+      );
+    }
+    if (clawsReviewParts.length > 0) {
+      sections.push(
+        `=== AUTOMATED CLAWS REVIEW (advisory — defer to human directives above when they conflict) ===\n\n` +
+        clawsReviewParts.join("\n\n---\n\n"),
+      );
+    }
+    if (clawsOtherParts.length > 0) {
+      sections.push(
+        `=== OTHER CLAWS AUTOMATED COMMENTS ===\n\n` +
+        clawsOtherParts.join("\n\n---\n\n"),
+      );
+    }
+
     return {
-      formatted: parts.join("\n\n---\n\n"),
+      formatted: sections.join("\n\n---\n\n"),
       commentIds,
       reviewCommentIds,
+      htmlBodies,
+      prReviewComment,
     };
   } catch (err) {
     log.warn(`getPRReviewComments for PR #${prNumber} in ${repo}: ${err}`);
@@ -1065,8 +1675,8 @@ export async function getFailingCheck(repo: string, prNumber: number): Promise<F
       "--json",
       "name,state,link",
     ]);
-    const checks = JSON.parse(raw) as FailedCheck[];
-    return checks.find((c) => FAILED_STATES.has(c.state));
+    const checks = safeJsonParse(z.array(FailedCheckSchema), raw, "pr checks failing");
+    return checks.find((c) => FAILED_STATES.has(normalizeCheckState(c.state)));
   } catch {
     return undefined;
   }
@@ -1076,11 +1686,29 @@ export async function rerunWorkflow(repo: string, runId: string): Promise<void> 
   await gh(["run", "rerun", runId, "--repo", repo]);
 }
 
+/**
+ * Cancels a GitHub Actions workflow run.
+ * @param repo - The full repository name (e.g., "owner/repo")
+ * @param runId - The workflow run ID (numeric string)
+ * @throws Error if the run is already completed or if GitHub CLI fails
+ */
+export async function cancelWorkflow(repo: string, runId: string): Promise<void> {
+  await gh(["run", "cancel", runId, "--repo", repo]);
+}
+
 async function getFailedJobLog(repo: string, runId: string): Promise<string> {
   const raw = await gh(["api", `repos/${repo}/actions/runs/${runId}/jobs`]);
-  const { jobs } = JSON.parse(raw) as {
-    jobs: { id: number; conclusion: string | null; name: string }[];
-  };
+  const { jobs } = safeJsonParse(
+    z.object({
+      jobs: z.array(z.object({
+        id: z.number(),
+        conclusion: z.string().nullable(),
+        name: z.string(),
+      })),
+    }),
+    raw,
+    "actions runs jobs",
+  );
   const failedJob = jobs.find((j) => j.conclusion === "failure");
   if (!failedJob) return "";
 
@@ -1090,6 +1718,43 @@ async function getFailedJobLog(repo: string, runId: string): Promise<string> {
   return logOutput.slice(0, 20_000);
 }
 
+export const BILLING_ANNOTATION_PATTERN = /account payments have failed|spending limit/i;
+
+export function isBillingBlocked(annotations: string[]): boolean {
+  return annotations.some((m) => BILLING_ANNOTATION_PATTERN.test(m));
+}
+
+export async function getRunAnnotations(repo: string, runId: string): Promise<string[]> {
+  try {
+    const raw = await gh(["api", `repos/${repo}/actions/runs/${runId}/jobs`]);
+    const { jobs } = safeJsonParse(
+      z.object({
+        jobs: z.array(z.object({
+          id: z.number(),
+          conclusion: z.string().nullable().optional(),
+          name: z.string(),
+        })),
+      }),
+      raw,
+      "actions runs jobs for annotations",
+    );
+
+    const messages: string[] = [];
+    for (const job of jobs) {
+      const annotationRaw = await gh(["api", `repos/${repo}/check-runs/${job.id}/annotations`]);
+      const annotations = safeJsonParse(
+        z.array(z.object({ message: z.string(), annotation_level: z.string().nullable().optional() })),
+        annotationRaw,
+        "check-run annotations",
+      );
+      messages.push(...annotations.map((a) => a.message));
+    }
+    return messages;
+  } catch (err) {
+    log.warn(`getRunAnnotations for run ${runId} in ${repo}: ${err}`);
+    return [];
+  }
+}
 
 export async function getFailedRunLog(repo: string, prNumber: number): Promise<string> {
   try {
@@ -1102,8 +1767,8 @@ export async function getFailedRunLog(repo: string, prNumber: number): Promise<s
       "--json",
       "name,state,link",
     ]);
-    const checks = JSON.parse(raw) as { name: string; state: string; link: string }[];
-    const failed = checks.find((c) => FAILED_STATES.has(c.state));
+    const checks = safeJsonParse(z.array(FailedCheckSchema), raw, "pr checks for run log");
+    const failed = checks.find((c) => FAILED_STATES.has(normalizeCheckState(c.state)));
     if (!failed?.link) return "";
 
     // Extract run ID from the link URL
@@ -1140,6 +1805,79 @@ export async function getPRChangedFiles(repo: string, prNumber: number): Promise
   }
 }
 
+export async function getPRDiff(repo: string, prNumber: number): Promise<string> {
+  try {
+    return await gh(["pr", "diff", String(prNumber), "--repo", repo]);
+  } catch (err) {
+    log.warn(`getPRDiff for PR #${prNumber} in ${repo}: ${err}`);
+    return "";
+  }
+}
+
+// ── Deployment URL discovery (for QA phase) ──
+
+export async function getPRHeadSHA(repo: string, prNumber: number): Promise<string> {
+  const raw = await gh(["pr", "view", String(prNumber), "--repo", repo, "--json", "headRefOid", "--jq", ".headRefOid"]);
+  return raw.trim();
+}
+
+export async function getPRBody(repo: string, prNumber: number): Promise<string> {
+  const raw = await gh(["pr", "view", String(prNumber), "--repo", repo, "--json", "body", "--jq", ".body"]);
+  return raw.trim();
+}
+
+export async function getDeploymentUrl(repo: string, sha: string, prNumber: number): Promise<string | null> {
+  // Primary: GitHub Deployments API
+  try {
+    const raw = await gh(["api", `repos/${repo}/deployments?sha=${sha}&environment=Preview`]);
+    const deployments = safeJsonParse(
+      z.array(z.object({ id: z.number(), environment: z.string() })),
+      raw,
+      "deployments",
+    );
+    for (const dep of deployments) {
+      const statusesRaw = await gh(["api", `repos/${repo}/deployments/${dep.id}/statuses`]);
+      const statuses = safeJsonParse(
+        z.array(z.object({ state: z.string(), environment_url: z.string().optional() })),
+        statusesRaw,
+        "deployment statuses",
+      );
+      const success = statuses.find((s) => s.state === "success" && s.environment_url);
+      if (success?.environment_url) return success.environment_url;
+    }
+  } catch {
+    // Fall through to comment scanning
+  }
+
+  // Fallback: scan PR comments for Vercel preview URLs
+  try {
+    const comments = await getIssueComments(repo, prNumber);
+    const vercelRe = /https:\/\/[a-z0-9-]+\.vercel\.app/i;
+    for (const comment of comments) {
+      const match = comment.body.match(vercelRe);
+      if (match) return match[0];
+    }
+  } catch {
+    // No URL found
+  }
+
+  return null;
+}
+
+export function getLinkedIssueNumber(pr: PR): number | null {
+  // Try branch name: claws/issue-{N}-...
+  const branchMatch = pr.headRefName.match(/^claws\/issue-(\d+)-/);
+  if (branchMatch) return parseInt(branchMatch[1], 10);
+
+  // Try PR body: Closes #N, Fixes #N, Resolves #N, Part of #N
+  if (pr.body) {
+    const bodyMatch = pr.body.match(/(?:closes?|fixes?|resolves?|part of)\s*#(\d+)/i);
+    if (bodyMatch) return parseInt(bodyMatch[1], 10);
+  }
+
+  return null;
+}
+
 // ── Recently closed issues ──
 
 export async function listRecentlyClosedIssues(
@@ -1153,10 +1891,63 @@ export async function listRecentlyClosedIssues(
     "--limit", "100",
     "--json", "number,title,body,closedAt",
   ]);
-  const issues = safeJsonParse(raw, "issue list closed") as {
-    number: number; title: string; body: string; closedAt: string;
-  }[];
+  const issues = safeJsonParse(
+    z.array(z.object({
+      number: z.number(),
+      title: z.string(),
+      body: z.string(),
+      closedAt: z.string(),
+    })),
+    raw,
+    "issue list closed",
+  );
   return issues.filter((i) => new Date(i.closedAt) >= since);
+}
+
+// ── Branch cleanup helpers ──
+
+export interface BranchPR {
+  number: number;
+  state: string;
+  mergedAt?: string;
+  closedAt?: string;
+}
+
+export async function listPRsForBranch(
+  repo: string,
+  branchName: string,
+  state: "open" | "merged" | "closed" | "all",
+): Promise<BranchPR[]> {
+  const raw = await gh([
+    "pr", "list",
+    "--repo", repo,
+    "--head", branchName,
+    "--state", state,
+    "--json", "number,state,mergedAt,closedAt",
+  ]);
+  return safeJsonParse(z.array(BranchPrSchema), raw, "pr list for branch");
+}
+
+export async function deleteRemoteBranch(repo: string, branchName: string): Promise<void> {
+  await gh(["api", "--method", "DELETE", `repos/${repo}/git/refs/heads/${branchName}`]);
+}
+
+async function getPRMetadata(
+  repo: string,
+  prNumber: number,
+): Promise<{ labels: string[]; mergeableState: "MERGEABLE" | "CONFLICTING" | "UNKNOWN" }> {
+  return apiCache.dedupedFetch(`pr-meta:${repo}:${prNumber}`, 30_000, async () => {
+    const raw = await gh(["pr", "view", String(prNumber), "--repo", repo, "--json", "labels,mergeable"]);
+    const parsed = safeJsonParse(
+      z.object({ labels: z.array(z.object({ name: z.string() })), mergeable: z.string() }),
+      raw,
+      "pr view metadata",
+    );
+    return {
+      labels: parsed.labels.map((l) => l.name),
+      mergeableState: parsed.mergeable as "MERGEABLE" | "CONFLICTING" | "UNKNOWN",
+    };
+  }) as Promise<{ labels: string[]; mergeableState: "MERGEABLE" | "CONFLICTING" | "UNKNOWN" }>;
 }
 
 export async function enrichQueueItemsWithPRStatus(items: QueueItem[]): Promise<void> {
@@ -1164,14 +1955,37 @@ export async function enrichQueueItemsWithPRStatus(items: QueueItem[]): Promise<
     try {
       if (item.type === "pr") {
         item.prNumber = item.number;
-        const s = await getPRCheckStatus(item.repo, item.number);
-        if (s !== "none") item.checkStatus = s;
+        const [sum, meta, rev] = await Promise.all([
+          getPRChecksSummary(item.repo, item.number),
+          getPRMetadata(item.repo, item.number),
+          getPRReviewStatus(item.repo, item.number),
+        ]);
+        if (sum.status !== "none") {
+          item.checkStatus = sum.status;
+          item.checksPassed = sum.passed;
+          item.checksTotal = sum.total;
+        }
+        item.labels = meta.labels;
+        item.mergeableState = meta.mergeableState;
+        item.reviewStatus = rev.status;
+        if (rev.status === "issues") item.reviewIssueCount = rev.issueCount;
       } else if (item.type === "issue") {
         const pr = await getOpenPRForIssue(item.repo, item.number);
         if (pr) {
           item.prNumber = pr.number;
-          const s = await getPRCheckStatus(item.repo, pr.number);
-          if (s !== "none") item.checkStatus = s;
+          const [sum, meta, rev] = await Promise.all([
+            getPRChecksSummary(item.repo, pr.number),
+            getPRMetadata(item.repo, pr.number),
+            getPRReviewStatus(item.repo, pr.number),
+          ]);
+          if (sum.status !== "none") {
+            item.checkStatus = sum.status;
+            item.checksPassed = sum.passed;
+            item.checksTotal = sum.total;
+          }
+          item.mergeableState = meta.mergeableState;
+          item.reviewStatus = rev.status;
+          if (rev.status === "issues") item.reviewIssueCount = rev.issueCount;
         }
       }
     } catch {
@@ -1180,3 +1994,88 @@ export async function enrichQueueItemsWithPRStatus(items: QueueItem[]): Promise<
   });
   await Promise.allSettled(tasks);
 }
+
+// ── Workflow run fetching (runner metrics) ──
+
+const WORKFLOW_RUN_JQ = '[.workflow_runs[] | {run_id: .id, workflow_name: .name, status: .status, conclusion: .conclusion, event: .event, head_branch: .head_branch, created_at: .created_at, run_started_at: .run_started_at, updated_at: .updated_at}]';
+const WORKFLOW_RUN_SINGLE_JQ = '{run_id: .id, workflow_name: .name, status: .status, conclusion: .conclusion, event: .event, head_branch: .head_branch, created_at: .created_at, run_started_at: .run_started_at, updated_at: .updated_at}';
+
+async function fetchWorkflowRuns(repo: string, params: string): Promise<WorkflowRunRow[]> {
+  try {
+    const raw = await gh(["api", `repos/${repo}/actions/runs?${params}`, "--jq", WORKFLOW_RUN_JQ]);
+    const parsed = safeJsonParse(z.array(WorkflowRunSchema), raw, `workflow runs for ${repo}`);
+    return parsed.map(r => ({ ...r, repo }));
+  } catch (err) {
+    log.warn(`[github] Failed to fetch workflow runs for ${repo}: ${err}`);
+    return [];
+  }
+}
+
+async function fetchWorkflowRunsBatched(
+  repos: Repo[],
+  concurrency: number,
+  perRepo: (repo: Repo) => Promise<WorkflowRunRow[]>,
+): Promise<WorkflowRunRow[]> {
+  const allRuns: WorkflowRunRow[] = [];
+  for (let i = 0; i < repos.length; i += concurrency) {
+    const batch = repos.slice(i, i + concurrency);
+    const results = await Promise.allSettled(batch.map(perRepo));
+    for (const result of results) {
+      if (result.status === "fulfilled") {
+        allRuns.push(...result.value);
+      }
+    }
+  }
+  return allRuns;
+}
+
+export async function fetchRecentWorkflowRuns(repos: Repo[]): Promise<WorkflowRunRow[]> {
+  return fetchWorkflowRunsBatched(repos, 10, repo =>
+    fetchWorkflowRuns(repo.fullName, "per_page=30"),
+  );
+}
+
+export async function fetchActiveWorkflowRuns(repos: Repo[]): Promise<WorkflowRunRow[]> {
+  // Fetch in_progress and queued runs by status to avoid missing runs that fell outside
+  // the recent per_page=30 window due to high repo activity.
+  // Process repos in batches to cap concurrent API calls at 10 (2 statuses × 5 repos).
+  return fetchWorkflowRunsBatched(repos, 5, async repo => {
+    const results = await Promise.allSettled([
+      fetchWorkflowRuns(repo.fullName, "status=in_progress&per_page=100"),
+      fetchWorkflowRuns(repo.fullName, "status=queued&per_page=100"),
+    ]);
+    return results.flatMap(r => r.status === "fulfilled" ? r.value : []);
+  });
+}
+
+export async function fetchWorkflowRunsForBackfill(repos: Repo[], sinceDaysAgo: number): Promise<WorkflowRunRow[]> {
+  const since = new Date(Date.now() - sinceDaysAgo * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+  return fetchWorkflowRunsBatched(repos, 5, async repo => {
+    const runs: WorkflowRunRow[] = [];
+    for (let page = 1; page <= 3; page++) {
+      const pageRuns = await fetchWorkflowRuns(
+        repo.fullName,
+        `per_page=100&page=${page}&created=%3E%3D${since}`,
+      );
+      runs.push(...pageRuns);
+      if (pageRuns.length < 100) break;
+    }
+    return runs;
+  });
+}
+
+export async function fetchWorkflowRunById(repo: string, runId: number): Promise<WorkflowRunRow | "not_found" | null> {
+  try {
+    const raw = await gh(["api", `repos/${repo}/actions/runs/${runId}`, "--jq", WORKFLOW_RUN_SINGLE_JQ]);
+    const parsed = safeJsonParse(WorkflowRunSchema, raw, `workflow run ${runId} for ${repo}`);
+    return { ...parsed, repo };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/\b404\b/.test(msg) || /HTTP 404/i.test(msg) || /not found/i.test(msg)) {
+      return "not_found";
+    }
+    log.warn(`[github] Failed to fetch workflow run ${runId} for ${repo}: ${err}`);
+    return null;
+  }
+}
+

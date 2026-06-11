@@ -1,0 +1,5 @@
+# Operational resilience
+
+### Job health scoring with automatic circuit-breaking (#482)
+
+Track a rolling success/failure rate per job over the last 24 hours using the existing SQLite task data. If a job's failure rate exceeds a configurable threshold (e.g. 60% over the last 10 runs), automatically pause it and send a Slack alert with the failure pattern summary. This prevents a broken job from burning Claude quota on repeated failures — for example, if a repo's CI is fundamentally broken and ci-fixer keeps failing, or if a GitHub API change causes issue-refiner to consistently error. The auto-pause would be distinct from manual pause (shown differently on the dashboard) and would automatically lift after a configurable cooldown (e.g. 6 hours) to retry. Critical jobs (ci-fixer, review-addresser) could have higher thresholds than discretionary jobs (improvement-identifier, idea-suggester). Implementation: check the threshold in the scheduler before each job tick, querying the task table for recent runs of that job name.

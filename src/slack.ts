@@ -1,4 +1,18 @@
+import { z } from "zod";
 import { SLACK_WEBHOOK, SLACK_BOT_TOKEN, SLACK_IDEAS_CHANNEL } from "./config.js";
+
+const SlackPostMessageResponseSchema = z.object({
+  ok: z.boolean(),
+  ts: z.string().optional(),
+  error: z.string().optional(),
+});
+
+const SlackReactionSchema = z.object({ name: z.string(), count: z.number(), users: z.array(z.string()) });
+const SlackGetReactionsResponseSchema = z.object({
+  ok: z.boolean(),
+  message: z.object({ reactions: z.array(SlackReactionSchema).optional() }).optional(),
+  error: z.string().optional(),
+});
 
 let lastResult: "ok" | "error" | null = null;
 
@@ -12,6 +26,7 @@ export function notify(text: string): void {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ text }),
+    signal: AbortSignal.timeout(30_000),
   })
     .then((response) => {
       lastResult = response.ok ? "ok" : "error";
@@ -57,18 +72,19 @@ export async function postMessage(
       Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
     },
     body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(30_000),
   });
 
   if (!response.ok) {
     throw new Error(`Slack API HTTP error: ${response.status}`);
   }
 
-  const data = (await response.json()) as { ok: boolean; ts?: string; error?: string };
+  const data = SlackPostMessageResponseSchema.parse(await response.json());
   if (!data.ok) {
     throw new Error(`Slack API error: ${data.error}`);
   }
 
-  return data.ts!;
+  return data.ts ?? "";
 }
 
 export interface SlackReaction {
@@ -90,6 +106,7 @@ export async function getReactions(
     `https://slack.com/api/reactions.get?${params}`,
     {
       headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}` },
+      signal: AbortSignal.timeout(30_000),
     },
   );
 
@@ -97,11 +114,7 @@ export async function getReactions(
     throw new Error(`Slack API HTTP error: ${response.status}`);
   }
 
-  const data = (await response.json()) as {
-    ok: boolean;
-    message?: { reactions?: SlackReaction[] };
-    error?: string;
-  };
+  const data = SlackGetReactionsResponseSchema.parse(await response.json());
 
   if (!data.ok) {
     throw new Error(`Slack API error: ${data.error}`);

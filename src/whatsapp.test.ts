@@ -63,6 +63,10 @@ vi.mock("./error-reporter.js", () => ({
 const { mockNotify } = vi.hoisted(() => ({ mockNotify: vi.fn() }));
 vi.mock("./slack.js", () => ({ notify: mockNotify }));
 
+vi.mock("./db.js", () => ({
+  recordWhatsappEvent: vi.fn(),
+}));
+
 // Mock baileys so we don't actually connect
 vi.mock("baileys", () => ({
   default: mockMakeWASocket,
@@ -93,7 +97,7 @@ vi.mock("node:fs", async () => {
 });
 
 import * as log from "./log.js";
-import { isConnected, whatsappStatus, hasAuthState, isPairingRequired, isPairing, stopPairing, cancelPairing, start, stop, unpair } from "./whatsapp.js";
+import { isConnected, whatsappStatus, hasAuthState, isPairing, stopPairing, cancelPairing, start, stop, unpair } from "./whatsapp.js";
 
 describe("whatsapp", () => {
   beforeEach(async () => {
@@ -141,7 +145,7 @@ describe("whatsapp", () => {
     expect(isPairing()).toBe(false);
     cancelPairing();
     expect(isPairing()).toBe(false);
-    expect(isPairingRequired()).toBe(true);
+    expect(whatsappStatus().pairingRequired).toBe(true);
   });
 
   it("connects even when fetchLatestBaileysVersion fails", async () => {
@@ -166,7 +170,7 @@ describe("whatsapp", () => {
       // Simulate successful connection to reset pairingRequired
       eventHandlers["connection.update"]({ connection: "open" });
       expect(isConnected()).toBe(true);
-      expect(isPairingRequired()).toBe(false);
+      expect(whatsappStatus().pairingRequired).toBe(false);
       return handler;
     }
 
@@ -183,7 +187,7 @@ describe("whatsapp", () => {
       await startWithAuth();
       fireDisconnect(405);
 
-      expect(isPairingRequired()).toBe(true);
+      expect(whatsappStatus().pairingRequired).toBe(true);
       expect(isConnected()).toBe(false);
       expect(log.warn).toHaveBeenCalledWith(
         expect.stringContaining("Stale session (status 405)"),
@@ -194,7 +198,7 @@ describe("whatsapp", () => {
       await startWithAuth();
       fireDisconnect(500);
 
-      expect(isPairingRequired()).toBe(true);
+      expect(whatsappStatus().pairingRequired).toBe(true);
       expect(isConnected()).toBe(false);
       expect(log.warn).toHaveBeenCalledWith(
         expect.stringContaining("Stale session (status 500)"),
@@ -205,7 +209,7 @@ describe("whatsapp", () => {
       await startWithAuth();
       fireDisconnect(401);
 
-      expect(isPairingRequired()).toBe(true);
+      expect(whatsappStatus().pairingRequired).toBe(true);
       expect(isConnected()).toBe(false);
       expect(log.error).toHaveBeenCalledWith(
         expect.stringContaining("Logged out"),
@@ -218,7 +222,7 @@ describe("whatsapp", () => {
       fireDisconnect(408);
 
       // Should NOT immediately set pairingRequired — it retries
-      expect(isPairingRequired()).toBe(false);
+      expect(whatsappStatus().pairingRequired).toBe(false);
       expect(log.warn).toHaveBeenCalledWith(
         expect.stringContaining("Disconnected (status 408)"),
       );
@@ -273,7 +277,7 @@ describe("whatsapp", () => {
       mockCredsState.exists = false;
       const handler = vi.fn();
       await start(handler);
-      expect(isPairingRequired()).toBe(true);
+      expect(whatsappStatus().pairingRequired).toBe(true);
       mockNotify.mockClear();
 
       // Now simulate connection opening (as if pairing completed)
@@ -379,6 +383,58 @@ describe("whatsapp", () => {
       // unpair() calls stop() which resets lastNotifiedState,
       // so no notification should be sent
       expect(mockNotify).not.toHaveBeenCalled();
+    });
+
+    it("status 515 triggers reconnect after 1s and does not set pairingRequired", async () => {
+      vi.useFakeTimers();
+      await startWithAuth();
+      const callsBefore = mockUseMultiFileAuthState.mock.calls.length;
+
+      fireDisconnect(515);
+
+      expect(whatsappStatus().pairingRequired).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1000);
+
+      // Reconnect attempt calls useMultiFileAuthState again
+      expect(mockUseMultiFileAuthState.mock.calls.length).toBeGreaterThan(callsBefore);
+
+      vi.useRealTimers();
+    });
+
+    it("status 440 sets pairingRequired and notifies Slack about replaced session", async () => {
+      vi.useFakeTimers();
+      await startWithAuth();
+      mockNotify.mockClear();
+
+      fireDisconnect(440);
+
+      expect(whatsappStatus().pairingRequired).toBe(true);
+      expect(mockNotify).toHaveBeenCalledWith(expect.stringContaining("Connection replaced"));
+
+      // No automatic reconnect scheduled for 440
+      const callsBefore = mockUseMultiFileAuthState.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(mockUseMultiFileAuthState.mock.calls.length).toBe(callsBefore);
+
+      vi.useRealTimers();
+    });
+
+    it("five consecutive 515s do not clear auth or set pairingRequired", async () => {
+      vi.useFakeTimers();
+      await startWithAuth();
+
+      for (let i = 0; i < 5; i++) {
+        fireDisconnect(515);
+        // Advance past the 1s reconnect timer so connection.open can reset state
+        await vi.advanceTimersByTimeAsync(1100);
+        // Simulate the reconnect succeeding so consecutiveFailures stays 0
+        eventHandlers["connection.update"]({ connection: "open" });
+      }
+
+      expect(whatsappStatus().pairingRequired).toBe(false);
+
+      vi.useRealTimers();
     });
   });
 

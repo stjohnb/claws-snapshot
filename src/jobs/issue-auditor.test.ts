@@ -34,13 +34,19 @@ const { mockGh } = vi.hoisted(() => ({
     getIssueComments: vi.fn(),
     addLabel: vi.fn(),
     removeLabel: vi.fn(),
-    isClawsComment: (body: string) => body.includes("<!-- claws-automated -->"),
+    closeIssue: vi.fn(),
+    isClawsComment: (body: string) => /\*— Automated by Claws(?:\s*·\s*[\w\s-]+)?\s*—\*/.test(body) || body.includes("<!-- claws-automated -->"),
     isRateLimited: vi.fn().mockReturnValue(false),
+    isItemSkipped: vi.fn().mockReturnValue(false),
+    isAllowedActor: vi.fn().mockResolvedValue(true),
+    hasIgnoreLabel: vi.fn().mockReturnValue(false),
     listMergedPRsForIssue: vi.fn(),
   },
 }));
 
 vi.mock("../github.js", () => mockGh);
+vi.mock("../db.js", () => ({ markRepoProcessedDaily: vi.fn() }));
+vi.mock("../smart-schedule.js", () => ({ localDateString: () => "2024-01-15" }));
 
 vi.mock("./triage-kwyjibo-errors.js", () => ({
   extractGameId: vi.fn().mockReturnValue(null),
@@ -59,8 +65,9 @@ vi.mock("../plan-parser.js", () => ({
   parsePlan: mockParsePlan,
 }));
 
-import { run, classifyIssue } from "./issue-auditor.js";
+import { run, processRepo, classifyIssue } from "./issue-auditor.js";
 import { reportError } from "../error-reporter.js";
+import * as db from "../db.js";
 import { extractGameId } from "./triage-kwyjibo-errors.js";
 import { extractFingerprint } from "./triage-claws-errors.js";
 import * as log from "../log.js";
@@ -76,8 +83,10 @@ describe("issue-auditor", () => {
     mockGh.getCommentReactions.mockResolvedValue([]);
     mockGh.addLabel.mockResolvedValue(undefined);
     mockGh.removeLabel.mockResolvedValue(undefined);
+    mockGh.closeIssue.mockResolvedValue(undefined);
     mockGh.getIssueComments.mockResolvedValue([]);
     mockGh.listMergedPRsForIssue.mockResolvedValue([]);
+    mockGh.isRateLimited.mockReturnValue(false);
     mockFindPlanComment.mockReturnValue(null);
     mockParsePlan.mockReturnValue({ preamble: "", phases: [], totalPhases: 0 });
     vi.mocked(extractGameId).mockReturnValue(null);
@@ -140,7 +149,7 @@ describe("issue-auditor", () => {
     const issue = mockIssue();
     mockGh.listOpenIssues.mockResolvedValueOnce([issue]);
     mockGh.getIssueComments.mockResolvedValue([
-      { id: 100, body: "<!-- claws-automated -->\n## Implementation Plan\nDo something", login: "claws-bot[bot]" },
+      { id: 100, body: "*— Automated by Claws —*\n\n## Implementation Plan\nDo something", login: "claws-bot[bot]" },
       { id: 101, body: "I think we should change the approach", login: "human-user" },
     ]);
     mockGh.getCommentReactions.mockResolvedValue([]);
@@ -155,7 +164,7 @@ describe("issue-auditor", () => {
     const issue = mockIssue({ labels: [] });
     mockGh.listOpenIssues.mockResolvedValueOnce([issue]);
     mockGh.getIssueComments.mockResolvedValue([
-      { id: 100, body: "<!-- claws-automated -->\n## Implementation Plan\nDo something", login: "claws-bot[bot]" },
+      { id: 100, body: "*— Automated by Claws —*\n\n## Implementation Plan\nDo something", login: "claws-bot[bot]" },
     ]);
     mockGh.listMergedPRsForIssue.mockResolvedValue([]);
 
@@ -169,7 +178,7 @@ describe("issue-auditor", () => {
     const issue = mockIssue({ labels: [{ name: "Ready" }] });
     mockGh.listOpenIssues.mockResolvedValueOnce([issue]);
     mockGh.getIssueComments.mockResolvedValue([
-      { id: 100, body: "<!-- claws-automated -->\n## Implementation Plan\nDo something", login: "claws-bot[bot]" },
+      { id: 100, body: "*— Automated by Claws —*\n\n## Implementation Plan\nDo something", login: "claws-bot[bot]" },
     ]);
     mockGh.listMergedPRsForIssue.mockResolvedValue([]);
 
@@ -183,7 +192,7 @@ describe("issue-auditor", () => {
     const issue = mockIssue({ labels: [] });
     mockGh.listOpenIssues.mockResolvedValueOnce([issue]);
     mockGh.getIssueComments.mockResolvedValue([
-      { id: 100, body: "<!-- claws-automated -->\n## Implementation Plan\n### PR 1: First\nDo first\n### PR 2: Second\nDo second", login: "claws-bot[bot]" },
+      { id: 100, body: "*— Automated by Claws —*\n\n## Implementation Plan\n### PR 1: First\nDo first\n### PR 2: Second\nDo second", login: "claws-bot[bot]" },
     ]);
     mockGh.listMergedPRsForIssue.mockResolvedValue([
       { number: 20, title: "fix(#1): First (1/2)", headRefName: "claws/issue-1-ab12" },
@@ -204,6 +213,59 @@ describe("issue-auditor", () => {
     expect(mockNotify).toHaveBeenCalledWith(expect.stringContaining("stuck multi-phase"));
   });
 
+  it("closes completed multi-phase issue via content-based phase matching", async () => {
+    const issue = mockIssue({ labels: [] });
+    mockGh.listOpenIssues.mockResolvedValueOnce([issue]);
+    mockGh.getIssueComments.mockResolvedValue([
+      { id: 100, body: "*— Automated by Claws —*\n\n## Implementation Plan\n### PR 1: First\nDo first\n### PR 2: Second\nDo second", login: "claws-bot[bot]" },
+    ]);
+    mockGh.listMergedPRsForIssue.mockResolvedValue([
+      { number: 20, title: "fix(#1): First (1/2)", headRefName: "claws/issue-1-ab12" },
+      { number: 21, title: "fix(#1): Second (2/2)", headRefName: "claws/issue-1-cd34" },
+    ]);
+    mockFindPlanComment.mockReturnValue("## Implementation Plan\n### PR 1: First\nDo first\n### PR 2: Second\nDo second");
+    mockParsePlan.mockReturnValue({
+      preamble: "",
+      phases: [
+        { phaseNumber: 1, title: "First", description: "Do first" },
+        { phaseNumber: 2, title: "Second", description: "Do second" },
+      ],
+      totalPhases: 2,
+    });
+
+    await run([repo]);
+
+    expect(mockGh.closeIssue).toHaveBeenCalledWith(repo.fullName, issue.number, "completed");
+    expect(mockGh.addLabel).not.toHaveBeenCalledWith(repo.fullName, issue.number, "Ready");
+    expect(mockNotify).toHaveBeenCalledWith(expect.stringContaining("closed completed multi-phase"));
+  });
+
+  it("closes completed multi-phase issue via fallback counting (no phase patterns in titles)", async () => {
+    const issue = mockIssue({ labels: [] });
+    mockGh.listOpenIssues.mockResolvedValueOnce([issue]);
+    mockGh.getIssueComments.mockResolvedValue([
+      { id: 100, body: "*— Automated by Claws —*\n\n## Implementation Plan\n### PR 1: First\nDo first\n### PR 2: Second\nDo second", login: "claws-bot[bot]" },
+    ]);
+    mockGh.listMergedPRsForIssue.mockResolvedValue([
+      { number: 20, title: "fix: First phase", headRefName: "claws/issue-1-ab12" },
+      { number: 21, title: "fix: Second phase", headRefName: "claws/issue-1-cd34" },
+    ]);
+    mockFindPlanComment.mockReturnValue("## Implementation Plan\n### PR 1: First\nDo first\n### PR 2: Second\nDo second");
+    mockParsePlan.mockReturnValue({
+      preamble: "",
+      phases: [
+        { phaseNumber: 1, title: "First", description: "Do first" },
+        { phaseNumber: 2, title: "Second", description: "Do second" },
+      ],
+      totalPhases: 2,
+    });
+
+    await run([repo]);
+
+    expect(mockGh.closeIssue).toHaveBeenCalledWith(repo.fullName, issue.number, "completed");
+    expect(mockNotify).toHaveBeenCalledWith(expect.stringContaining("closed completed multi-phase"));
+  });
+
   it("classifies no-body issues as needs-refinement (not skipped)", async () => {
     const issue = mockIssue({ body: "" });
     mockGh.listOpenIssues.mockResolvedValueOnce([issue]);
@@ -219,13 +281,13 @@ describe("issue-auditor", () => {
     const issue = mockIssue({ labels: [] });
     mockGh.listOpenIssues.mockResolvedValueOnce([issue]);
     mockGh.getIssueComments.mockResolvedValue([
-      { id: 100, body: "<!-- claws-automated -->\n## Implementation Plan\nDo something", login: "claws-bot[bot]" },
+      { id: 100, body: "*— Automated by Claws —*\n\n## Implementation Plan\nDo something", login: "claws-bot[bot]" },
     ]);
     mockGh.listMergedPRsForIssue.mockResolvedValue([]);
 
     await run([repo]);
 
-    expect(mockNotify).toHaveBeenCalledWith(expect.stringContaining("Issue auditor"));
+    expect(mockNotify).toHaveBeenCalledWith(expect.stringContaining(`Issue auditor (${repo.fullName})`));
   });
 
   it("no Slack notification when everything is clean", async () => {
@@ -240,13 +302,36 @@ describe("issue-auditor", () => {
     const issue = mockIssue({ labels: [{ name: "In Review" }] });
     mockGh.listOpenIssues.mockResolvedValueOnce([issue]);
     mockGh.getIssueComments.mockResolvedValue([
-      { id: 100, body: "<!-- claws-automated -->\n## Implementation Plan\nDo something", login: "claws-bot[bot]" },
+      { id: 100, body: "*— Automated by Claws —*\n\n## Implementation Plan\nDo something", login: "claws-bot[bot]" },
     ]);
     mockGh.listMergedPRsForIssue.mockResolvedValue([]);
 
     await run([repo]);
 
     expect(mockGh.removeLabel).toHaveBeenCalledWith(repo.fullName, issue.number, "In Review");
+  });
+
+  it("marks repo processed after run", async () => {
+    await run([repo]);
+    expect(vi.mocked(db.markRepoProcessedDaily)).toHaveBeenCalledWith(
+      "issue-auditor", repo.fullName, "2024-01-15"
+    );
+  });
+
+  it("marks repo processed even when rate-limited", async () => {
+    mockGh.isRateLimited.mockReturnValue(true);
+    await processRepo(repo);
+    expect(vi.mocked(db.markRepoProcessedDaily)).toHaveBeenCalledWith(
+      "issue-auditor", repo.fullName, "2024-01-15",
+    );
+  });
+
+  it("marks repo processed even when listOpenIssues throws", async () => {
+    mockGh.listOpenIssues.mockRejectedValueOnce(new Error("API failure"));
+    await processRepo(repo);
+    expect(vi.mocked(db.markRepoProcessedDaily)).toHaveBeenCalledWith(
+      "issue-auditor", repo.fullName, "2024-01-15",
+    );
   });
 
   it("per-repo error isolation — failure on one repo does not block others", async () => {
@@ -259,7 +344,7 @@ describe("issue-auditor", () => {
       .mockResolvedValueOnce([issue2]);
 
     mockGh.getIssueComments.mockResolvedValue([
-      { id: 100, body: "<!-- claws-automated -->\n## Implementation Plan\nDo something", login: "claws-bot[bot]" },
+      { id: 100, body: "*— Automated by Claws —*\n\n## Implementation Plan\nDo something", login: "claws-bot[bot]" },
     ]);
     mockGh.listMergedPRsForIssue.mockResolvedValue([]);
 
@@ -303,7 +388,7 @@ describe("issue-auditor", () => {
     it("returns ready when plan exists and no pending feedback", async () => {
       const issue = mockIssue();
       mockGh.getIssueComments.mockResolvedValue([
-        { id: 100, body: "<!-- claws-automated -->\n## Implementation Plan\nDo something", login: "claws-bot[bot]" },
+        { id: 100, body: "*— Automated by Claws —*\n\n## Implementation Plan\nDo something", login: "claws-bot[bot]" },
       ]);
       mockGh.listMergedPRsForIssue.mockResolvedValue([]);
       expect(await classifyIssue(repo, issue)).toBe("ready");

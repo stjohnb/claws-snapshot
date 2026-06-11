@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { mockRepo } from "../test-helpers.js";
 
 vi.mock("../config.js", () => ({}));
+vi.mock("../model-selector.js", () => ({ getModel: () => "sonnet" }));
 
 vi.mock("../log.js", () => ({
   info: vi.fn(),
@@ -39,6 +40,12 @@ const { mockTranscribe } = vi.hoisted(() => ({
   mockTranscribe: {
     transcribe: vi.fn(),
     isAvailable: vi.fn(),
+    WhisperRateLimitError: class WhisperRateLimitError extends Error {
+      constructor(message: string) {
+        super(message);
+        this.name = "WhisperRateLimitError";
+      }
+    },
   },
 }));
 
@@ -52,6 +59,7 @@ const { mockWhatsapp } = vi.hoisted(() => ({
 
 vi.mock("../whatsapp.js", () => mockWhatsapp);
 
+import * as log from "../log.js";
 import { createHandler } from "./whatsapp-handler.js";
 
 describe("whatsapp-handler", () => {
@@ -206,6 +214,31 @@ describe("whatsapp-handler", () => {
       "447000000000@s.whatsapp.net",
       expect.stringContaining("trouble understanding"),
     );
+  });
+
+  it("sends rate-limit message for WhisperRateLimitError", async () => {
+    mockTranscribe.transcribe.mockRejectedValue(
+      new mockTranscribe.WhisperRateLimitError("Whisper API returned HTTP 429"),
+    );
+    const handler = createHandler(listRepos);
+
+    await handler({
+      from: "447000000000@s.whatsapp.net",
+      audioBuffer: Buffer.from("fake-audio"),
+      messageId: "msg-rate-limit",
+    });
+
+    expect(mockWhatsapp.sendMessage).toHaveBeenCalledWith(
+      "447000000000@s.whatsapp.net",
+      expect.stringContaining("temporarily busy"),
+    );
+    expect(mockReportError).toHaveBeenCalledWith(
+      "whatsapp-handler:process-message",
+      "447000000000@s.whatsapp.net",
+      expect.any(mockTranscribe.WhisperRateLimitError),
+    );
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("rate-limited"));
+    expect(log.error).not.toHaveBeenCalled();
   });
 
   it("handles empty message text", async () => {

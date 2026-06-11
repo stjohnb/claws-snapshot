@@ -9,6 +9,15 @@ vi.mock("./error-reporter.js", () => ({ reportError: vi.fn() }));
 const { mockExecFile } = vi.hoisted(() => ({ mockExecFile: vi.fn() }));
 vi.mock("node:child_process", () => ({ execFile: mockExecFile }));
 
+vi.mock("./github-app.js", () => ({
+  getInstallationTokenForOwner: vi.fn(async () => "fake-token"),
+  extractOwnerFromGhArgs: vi.fn(() => null),
+  buildEnvForGh: vi.fn(() => ({})),
+  getAppBotLogin: vi.fn(async () => "claws-bot"),
+  listInstallationRepositories: vi.fn(async () => []),
+  registerOnResetCallback: vi.fn(),
+}));
+
 // Import after mocks are set up
 import * as github from "./github.js";
 
@@ -25,23 +34,6 @@ function mockGhCalls(handlers: Array<{ match: (args: string[]) => boolean; respo
     cb(new Error(`Unexpected gh call: ${args.join(" ")}`), "", "unexpected call");
   });
 }
-
-describe("getPRLatestCommitDate", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    github.clearRateLimitState();
-    github.clearApiCache();
-  });
-
-  it("returns the latest commit date", async () => {
-    mockGhCalls([
-      { match: (args) => args.some((a) => a.includes("/commits")), response: "2025-01-15T10:00:00Z\n" },
-    ]);
-
-    const date = await github.getPRLatestCommitDate("owner/repo", 42);
-    expect(date).toBe("2025-01-15T10:00:00Z");
-  });
-});
 
 describe("hasValidLGTM", () => {
   const selfLogin = "claws-bot";
@@ -247,5 +239,14 @@ describe("hasValidLGTM", () => {
       ],
     );
     expect(await github.hasValidLGTM("owner/repo", 42, "main")).toBe(false);
+  });
+
+  it("returns false without throwing when gh call fails (e.g. transient 404)", async () => {
+    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: ExecFileCb) => {
+      const err = new Error("gh: Not Found (HTTP 404)");
+      (err as NodeJS.ErrnoException).code = "1";
+      cb(err, "", "gh: Not Found (HTTP 404)");
+    });
+    await expect(github.hasValidLGTM("owner/repo", 42, "main")).resolves.toBe(false);
   });
 });

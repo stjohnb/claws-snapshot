@@ -4,6 +4,10 @@ import { mockRepo, mockIssue } from "../test-helpers.js";
 vi.mock("../config.js", () => ({
   SELF_REPO: "test-org/test-repo",
 }));
+vi.mock("../model-selector.js", () => ({ getModel: (tier?: string) => tier ?? "sonnet" }));
+
+const mockClassifyComplexity = vi.hoisted(() => vi.fn().mockResolvedValue("sonnet"));
+vi.mock("../classify-complexity.js", () => ({ classifyComplexity: mockClassifyComplexity }));
 
 vi.mock("../log.js", () => ({
   info: vi.fn(),
@@ -13,6 +17,13 @@ vi.mock("../log.js", () => ({
 
 vi.mock("../error-reporter.js", () => ({
   reportError: vi.fn(),
+}));
+
+const mockGetItemTimeoutMs = vi.hoisted(() => vi.fn().mockReturnValue(undefined));
+const mockHandleTimeoutIfApplicable = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+vi.mock("../timeout-handler.js", () => ({
+  getItemTimeoutMs: mockGetItemTimeoutMs,
+  handleTimeoutIfApplicable: mockHandleTimeoutIfApplicable,
 }));
 
 const { mockGh, mockClaude, mockDb } = vi.hoisted(() => ({
@@ -25,20 +36,33 @@ const { mockGh, mockClaude, mockDb } = vi.hoisted(() => ({
     getIssueComments: vi.fn(),
     editIssueComment: vi.fn(),
     isItemSkipped: vi.fn().mockReturnValue(false),
+    isAllowedActor: vi.fn().mockResolvedValue(true),
     hasPriorityLabel: vi.fn().mockReturnValue(false),
+    hasIgnoreLabel: vi.fn().mockReturnValue(false),
   },
   mockClaude: {
-    createWorktree: vi.fn(),
-    removeWorktree: vi.fn(),
+    withNewWorktree: vi.fn(),
     enqueue: vi.fn(),
     runClaude: vi.fn(),
     randomSuffix: vi.fn().mockReturnValue("ab12"),
+    writeClawsMcpConfig: vi.fn().mockReturnValue("/tmp/mock-mcp-config.json"),
   },
   mockDb: {
     recordTaskStart: vi.fn().mockReturnValue(1),
     updateTaskWorktree: vi.fn(),
+    updateTaskModel: vi.fn(),
+    updateTaskTokenUsage: vi.fn(),
     recordTaskComplete: vi.fn(),
     recordTaskFailed: vi.fn(),
+    withTaskRecording: vi.fn(async (jobName: string, repo: string, itemNumber: number, triggerLabel: string | null, fn: (taskId: number) => Promise<unknown>) => {
+      const taskId = mockDb.recordTaskStart(jobName, repo, itemNumber, triggerLabel);
+      try {
+        return await fn(taskId);
+      } catch (err) {
+        mockDb.recordTaskFailed(taskId, String(err), { failureCategory: "unknown" });
+        throw err;
+      }
+    }),
   },
 }));
 
@@ -52,6 +76,7 @@ import {
   extractFingerprint,
   buildInvestigationPrompt,
   parseRelatedIssues,
+  isReportTruncated,
   deduplicateByFingerprint,
   deduplicateByInvestigation,
 } from "./triage-claws-errors.js";
@@ -75,10 +100,9 @@ describe("triage-claws-errors", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    mockClaude.createWorktree.mockResolvedValue("/tmp/worktree");
+    mockClaude.withNewWorktree.mockImplementation(async (_r: unknown, _b: unknown, _n: unknown, fn: (p: string) => Promise<unknown>) => fn("/tmp/worktree"));
     mockClaude.enqueue.mockImplementation((fn: () => Promise<string>) => fn());
     mockClaude.runClaude.mockResolvedValue("Root cause: transient 502\n\nRELATED_ISSUES: none");
-    mockClaude.removeWorktree.mockResolvedValue(undefined);
     mockGh.listOpenIssues.mockResolvedValue([]);
     mockGh.populateQueueCache.mockReturnValue(undefined);
     mockGh.commentOnIssue.mockResolvedValue(undefined);
@@ -237,7 +261,7 @@ describe("triage-claws-errors", () => {
       const issue = mockIssue({ number: 1, title: "[claws-error] test:fp", body: ERROR_BODY });
       const details = parseClawsError(ERROR_BODY);
 
-      const prompt = buildInvestigationPrompt(issue, details, []);
+      const prompt = buildInvestigationPrompt(issue, details, [], "owner/repo");
 
       expect(prompt).toContain("kwyjibo-bug-investigator:list-issues");
       expect(prompt).toContain("Error: gh issue list failed: 502");
@@ -250,7 +274,7 @@ describe("triage-claws-errors", () => {
       const details = parseClawsError(ERROR_BODY);
       const other = mockIssue({ number: 5, title: "[claws-error] other:fp", body: "Other error" });
 
-      const prompt = buildInvestigationPrompt(issue, details, [other]);
+      const prompt = buildInvestigationPrompt(issue, details, [other], "owner/repo");
 
       expect(prompt).toContain("Other Open Error Issues");
       expect(prompt).toContain("#5");
@@ -261,7 +285,7 @@ describe("triage-claws-errors", () => {
       const issue = mockIssue({ number: 1, title: "[claws-error] kwyjibo-bug-investigator:list-issues", body: ERROR_BODY });
       const details = parseClawsError(ERROR_BODY);
 
-      const prompt = buildInvestigationPrompt(issue, details, []);
+      const prompt = buildInvestigationPrompt(issue, details, [], "owner/repo");
 
       expect(prompt).toContain("src/jobs/kwyjibo-bug-investigator.ts");
     });
@@ -270,7 +294,7 @@ describe("triage-claws-errors", () => {
       const issue = mockIssue({ number: 1, body: ERROR_BODY });
       const details = parseClawsError(ERROR_BODY);
 
-      const prompt = buildInvestigationPrompt(issue, details, []);
+      const prompt = buildInvestigationPrompt(issue, details, [], "owner/repo");
 
       expect(prompt).toContain("Read `docs/OVERVIEW.md` first");
       expect(prompt).toContain("follow and read any linked documents");
@@ -295,6 +319,28 @@ describe("triage-claws-errors", () => {
     });
   });
 
+  describe("isReportTruncated", () => {
+    it("returns false when RELATED_ISSUES has value 'none'", () => {
+      expect(isReportTruncated("text\n\nRELATED_ISSUES: none")).toBe(false);
+    });
+
+    it("returns false when RELATED_ISSUES has issue numbers", () => {
+      expect(isReportTruncated("text\n\nRELATED_ISSUES: 1, 2")).toBe(false);
+    });
+
+    it("returns true when RELATED_ISSUES marker is absent", () => {
+      expect(isReportTruncated("text without marker")).toBe(true);
+    });
+
+    it("returns true when RELATED_ISSUES has no value", () => {
+      expect(isReportTruncated("text\n\nRELATED_ISSUES:")).toBe(true);
+    });
+
+    it("returns true when RELATED_ISSUES has only whitespace", () => {
+      expect(isReportTruncated("text\n\nRELATED_ISSUES:    ")).toBe(true);
+    });
+  });
+
   describe("run", () => {
     it("happy path — investigates and posts report", async () => {
       const issue = mockIssue({
@@ -307,15 +353,14 @@ describe("triage-claws-errors", () => {
 
       await run([selfRepo]);
 
-      expect(mockClaude.createWorktree).toHaveBeenCalledWith(selfRepo, "claws/investigate-error-10-ab12", "triage-claws-errors");
+      expect(mockClaude.withNewWorktree).toHaveBeenCalledWith(selfRepo, "claws/investigate-error-10-ab12", "triage-claws-errors", expect.any(Function));
       expect(mockGh.commentOnIssue).toHaveBeenCalledWith(
         "test-org/test-repo",
         10,
         expect.stringContaining("## Claws Error Investigation Report"),
       );
       expect(mockDb.recordTaskStart).toHaveBeenCalledWith("triage-claws-errors", "test-org/test-repo", 10, null);
-      expect(mockDb.recordTaskComplete).toHaveBeenCalledWith(1);
-      expect(mockClaude.removeWorktree).toHaveBeenCalled();
+      expect(mockDb.recordTaskComplete).toHaveBeenCalledWith(1, expect.any(Object));
     });
 
     it("phase 2 dedup — Claude identifies related issues, they get closed", async () => {
@@ -363,7 +408,7 @@ describe("triage-claws-errors", () => {
       expect(mockGh.commentOnIssue).not.toHaveBeenCalledWith(
         "test-org/test-repo", 10, expect.stringContaining("Investigation Report"),
       );
-      expect(mockDb.recordTaskComplete).toHaveBeenCalledWith(1);
+      expect(mockDb.recordTaskComplete).toHaveBeenCalledWith(1, expect.any(Object));
     });
 
     it("Claude error — task marked failed, worktree cleaned up", async () => {
@@ -378,9 +423,26 @@ describe("triage-claws-errors", () => {
 
       await run([selfRepo]);
 
-      expect(mockDb.recordTaskFailed).toHaveBeenCalledWith(1, expect.stringContaining("claude error"));
+      expect(mockDb.recordTaskFailed).toHaveBeenCalledWith(1, expect.stringContaining("claude error"), expect.any(Object));
       expect(reportError).toHaveBeenCalled();
-      expect(mockClaude.removeWorktree).toHaveBeenCalled();
+    });
+
+    it("calls handleTimeoutIfApplicable on error", async () => {
+      const issue = mockIssue({
+        number: 10,
+        title: "[claws-error] test:fp",
+        body: ERROR_BODY,
+      });
+      mockGh.listOpenIssues.mockResolvedValue([issue]);
+      mockGh.getIssueComments.mockResolvedValue([]);
+      const err = new Error("timeout");
+      mockClaude.runClaude.mockRejectedValue(err);
+
+      await run([selfRepo]);
+
+      expect(mockHandleTimeoutIfApplicable).toHaveBeenCalledWith(
+        "triage-claws-errors", "test-org/test-repo", 10, err,
+      );
     });
 
     it("SELF_REPO not in repos list — returns without processing", async () => {
@@ -389,7 +451,7 @@ describe("triage-claws-errors", () => {
       await run([otherRepo]);
 
       expect(mockGh.listOpenIssues).not.toHaveBeenCalled();
-      expect(mockClaude.createWorktree).not.toHaveBeenCalled();
+      expect(mockClaude.withNewWorktree).not.toHaveBeenCalled();
     });
 
     it("strips RELATED_ISSUES line from posted comment", async () => {
@@ -424,7 +486,7 @@ describe("triage-claws-errors", () => {
 
       await run([selfRepo]);
 
-      expect(mockClaude.createWorktree).not.toHaveBeenCalled();
+      expect(mockClaude.withNewWorktree).not.toHaveBeenCalled();
     });
 
     it("populates queue cache for uninvestigated issues", async () => {
@@ -442,6 +504,89 @@ describe("triage-claws-errors", () => {
         "needs-triage", "test-org/test-repo",
         expect.objectContaining({ number: 10 }),
       );
+    });
+
+    it("truncated output then succeeds on retry — posts report from retry", async () => {
+      const issue = mockIssue({
+        number: 10,
+        title: "[claws-error] test:fp",
+        body: ERROR_BODY,
+      });
+      mockGh.listOpenIssues.mockResolvedValue([issue]);
+      mockGh.getIssueComments.mockResolvedValue([]);
+      mockClaude.runClaude
+        .mockResolvedValueOnce("Partial output without marker")
+        .mockResolvedValueOnce("Root cause: foo\n\nRELATED_ISSUES: none");
+
+      await run([selfRepo]);
+
+      expect(mockClaude.runClaude).toHaveBeenCalledTimes(2);
+      expect(mockGh.commentOnIssue).toHaveBeenCalledWith(
+        "test-org/test-repo",
+        10,
+        expect.stringContaining("Root cause: foo"),
+      );
+      const commentBody = mockGh.commentOnIssue.mock.calls.find(
+        (call: unknown[]) => (call[2] as string).includes("Root cause: foo"),
+      )![2] as string;
+      expect(commentBody).not.toContain("RELATED_ISSUES");
+    });
+
+    it("truncated twice — skips posting and records task complete", async () => {
+      const issue = mockIssue({
+        number: 10,
+        title: "[claws-error] test:fp",
+        body: ERROR_BODY,
+      });
+      mockGh.listOpenIssues.mockResolvedValue([issue]);
+      mockGh.getIssueComments.mockResolvedValue([]);
+      mockClaude.runClaude.mockResolvedValue("Partial output without marker");
+
+      await run([selfRepo]);
+
+      expect(mockClaude.runClaude).toHaveBeenCalledTimes(2);
+      expect(mockGh.commentOnIssue).not.toHaveBeenCalled();
+      expect(mockDb.recordTaskComplete).toHaveBeenCalledWith(1, expect.any(Object));
+    });
+
+    it("uses classifyComplexity to pick model for investigation", async () => {
+      const issue = mockIssue({
+        number: 10,
+        title: "[claws-error] test:fp",
+        body: ERROR_BODY,
+      });
+      mockGh.listOpenIssues.mockResolvedValue([issue]);
+      mockGh.getIssueComments.mockResolvedValue([]);
+      mockClassifyComplexity.mockResolvedValueOnce("opus");
+
+      await run([selfRepo]);
+
+      expect(mockClassifyComplexity).toHaveBeenCalledWith(
+        expect.stringContaining("Claws internal error investigation"),
+        "/tmp/worktree",
+      );
+      expect(mockClaude.runClaude).toHaveBeenCalledWith(
+        expect.any(String),
+        "/tmp/worktree",
+        expect.objectContaining({ model: "opus" }),
+      );
+    });
+
+    it("skips issues from non-allowed actors", async () => {
+      const issue = mockIssue({
+        number: 10,
+        title: "[claws-error] test:fp",
+        body: ERROR_BODY,
+        author: { login: "attacker" },
+      });
+      mockGh.listOpenIssues.mockResolvedValue([issue]);
+      mockGh.getIssueComments.mockResolvedValue([]);
+      mockGh.isAllowedActor.mockResolvedValue(false);
+
+      await run([selfRepo]);
+
+      expect(mockGh.isAllowedActor).toHaveBeenCalledWith("attacker");
+      expect(mockClaude.withNewWorktree).not.toHaveBeenCalled();
     });
   });
 });

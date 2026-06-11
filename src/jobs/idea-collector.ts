@@ -1,21 +1,20 @@
 import fs from "node:fs";
 import path from "node:path";
-import { execFile as execFileCb } from "node:child_process";
-import { promisify } from "node:util";
 import { WORK_DIR, type Repo } from "../config.js";
 import * as gh from "../github.js";
 import * as claude from "../claude.js";
 import * as log from "../log.js";
 import * as slack from "../slack.js";
 import { reportError } from "../error-reporter.js";
-import type { PendingIdeasFile, PendingIdea } from "./idea-suggester.js";
-
-const execFile = promisify(execFileCb);
+import { parseFocusAreasFromOverview, type PendingIdeasFile, type PendingIdea, PendingIdeasFileSchema } from "./idea-suggester.js";
 
 const PENDING_IDEAS_DIR = path.join(WORK_DIR, "pending-ideas");
 
 /** Maximum time to wait for reactions before treating unreacted ideas as "potential". */
 const TIMEOUT_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+/** Upper-bound timeout: if no reactions arrive at all within this window, give up. */
+const MAX_WAIT_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 type Disposition = "accepted" | "potential" | "rejected";
 
@@ -38,7 +37,9 @@ export function classifyReactions(reactions: slack.SlackReaction[]): Disposition
 
 /**
  * Check if all ideas in a pending file have been resolved (reacted to),
- * or if the timeout has elapsed.
+ * or if the timeout has elapsed once at least one idea has a reaction.
+ * When zero ideas have reactions, waits up to {@link MAX_WAIT_MS} before
+ * treating the batch as ready to prevent indefinite accumulation.
  */
 function isReady(
   ideas: { disposition: Disposition | null }[],
@@ -48,6 +49,16 @@ function isReady(
   if (allResolved) return true;
 
   const elapsed = Date.now() - new Date(postedAt).getTime();
+
+  const anyResolved = ideas.some((i) => i.disposition !== null);
+  if (!anyResolved) {
+    if (elapsed >= MAX_WAIT_MS) {
+      log.warn(`[idea-collector] No reactions received after ${Math.round(elapsed / 86_400_000)}d — giving up on batch posted at ${postedAt}`);
+      return true;
+    }
+    return false;
+  }
+
   return elapsed >= TIMEOUT_MS;
 }
 
@@ -70,7 +81,7 @@ export async function run(repos: Repo[]): Promise<void> {
 
 async function processPendingFile(filePath: string, repos: Repo[]): Promise<void> {
   const raw = fs.readFileSync(filePath, "utf-8");
-  const pending: PendingIdeasFile = JSON.parse(raw);
+  const pending: PendingIdeasFile = PendingIdeasFileSchema.parse(JSON.parse(raw));
 
   // Find the matching Repo object
   const repo = repos.find((r) => r.fullName === pending.repo);
@@ -108,6 +119,15 @@ async function processPendingFile(filePath: string, repos: Repo[]): Promise<void
   const accepted = resolved.filter((i) => i.disposition === "accepted");
   for (const idea of accepted) {
     try {
+      // Dedup: skip if an open issue with the same title already exists
+      const existing = await gh.searchIssues(pending.repo, idea.title);
+      const exactMatch = existing.find((e) => e.title === idea.title);
+      if (exactMatch) {
+        log.info(`[idea-collector] Skipping issue creation for "${idea.title}" — already exists as #${exactMatch.number}`);
+        idea.issueNumber = exactMatch.number;
+        continue;
+      }
+
       const issueNumber = await gh.createIssue(
         pending.repo,
         idea.title,
@@ -126,17 +146,58 @@ async function processPendingFile(filePath: string, repos: Repo[]): Promise<void
 
   // Create collection PR
   const branch = `claws/ideas-collect-${claude.randomSuffix()}`;
-  let wt: string | undefined;
 
-  try {
-    wt = await claude.createWorktree(repo, branch, "idea-collector");
-
+  await claude.withNewWorktree(repo, branch, "idea-collector", async (wt) => {
     const ideasDir = path.join(wt, "ideas");
     fs.mkdirSync(ideasDir, { recursive: true });
 
+    // Populate focus areas in overview.md if none are declared yet
+    const overviewPath = path.join(ideasDir, "overview.md");
+    const hasExplicitAreas = (() => {
+      if (fs.existsSync(overviewPath)) {
+        const content = fs.readFileSync(overviewPath, "utf-8");
+        if (parseFocusAreasFromOverview(content).length > 0) return true;
+      }
+      // Fallback: check legacy focus-areas.md
+      const legacyPath = path.join(ideasDir, "focus-areas.md");
+      if (fs.existsSync(legacyPath)) {
+        const content = fs.readFileSync(legacyPath, "utf-8");
+        return content.split("\n").some((line) => /^\s*[-*]\s+.+$/.test(line));
+      }
+      return false;
+    })();
+
+    if (!hasExplicitAreas) {
+      const seen = new Set<string>();
+      const uniqueAreas: string[] = [];
+      for (const idea of resolved) {
+        const lower = idea.focusArea.toLowerCase();
+        if (!seen.has(lower)) {
+          seen.add(lower);
+          uniqueAreas.push(idea.focusArea);
+        }
+      }
+      if (uniqueAreas.length > 0) {
+        const focusSection = [
+          "",
+          "## Focus Areas",
+          "",
+          ...uniqueAreas.map((a) => `- ${a}`),
+          "",
+        ].join("\n");
+
+        if (fs.existsSync(overviewPath)) {
+          const existing = fs.readFileSync(overviewPath, "utf-8");
+          fs.writeFileSync(overviewPath, existing.trimEnd() + "\n" + focusSection);
+        } else {
+          fs.writeFileSync(overviewPath, "# Ideas\n" + focusSection);
+        }
+      }
+    }
+
     // Append accepted ideas to focus-area files
     for (const idea of accepted) {
-      const areaSlug = idea.focusArea.toLowerCase().replace(/\s+/g, "-");
+      const areaSlug = idea.focusArea.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
       const areaFile = path.join(ideasDir, `${areaSlug}.md`);
       let existing = "";
       if (fs.existsSync(areaFile)) {
@@ -183,20 +244,16 @@ async function processPendingFile(filePath: string, repos: Repo[]): Promise<void
     }
 
     // Stage, commit, push, create PR
-    await execFile("git", ["add", "ideas/"], { cwd: wt });
+    await claude.git(["add", "ideas/"], wt);
 
     // Check if there are any changes to commit
-    const { stdout: statusOut } = await execFile("git", ["status", "--porcelain"], { cwd: wt });
+    const statusOut = await claude.git(["status", "--porcelain"], wt);
     if (!statusOut.trim()) {
       log.info(`[idea-collector] No changes to commit for ${pending.repo}`);
     } else {
-      await execFile(
-        "git",
-        ["commit", "-m", `ideas: collect idea responses for ${repo.name}`],
-        { cwd: wt },
-      );
+      await claude.git(["commit", "-m", `ideas: collect idea responses for ${repo.name}`], wt);
 
-      await claude.pushBranch(wt, branch);
+      await claude.pushBranch(wt, branch, repo.owner);
 
       const summary = [
         `## Collected Idea Responses`,
@@ -242,9 +299,5 @@ async function processPendingFile(filePath: string, repos: Repo[]): Promise<void
     log.info(
       `[idea-collector] Processed ${pending.repo}: ${accepted.length} accepted, ${potential.length} potential, ${rejected.length} rejected`,
     );
-  } finally {
-    if (wt) {
-      await claude.removeWorktree(repo, wt);
-    }
-  }
+  });
 }

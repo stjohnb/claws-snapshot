@@ -3,14 +3,14 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 const { mockConfig } = vi.hoisted(() => ({
   mockConfig: {
     EMAIL_ENABLED: true,
-    EMAIL_USER: "user@example.com",
+    EMAIL_USER: "brendanserver@gmail.com",
     EMAIL_APP_PASSWORD: "test-password",
-    EMAIL_RECIPIENT: "recipient@example.com",
-    EMAIL_VEG_BOX_SENDER: "sender",
+    EMAIL_RECIPIENT: "brendan@bstjohn.net",
   },
 }));
 
 vi.mock("../config.js", () => mockConfig);
+vi.mock("../model-selector.js", () => ({ getModel: () => "sonnet" }));
 
 vi.mock("../log.js", () => ({
   info: vi.fn(),
@@ -63,6 +63,14 @@ vi.mock("imapflow", () => ({
   ImapFlow: MockImapFlow,
 }));
 
+const { mockSimpleParser } = vi.hoisted(() => ({
+  mockSimpleParser: vi.fn(),
+}));
+
+vi.mock("mailparser", () => ({
+  simpleParser: mockSimpleParser,
+}));
+
 const { mockSendMail } = vi.hoisted(() => ({
   mockSendMail: vi.fn().mockResolvedValue(undefined),
 }));
@@ -77,51 +85,13 @@ vi.mock("nodemailer", () => ({
 
 import { run, getEmailStatus } from "./email-monitor.js";
 
-const SAMPLE_EMAIL_SOURCE = [
-  'Content-Type: multipart/alternative; boundary="test-boundary"',
-  "",
-  "--test-boundary",
-  "Content-Type: text/plain; charset=\"Windows-1252\"",
-  "Content-Transfer-Encoding: quoted-printable",
-  "",
-  "This Week's Veg Content",
-  "",
-  "Regular Veg Size",
-  "Large Veg Size",
-  "",
-  "  *   Carrots",
-  "  *   Onions",
-  "  *   Leek",
-  "  *   Kale",
-  "  *   Beetroots",
-  "  *   Salad",
-  "  *   Mushrooms",
-  "",
-  "  *   Carrots",
-  "  *   Onions",
-  "  *   Leek",
-  "  *   Kale",
-  "  *   Beetroots",
-  "  *   Salad",
-  "  *   Mushrooms",
-  "  *   Celery",
-  "",
-  "--test-boundary",
-  "Content-Type: text/html; charset=\"Windows-1252\"",
-  "",
-  "<html>...</html>",
-  "",
-  "--test-boundary--",
-].join("\r\n");
-
 describe("email-monitor", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockConfig.EMAIL_ENABLED = true;
-    mockConfig.EMAIL_USER = "user@example.com";
+    mockConfig.EMAIL_USER = "brendanserver@gmail.com";
     mockConfig.EMAIL_APP_PASSWORD = "test-password";
-    mockConfig.EMAIL_RECIPIENT = "recipient@example.com";
-    mockConfig.EMAIL_VEG_BOX_SENDER = "sender";
+    mockConfig.EMAIL_RECIPIENT = "brendan@bstjohn.net";
     mockSearch.mockResolvedValue([]);
   });
 
@@ -145,50 +115,42 @@ describe("email-monitor", () => {
     expect(mockConnect).not.toHaveBeenCalled();
   });
 
-  it("connects and searches for unseen veg box emails", async () => {
+  it("connects and searches for unseen emails", async () => {
     mockSearch.mockResolvedValue([]);
     await run();
     expect(mockConnect).toHaveBeenCalledOnce();
     expect(mockMailboxOpen).toHaveBeenCalledWith("INBOX");
-    expect(mockSearch).toHaveBeenCalledWith({
-      seen: false,
-      from: "sender",
-      subject: "Veg Content",
-    });
+    expect(mockSearch).toHaveBeenCalledWith({ seen: false });
     expect(getEmailStatus().configured).toBe(true);
     expect(getEmailStatus().lastCheck).toBeTruthy();
   });
 
-  it("uses configured sender filter in IMAP search", async () => {
-    mockConfig.EMAIL_VEG_BOX_SENDER = "customsender";
+  it("searches with only seen:false — no from or subject filters", async () => {
     await run();
-    expect(mockSearch).toHaveBeenCalledWith(
-      expect.objectContaining({ from: "customsender" }),
-    );
-  });
-
-  it("includes Veg Content subject filter in search", async () => {
-    await run();
-    expect(mockSearch).toHaveBeenCalledWith(
-      expect.objectContaining({ subject: "Veg Content" }),
-    );
+    const searchArg = mockSearch.mock.calls[0][0];
+    expect(searchArg).toEqual({ seen: false });
+    expect(searchArg).not.toHaveProperty("from");
+    expect(searchArg).not.toHaveProperty("subject");
   });
 
   it("extracts veg list and generates recipes for matching email", async () => {
     mockSearch.mockResolvedValue([101]);
     mockFetchOne.mockResolvedValue({
-      source: Buffer.from(SAMPLE_EMAIL_SOURCE),
+      source: Buffer.from("raw email content"),
+    });
+    mockSimpleParser.mockResolvedValue({
+      text: "This Week's Veg Content\n\nRegular Veg Size\n  * Carrots\n  * Onions\n  * Kale",
     });
     mockClaude.runClaude
-      .mockResolvedValueOnce("Carrots\nOnions\nLeek\nKale\nBeetroots\nSalad\nMushrooms")
-      .mockResolvedValueOnce("1. Carrot Soup\n2. Kale Salad\n3. Mushroom Risotto");
+      .mockResolvedValueOnce("Carrots\nOnions\nKale")
+      .mockResolvedValueOnce("1. Carrot Soup\n2. Kale Salad");
 
     await run();
 
     // First Claude call: extract veg list
     expect(mockClaude.runClaude).toHaveBeenCalledTimes(2);
     const extractPrompt = mockClaude.runClaude.mock.calls[0][0] as string;
-    expect(extractPrompt).toContain("Regular Veg Size");
+    expect(extractPrompt).toContain("vegetable");
 
     // Second Claude call: generate recipes
     const recipePrompt = mockClaude.runClaude.mock.calls[1][0] as string;
@@ -199,7 +161,7 @@ describe("email-monitor", () => {
     expect(mockSendMail).toHaveBeenCalledOnce();
     expect(mockSendMail).toHaveBeenCalledWith(
       expect.objectContaining({
-        to: "recipient@example.com",
+        to: "brendan@bstjohn.net",
         subject: expect.stringContaining("Veg Box Recipes"),
       }),
     );
@@ -211,7 +173,10 @@ describe("email-monitor", () => {
   it("marks email as seen and skips when Claude returns NOT_FOUND", async () => {
     mockSearch.mockResolvedValue([200]);
     mockFetchOne.mockResolvedValue({
-      source: Buffer.from(SAMPLE_EMAIL_SOURCE),
+      source: Buffer.from("some non-veg email"),
+    });
+    mockSimpleParser.mockResolvedValue({
+      text: "Meeting notes for Tuesday",
     });
     mockClaude.runClaude.mockResolvedValueOnce("NOT_FOUND");
 
@@ -222,15 +187,52 @@ describe("email-monitor", () => {
     expect(mockMessageFlagsAdd).toHaveBeenCalledWith(200, ["\\Seen"]);
   });
 
-  it("updates status on IMAP error", async () => {
-    mockConnect.mockRejectedValueOnce(new Error("Connection refused"));
+  it("marks email as seen when simpleParser returns no text body", async () => {
+    mockSearch.mockResolvedValue([300]);
+    mockFetchOne.mockResolvedValue({
+      source: Buffer.from("html-only email"),
+    });
+    mockSimpleParser.mockResolvedValue({ text: undefined });
+
     await run();
+
+    expect(mockClaude.runClaude).not.toHaveBeenCalled();
+    expect(mockMessageFlagsAdd).toHaveBeenCalledWith(300, ["\\Seen"]);
+  });
+
+  it("updates status on IMAP error after retry exhausted", async () => {
+    vi.useFakeTimers();
+    mockConnect
+      .mockRejectedValueOnce(new Error("Connection refused"))
+      .mockRejectedValueOnce(new Error("Connection refused"));
+    const p = run();
+    await vi.advanceTimersByTimeAsync(5000);
+    await p;
+    expect(mockConnect).toHaveBeenCalledTimes(2);
     expect(getEmailStatus().lastError).toContain("Connection refused");
     expect(mockReportError).toHaveBeenCalledWith(
       "email-monitor:poll",
       expect.any(String),
       expect.any(Error),
     );
+    vi.useRealTimers();
+  });
+
+  it("retries once on transient connect failure", async () => {
+    vi.useFakeTimers();
+    mockConnect
+      .mockRejectedValueOnce(new Error("Connection timeout"))
+      .mockResolvedValueOnce(undefined);
+    mockSearch.mockResolvedValue([]);
+
+    const p = run();
+    await vi.advanceTimersByTimeAsync(5000);
+    await p;
+
+    expect(mockConnect).toHaveBeenCalledTimes(2);
+    expect(mockMailboxOpen).toHaveBeenCalledWith("INBOX");
+    expect(mockReportError).not.toHaveBeenCalled();
+    vi.useRealTimers();
   });
 
   it("reports per-email errors without blocking other emails", async () => {
@@ -238,8 +240,11 @@ describe("email-monitor", () => {
     mockFetchOne
       .mockRejectedValueOnce(new Error("fetch failed"))
       .mockResolvedValueOnce({
-        source: Buffer.from(SAMPLE_EMAIL_SOURCE),
+        source: Buffer.from("raw email"),
       });
+    mockSimpleParser.mockResolvedValue({
+      text: "Carrots\nOnions",
+    });
     mockClaude.runClaude
       .mockResolvedValueOnce("Carrots\nOnions")
       .mockResolvedValueOnce("1. Carrot Soup");
