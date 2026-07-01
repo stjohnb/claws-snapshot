@@ -54,10 +54,15 @@ export async function runDiagnosis(repo: Repo, pr: gh.PR): Promise<void> {
   }
 
   // Dedup guard — once we've posted a final report for this label-application,
-  // don't replay. Human must delete the marker comment to retry.
+  // don't replay the diagnosis. But CI may have recovered since (flaky check
+  // passed on retry, transient infra cleared, or a manual/external fix landed)
+  // while the stale problematic label lingers. Before short-circuiting, clear
+  // the label if the PR is now green — otherwise a recovered PR stays labelled
+  // problematic forever, since the marker blocks every future diagnosis pass.
   try {
     const comments = await gh.getIssueComments(fullName, pr.number);
     if (comments.some((c) => c.body.includes(DIAGNOSIS_COMMENT_MARKER))) {
+      await clearStaleProblematicLabelIfGreen(fullName, pr.number);
       log.info(`[problematic-diagnoser] Skipping ${fullName}#${pr.number} — already diagnosed`);
       return;
     }
@@ -87,13 +92,26 @@ export async function runDiagnosis(repo: Repo, pr: gh.PR): Promise<void> {
 
     const failLog = await gh.getFailedRunLog(fullName, currentPR.number);
     if (!failLog) {
+      // The problematic label is applied after failed CI-fix attempts, but CI may
+      // have recovered before this diagnosis pass runs (flaky check passed on retry,
+      // transient infra failure cleared, or a manual fix landed). Verify the PR is
+      // genuinely still failing before reporting "no fix attempted" — otherwise we
+      // leave a stale problematic label and a misleading report on a green PR.
+      const failing = await gh.getFailingCheck(fullName, currentPR.number);
+      if (!failing) {
+        const status = await gh.getPRCheckStatus(fullName, currentPR.number);
+        if (status === "passing" || status === "none") {
+          log.info(`[problematic-diagnoser] No failing checks for ${fullName}#${currentPR.number} — CI is green, clearing stale problematic label`);
+          outcome = { kind: "success", roundsRun };
+          break;
+        }
+      }
       if (round === 1) {
         log.info(`[problematic-diagnoser] No failure log for ${fullName}#${currentPR.number} on round 1 — nothing to diagnose`);
         outcome = { kind: "no-fix-possible", roundsRun, reason: "No CI failure log available to diagnose" };
         break;
       }
-      // After our first push, an empty log could mean CI cleanly succeeded or is still running.
-      const failing = await gh.getFailingCheck(fullName, currentPR.number);
+      // After our first push, an empty log with no failing check means CI cleanly succeeded.
       if (!failing) {
         outcome = { kind: "success", roundsRun };
         break;
@@ -237,8 +255,6 @@ async function runDiagnosisRound(
         db.updateTaskModel(taskId, model);
         log.info(`[problematic-diagnoser] Using model "${model}" for round ${round} on ${fullName}#${pr.number}`);
 
-        let taskTokensUsed: number | undefined;
-        let taskCostUsd: number | undefined;
         await claude.runClaude(prompt, wtPath, {
           capability: "tool-use",
           mcpConfig: mcpConfigPath,
@@ -246,11 +262,8 @@ async function runDiagnosisRound(
           tier,
           model,
           agent: "build",
-          onTokensUsed: (t, c) => { taskTokensUsed = t; taskCostUsd = c; },
+          onTokensUsed: db.trackTaskTokens(taskId),
         });
-        if (taskTokensUsed !== undefined && taskCostUsd !== undefined) {
-          db.updateTaskTokenUsage(taskId, taskTokensUsed, taskCostUsd);
-        }
 
         let outcomeRow: TaskOutcome = { commits: 0 };
 
@@ -328,6 +341,35 @@ async function refetchPR(fullName: string, prNumber: number): Promise<gh.PR | nu
   } catch (err) {
     log.warn(`[problematic-diagnoser] refetchPR failed for ${fullName}#${prNumber}: ${err}`);
     return null;
+  }
+}
+
+async function clearStaleProblematicLabelIfGreen(fullName: string, prNumber: number): Promise<boolean> {
+  let failing: gh.FailedCheck | undefined;
+  try {
+    failing = await gh.getFailingCheck(fullName, prNumber);
+  } catch (err) {
+    log.warn(`[problematic-diagnoser] getFailingCheck failed for ${fullName}#${prNumber}: ${err}`);
+    return false;
+  }
+  if (failing) return false;
+
+  let status: "passing" | "failing" | "pending" | "none";
+  try {
+    status = await gh.getPRCheckStatus(fullName, prNumber);
+  } catch (err) {
+    log.warn(`[problematic-diagnoser] getPRCheckStatus failed for ${fullName}#${prNumber}: ${err}`);
+    return false;
+  }
+  if (status !== "passing" && status !== "none") return false;
+
+  try {
+    await gh.removeLabel(fullName, prNumber, LABELS.problematic);
+    log.info(`[problematic-diagnoser] CI green for already-diagnosed ${fullName}#${prNumber} — removed stale ${LABELS.problematic} label`);
+    return true;
+  } catch (err) {
+    log.warn(`[problematic-diagnoser] Failed to remove stale problematic label for ${fullName}#${prNumber}: ${err}`);
+    return false;
   }
 }
 

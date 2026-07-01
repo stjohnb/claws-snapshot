@@ -6,7 +6,6 @@ import * as db from "../db.js";
 import * as smartSchedule from "../smart-schedule.js";
 import { reportError } from "../error-reporter.js";
 import { notify } from "../slack.js";
-import { extractGameId, REPORT_HEADER as KWYJIBO_REPORT_HEADER } from "./triage-kwyjibo-errors.js";
 import { extractFingerprint, REPORT_HEADER as CLAWS_ERROR_REPORT_HEADER } from "./triage-claws-errors.js";
 import { findPlanComment, parsePlan } from "../plan-parser.js";
 
@@ -56,13 +55,6 @@ export async function classifyIssue(
   if (extractFingerprint(issue.title) !== null) {
     const comments = await gh.getIssueComments(fullName, issue.number);
     const hasReport = comments.some((c) => c.body.includes(CLAWS_ERROR_REPORT_HEADER));
-    if (!hasReport) return "needs-triage";
-  }
-
-  // Game-ID without investigation report → triage handles
-  if (issue.body && extractGameId(issue.body) !== null) {
-    const comments = await gh.getIssueComments(fullName, issue.number);
-    const hasReport = comments.some((c) => c.body.includes(KWYJIBO_REPORT_HEADER));
     if (!hasReport) return "needs-triage";
   }
 

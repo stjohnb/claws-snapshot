@@ -137,12 +137,7 @@ async function processPR(
     const timeoutMs = getItemTimeoutMs(fullName, pr.number);
     const model = getModel("sonnet", "text-only", "opencode");
     db.updateTaskModel(taskId, model);
-    let taskTokensUsed: number | undefined;
-    let taskCostUsd: number | undefined;
-    const claudeOutput = await claude.runClaude(prompt, wtPath!, { capability: "text-only", mcpConfig: mcpConfigPath, timeoutMs, tier: "sonnet", model, agent: "plan", envSanitization: "passthrough", onTokensUsed: (t, c) => { taskTokensUsed = t; taskCostUsd = c; } });
-    if (taskTokensUsed !== undefined && taskCostUsd !== undefined) {
-      db.updateTaskTokenUsage(taskId, taskTokensUsed, taskCostUsd);
-    }
+    const claudeOutput = await claude.runClaude(prompt, wtPath!, { capability: "text-only", mcpConfig: mcpConfigPath, timeoutMs, tier: "sonnet", model, agent: "plan", envSanitization: "passthrough", onTokensUsed: db.trackTaskTokens(taskId) });
 
     if (claudeOutput.trim()) {
       await gh.commentOnIssue(fullName, pr.number, claudeOutput.trim());
@@ -173,55 +168,53 @@ export async function run(repos: Repo[]): Promise<void> {
       const selfLogin = await gh.getSelfLogin(repo.owner);
       const prs = await gh.listPRs(repo.fullName);
       for (const pr of prs) {
-        if (gh.isItemSkipped(repo.fullName, pr.number)) continue;
-        if (gh.hasIgnoreLabel(pr.labels)) continue;
-        if (gh.isForkPR(pr)) continue;
-        if (!await gh.isAllowedActor(pr.author.login)) continue;
+        try {
+          if (gh.isItemSkipped(repo.fullName, pr.number)) continue;
+          if (gh.hasIgnoreLabel(pr.labels)) continue;
+          if (gh.isForkPR(pr)) continue;
+          if (!await gh.isAllowedActor(pr.author.login)) continue;
 
-        // Look for "QA this" trigger comment
-        const comments = await gh.getIssueComments(repo.fullName, pr.number);
-        let triggerComment: gh.IssueComment | null = null;
+          // Look for "QA this" trigger comment
+          const comments = await gh.getIssueComments(repo.fullName, pr.number);
+          let triggerComment: gh.IssueComment | null = null;
 
-        for (const comment of comments) {
-          if (comment.login === selfLogin) continue;
-          if (!QA_TRIGGER_RE.test(comment.body)) continue;
+          for (const comment of comments) {
+            if (comment.login === selfLogin) continue;
+            if (!QA_TRIGGER_RE.test(comment.body)) continue;
 
-          // Check if Claws already reacted 👀
-          const reactions = await gh.getCommentReactions(repo.fullName, comment.id);
-          const alreadyProcessed = reactions.some(
-            (r) => r.user.login === selfLogin && r.content === "eyes",
+            // Check if Claws already reacted 👀
+            const reactions = await gh.getCommentReactions(repo.fullName, comment.id);
+            const alreadyProcessed = reactions.some(
+              (r) => r.user.login === selfLogin && r.content === "eyes",
+            );
+            if (alreadyProcessed) continue;
+
+            triggerComment = comment;
+            break;
+          }
+
+          if (!triggerComment) continue;
+
+          // Discover deployment URL
+          const headSHA = await gh.getPRHeadSHA(repo.fullName, pr.number);
+          const deploymentUrl = await gh.getDeploymentUrl(repo.fullName, headSHA, pr.number);
+          if (!deploymentUrl) {
+            log.warn(`[qa-phase] No deployment URL found for ${repo.fullName}#${pr.number} — will retry next cycle`);
+            continue;
+          }
+
+          gh.populateQueueCacheFor("needs-qa", repo.fullName, pr, "pr");
+
+          tasks.push(
+            processPR(repo, pr, triggerComment.id, deploymentUrl).catch(async (err) => {
+              await handleTimeoutIfApplicable("qa-phase", repo.fullName, pr.number, err);
+              reportError("qa-phase:process-pr", `${repo.fullName}#${pr.number}`, err);
+            }),
           );
-          if (alreadyProcessed) continue;
-
-          triggerComment = comment;
-          break;
-        }
-
-        if (!triggerComment) continue;
-
-        // Discover deployment URL
-        const headSHA = await gh.getPRHeadSHA(repo.fullName, pr.number);
-        const deploymentUrl = await gh.getDeploymentUrl(repo.fullName, headSHA, pr.number);
-        if (!deploymentUrl) {
-          log.warn(`[qa-phase] No deployment URL found for ${repo.fullName}#${pr.number} — will retry next cycle`);
+        } catch (err) {
+          reportError("qa-phase:inspect-pr", `${repo.fullName}#${pr.number}`, err);
           continue;
         }
-
-        gh.populateQueueCache("needs-qa", repo.fullName, {
-          number: pr.number,
-          title: pr.title,
-          type: "pr",
-          updatedAt: pr.updatedAt,
-          priority: gh.hasPriorityLabel(pr.labels),
-          labels: pr.labels.map((l) => l.name),
-        });
-
-        tasks.push(
-          processPR(repo, pr, triggerComment.id, deploymentUrl).catch(async (err) => {
-            await handleTimeoutIfApplicable("qa-phase", repo.fullName, pr.number, err);
-            reportError("qa-phase:process-pr", `${repo.fullName}#${pr.number}`, err);
-          }),
-        );
       }
     } catch (err) {
       reportError("qa-phase:list-prs", repo.fullName, err);

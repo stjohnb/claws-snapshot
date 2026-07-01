@@ -35,7 +35,7 @@ echo "$LATEST_TAG" > "$INSTALL_DIR/.current-version"
 
 # Patch the service unit with the current user and PATH
 log "Installing systemd units for user $USER_NAME..."
-sed "s/User=brendan/User=$USER_NAME/;s/Group=brendan/Group=$USER_NAME/;s|/home/brendan/|/home/$USER_NAME/|" \
+sed "s/User=user/User=$USER_NAME/;s/Group=user/Group=$USER_NAME/;s|/home/user/|/home/$USER_NAME/|" \
   "$INSTALL_DIR/deploy/claws.service" | \
   sed "/\[Service\]/a Environment=PATH=$PATH" | \
   sudo tee /etc/systemd/system/claws.service >/dev/null

@@ -1,8 +1,6 @@
-import fs from "node:fs";
-import path from "node:path";
 import { LABELS, type Repo } from "../config.js";
-import { runRepoScanner, type ScannerSpec } from "./scanner-runner.js";
-import { listWorkflowFiles, parseWorkflow } from "./workflow-parser.js";
+import { renderViolationTable, runRepoScanner, type ScannerSpec } from "./scanner-runner.js";
+import { listParsedWorkflows } from "./workflow-parser.js";
 
 interface Violation {
   file: string;
@@ -30,35 +28,22 @@ export function needsOsLabel(runsOn: string | string[] | null): boolean {
 }
 
 function formatIssueBody(violations: Violation[]): string {
-  const lines = [
-    "| File | Job | `runs-on` |",
-    "|------|-----|-----------|",
-  ];
-
-  for (const v of violations) {
-    lines.push(`| \`${v.file}\` | \`${v.job}\` | \`${formatRunsOn(v.runsOn)}\` |`);
-  }
-
-  lines.push(
-    "",
-    "**Why this matters:** When a new self-hosted runner (e.g. macOS) joins the pool, jobs that only request `self-hosted` will be scheduled onto it indiscriminately, even when they require Linux.",
-    "",
-    "**Fix:** Replace `runs-on: self-hosted` with `runs-on: [self-hosted, linux]` (or `[self-hosted, macos]` for jobs that genuinely require macOS).",
-  );
-
-  return lines.join("\n");
+  return renderViolationTable({
+    columns: ["File", "Job", "`runs-on`"],
+    rows: violations,
+    cells: (v) => [`\`${v.file}\``, `\`${v.job}\``, `\`${formatRunsOn(v.runsOn)}\``],
+    footer: [
+      "**Why this matters:** When a new self-hosted runner (e.g. macOS) joins the pool, jobs that only request `self-hosted` will be scheduled onto it indiscriminately, even when they require Linux.",
+      "",
+      "**Fix:** Replace `runs-on: self-hosted` with `runs-on: [self-hosted, linux]` (or `[self-hosted, macos]` for jobs that genuinely require macOS).",
+    ],
+  });
 }
 
 function scan(repoDir: string, _repo: Repo): { body: string; summary?: string } | null {
-  const wf = listWorkflowFiles(repoDir);
-  if (!wf) return null;
-
   const violations: Violation[] = [];
 
-  for (const file of wf.files) {
-    const content = fs.readFileSync(path.join(wf.dir, file), "utf-8");
-    const workflow = parseWorkflow(content);
-
+  for (const { file, workflow } of listParsedWorkflows(repoDir) ?? []) {
     for (const job of workflow.getJobs()) {
       if (needsOsLabel(job.runsOn)) {
         violations.push({ file, job: job.name, runsOn: job.runsOn! });

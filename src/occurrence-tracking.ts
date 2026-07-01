@@ -23,6 +23,11 @@ export function updateOccurrenceTracking(body: string, timestamp: string): strin
   );
 }
 
+export function parseOccurrenceCount(body: string): number | null {
+  const m = body.match(/\*\*Occurrences:\*\* (\d+)/);
+  return m ? parseInt(m[1], 10) : null;
+}
+
 export function applyOccurrenceTracking(
   currentBody: string,
   timestamp: string,
@@ -53,8 +58,7 @@ export interface EnsureAlertIssueResult {
 
 export async function ensureAlertIssue(opts: EnsureAlertIssueOptions): Promise<EnsureAlertIssueResult> {
   const timestamp = opts.timestamp ?? new Date().toISOString();
-  const results = await gh.searchIssues(opts.repo, opts.title);
-  const existing = results.find((r) => r.title === opts.title);
+  const existing = await gh.findIssueByExactTitle(opts.repo, opts.title);
 
   if (!existing) {
     const issueNumber = await gh.createIssue(

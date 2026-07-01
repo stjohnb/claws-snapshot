@@ -27,7 +27,7 @@ vi.mock("./github.js", () => {
     }
   }
   return {
-    searchIssues: vi.fn().mockResolvedValue([]),
+    findIssueByExactTitle: vi.fn().mockResolvedValue(null),
     createIssue: vi.fn().mockResolvedValue(undefined),
     commentOnIssue: vi.fn().mockResolvedValue(undefined),
     getIssueBody: vi.fn().mockResolvedValue(""),
@@ -55,7 +55,7 @@ describe("reportError", () => {
     await reportError("test:fingerprint", "some-context", new Error("test error"));
 
     expect(log.error).toHaveBeenCalledWith(expect.stringContaining("test:fingerprint"));
-    expect(gh.searchIssues).not.toHaveBeenCalled();
+    expect(gh.findIssueByExactTitle).not.toHaveBeenCalled();
     expect(gh.createIssue).not.toHaveBeenCalled();
   });
 
@@ -63,7 +63,7 @@ describe("reportError", () => {
     await reportError("test:fp2", "ctx", new Error("boom"));
 
     expect(log.error).toHaveBeenCalled();
-    expect(gh.searchIssues).toHaveBeenCalled();
+    expect(gh.findIssueByExactTitle).toHaveBeenCalled();
     expect(gh.createIssue).toHaveBeenCalled();
     const body = vi.mocked(gh.createIssue).mock.calls[0][2];
     expect(body).toContain("**First seen:**");
@@ -77,7 +77,7 @@ describe("reportError", () => {
 
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("test:ratelimit"));
     expect(log.error).not.toHaveBeenCalled();
-    expect(gh.searchIssues).not.toHaveBeenCalled();
+    expect(gh.findIssueByExactTitle).not.toHaveBeenCalled();
     expect(gh.createIssue).not.toHaveBeenCalled();
   });
 
@@ -89,7 +89,7 @@ describe("reportError", () => {
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("ci-fixer:run"));
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("push conflict — not reported"));
     expect(log.error).not.toHaveBeenCalled();
-    expect(gh.searchIssues).not.toHaveBeenCalled();
+    expect(gh.findIssueByExactTitle).not.toHaveBeenCalled();
     expect(gh.createIssue).not.toHaveBeenCalled();
   });
 
@@ -100,7 +100,7 @@ describe("reportError", () => {
 
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("test:cli-usage"));
     expect(log.error).not.toHaveBeenCalled();
-    expect(gh.searchIssues).not.toHaveBeenCalled();
+    expect(gh.findIssueByExactTitle).not.toHaveBeenCalled();
     expect(gh.createIssue).not.toHaveBeenCalled();
   });
 
@@ -111,7 +111,7 @@ describe("reportError", () => {
 
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("test:hit-limit"));
     expect(log.error).not.toHaveBeenCalled();
-    expect(gh.searchIssues).not.toHaveBeenCalled();
+    expect(gh.findIssueByExactTitle).not.toHaveBeenCalled();
     expect(gh.createIssue).not.toHaveBeenCalled();
   });
 
@@ -122,7 +122,7 @@ describe("reportError", () => {
 
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("test:hit-limit-2"));
     expect(log.error).not.toHaveBeenCalled();
-    expect(gh.searchIssues).not.toHaveBeenCalled();
+    expect(gh.findIssueByExactTitle).not.toHaveBeenCalled();
     expect(gh.createIssue).not.toHaveBeenCalled();
   });
 
@@ -132,7 +132,7 @@ describe("reportError", () => {
     await reportError("test:no-usage-match", "process-repo", err);
 
     expect(log.error).toHaveBeenCalled();
-    expect(gh.searchIssues).toHaveBeenCalled();
+    expect(gh.findIssueByExactTitle).toHaveBeenCalled();
     expect(gh.createIssue).toHaveBeenCalled();
   });
 
@@ -143,7 +143,7 @@ describe("reportError", () => {
 
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("CLAUDE_CODE_MAX_OUTPUT_TOKENS"));
     expect(log.error).not.toHaveBeenCalled();
-    expect(gh.searchIssues).not.toHaveBeenCalled();
+    expect(gh.findIssueByExactTitle).not.toHaveBeenCalled();
     expect(gh.createIssue).not.toHaveBeenCalled();
   });
 
@@ -154,7 +154,7 @@ describe("reportError", () => {
 
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("transient API error — not reported"));
     expect(log.error).not.toHaveBeenCalled();
-    expect(gh.searchIssues).not.toHaveBeenCalled();
+    expect(gh.findIssueByExactTitle).not.toHaveBeenCalled();
     expect(gh.createIssue).not.toHaveBeenCalled();
   });
 
@@ -165,7 +165,7 @@ describe("reportError", () => {
 
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("transient API error — not reported"));
     expect(log.error).not.toHaveBeenCalled();
-    expect(gh.searchIssues).not.toHaveBeenCalled();
+    expect(gh.findIssueByExactTitle).not.toHaveBeenCalled();
     expect(gh.createIssue).not.toHaveBeenCalled();
   });
 
@@ -176,7 +176,7 @@ describe("reportError", () => {
 
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("transient CLI init failure — not reported"));
     expect(log.error).not.toHaveBeenCalled();
-    expect(gh.searchIssues).not.toHaveBeenCalled();
+    expect(gh.findIssueByExactTitle).not.toHaveBeenCalled();
     expect(gh.createIssue).not.toHaveBeenCalled();
   });
 
@@ -188,7 +188,7 @@ describe("reportError", () => {
 
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining("Whisper rate limit — not reported"));
     expect(log.error).not.toHaveBeenCalled();
-    expect(gh.searchIssues).not.toHaveBeenCalled();
+    expect(gh.findIssueByExactTitle).not.toHaveBeenCalled();
     expect(gh.createIssue).not.toHaveBeenCalled();
   });
 
@@ -199,7 +199,7 @@ describe("reportError", () => {
 
     expect(log.info).toHaveBeenCalledWith(expect.stringContaining("shutdown — not reported"));
     expect(log.error).not.toHaveBeenCalled();
-    expect(gh.searchIssues).not.toHaveBeenCalled();
+    expect(gh.findIssueByExactTitle).not.toHaveBeenCalled();
     expect(gh.createIssue).not.toHaveBeenCalled();
   });
 
@@ -306,9 +306,9 @@ describe("reportError", () => {
   });
 
   it("edits issue body with occurrence tracking on recurrence instead of commenting", async () => {
-    vi.mocked(gh.searchIssues).mockResolvedValueOnce([
-      { number: 99, title: "[claws-error] test:timeout-recur" } as any,
-    ]);
+    vi.mocked(gh.findIssueByExactTitle).mockResolvedValueOnce(
+      { number: 99, title: "[claws-error] test:timeout-recur" },
+    );
     const existingBody = [
       "**Auto-created by Claws error reporter**",
       "",

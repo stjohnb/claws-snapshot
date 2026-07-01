@@ -97,7 +97,8 @@ vi.mock("node:fs", async () => {
 });
 
 import * as log from "./log.js";
-import { isConnected, whatsappStatus, hasAuthState, isPairing, stopPairing, cancelPairing, start, stop, unpair } from "./whatsapp.js";
+import { whatsappStatus, hasAuthState, isPairing, stopPairing, cancelPairing, start, stop, unpair, downloadAudio } from "./whatsapp.js";
+import { downloadContentFromMessage } from "baileys";
 
 describe("whatsapp", () => {
   beforeEach(async () => {
@@ -110,7 +111,7 @@ describe("whatsapp", () => {
   });
 
   it("reports not connected initially", () => {
-    expect(isConnected()).toBe(false);
+    expect(whatsappStatus().connected).toBe(false);
   });
 
   it("reports status correctly", () => {
@@ -156,7 +157,7 @@ describe("whatsapp", () => {
     await start(handler);
     // Socket should still be created despite version fetch failure
     eventHandlers["connection.update"]({ connection: "open" });
-    expect(isConnected()).toBe(true);
+    expect(whatsappStatus().connected).toBe(true);
     expect(log.warn).toHaveBeenCalledWith(
       expect.stringContaining("Failed to fetch latest WA version"),
     );
@@ -169,7 +170,7 @@ describe("whatsapp", () => {
       await start(handler);
       // Simulate successful connection to reset pairingRequired
       eventHandlers["connection.update"]({ connection: "open" });
-      expect(isConnected()).toBe(true);
+      expect(whatsappStatus().connected).toBe(true);
       expect(whatsappStatus().pairingRequired).toBe(false);
       return handler;
     }
@@ -188,7 +189,7 @@ describe("whatsapp", () => {
       fireDisconnect(405);
 
       expect(whatsappStatus().pairingRequired).toBe(true);
-      expect(isConnected()).toBe(false);
+      expect(whatsappStatus().connected).toBe(false);
       expect(log.warn).toHaveBeenCalledWith(
         expect.stringContaining("Stale session (status 405)"),
       );
@@ -199,7 +200,7 @@ describe("whatsapp", () => {
       fireDisconnect(500);
 
       expect(whatsappStatus().pairingRequired).toBe(true);
-      expect(isConnected()).toBe(false);
+      expect(whatsappStatus().connected).toBe(false);
       expect(log.warn).toHaveBeenCalledWith(
         expect.stringContaining("Stale session (status 500)"),
       );
@@ -210,7 +211,7 @@ describe("whatsapp", () => {
       fireDisconnect(401);
 
       expect(whatsappStatus().pairingRequired).toBe(true);
-      expect(isConnected()).toBe(false);
+      expect(whatsappStatus().connected).toBe(false);
       expect(log.error).toHaveBeenCalledWith(
         expect.stringContaining("Logged out"),
       );
@@ -732,6 +733,77 @@ describe("whatsapp", () => {
         "whatsapp:baileys-error",
         "unexpected failure",
         obj,
+      );
+    });
+  });
+
+  describe("downloadAudio", () => {
+    it("returns concatenated buffer when under cap", async () => {
+      const chunk1 = Buffer.alloc(1024);
+      const chunk2 = Buffer.alloc(2048);
+
+      const mockStream = (async function* () {
+        yield chunk1;
+        yield chunk2;
+      })() as any;
+
+      vi.mocked(downloadContentFromMessage).mockResolvedValue(mockStream);
+
+      const result = await downloadAudio({ audioMessage: {} } as any);
+
+      expect(result).toBeDefined();
+      expect(result).toEqual(Buffer.concat([chunk1, chunk2]));
+      expect(result!.length).toBe(1024 + 2048);
+    });
+
+    it("returns undefined and logs when exceeding cap", async () => {
+      // Create three chunks of 9 MB each (27 MB total)
+      const chunkSize = 9 * 1024 * 1024;
+      const chunk1 = Buffer.alloc(chunkSize);
+      const chunk2 = Buffer.alloc(chunkSize);
+      const chunk3 = Buffer.alloc(chunkSize);
+
+      const mockStream = (async function* () {
+        yield chunk1;
+        yield chunk2;
+        yield chunk3; // This should trigger the abort
+      })() as any;
+
+      vi.mocked(downloadContentFromMessage).mockResolvedValue(mockStream);
+      vi.mocked(log.warn).mockClear();
+
+      const result = await downloadAudio({ audioMessage: {} } as any);
+
+      expect(result).toBeUndefined();
+      expect(log.warn).toHaveBeenCalledWith(
+        expect.stringContaining("Audio exceeded"),
+      );
+    });
+
+    it("returns undefined when audioMessage is null", async () => {
+      const result = await downloadAudio({ audioMessage: null } as any);
+
+      expect(result).toBeUndefined();
+      expect(downloadContentFromMessage).not.toHaveBeenCalled();
+    });
+
+    it("returns undefined when audioMessage is undefined", async () => {
+      const result = await downloadAudio({} as any);
+
+      expect(result).toBeUndefined();
+      expect(downloadContentFromMessage).not.toHaveBeenCalled();
+    });
+
+    it("returns undefined and logs on download error", async () => {
+      const downloadError = new Error("download failed");
+      vi.mocked(downloadContentFromMessage).mockRejectedValue(downloadError);
+      vi.mocked(log.warn).mockClear();
+
+      const result = await downloadAudio({ audioMessage: {} } as any);
+
+      expect(result).toBeUndefined();
+      expect(log.warn).toHaveBeenCalledWith(
+        expect.stringContaining("Failed to download audio"),
       );
     });
   });

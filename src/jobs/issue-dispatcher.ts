@@ -6,12 +6,16 @@ import { reportError } from "../error-reporter.js";
 import * as planParser from "../plan-parser.js";
 import * as issueRefiner from "../agents/issue-refiner.js";
 import { extractFingerprint, REPORT_HEADER as CLAWS_ERROR_REPORT_HEADER } from "./triage-claws-errors.js";
-import { extractGameId, REPORT_HEADER as KWYJIBO_REPORT_HEADER } from "./triage-kwyjibo-errors.js";
 import * as worker from "../worker.js";
 import { AGENT_KINDS } from "../worker.js";
 import * as slack from "../slack.js";
 import * as db from "../db.js";
-import { ensureAlertIssue } from "../occurrence-tracking.js";
+import { ensureAlertIssue, parseOccurrenceCount } from "../occurrence-tracking.js";
+
+// Re-plan once the live occurrence count has at least doubled vs. what the plan
+// was based on. With a default of 1, this fires on the first recurrence (1 -> 2),
+// then backs off geometrically (2 -> 4, 4 -> 8) so we don't re-plan every bump.
+const REPLAN_OCCURRENCE_FACTOR = 2;
 
 async function notifyUntrustedActorSkip(repoFullName: string, issue: gh.Issue): Promise<void> {
   // DB-backed dedup: returns false if we already notified about this repo#issue
@@ -74,25 +78,14 @@ export async function run(repos: Repo[]): Promise<void> {
           for (const issue of refinedIssues) {
             if (isRateLimited()) break;
             if (gh.isDispatchSkippable(repo.fullName, issue)) continue;
-            if (!await gh.isAllowedActor(issue.author.login) && !gh.isCiFailureAlertIssue(issue)) {
-              if (gh.isCiAlertBotAuthor(issue)) {
-                log.info(`[issue-dispatcher] Silently skipping CI-bot issue #${issue.number} from @${issue.author.login} (not a disallowed human actor)`);
-                continue;
-              }
+            if (!await gh.isAllowedActor(issue.author.login) && !gh.isCiAlertBotAuthor(issue)) {
               log.info(`[issue-dispatcher] Skipping refined issue #${issue.number} from non-allowed actor @${issue.author.login}`);
               await notifyUntrustedActorSkip(repo.fullName, issue);
               continue;
             }
             processedByWorker.add(issue.number);
             populated.add(issue.number);
-            gh.populateQueueCache("refined", repo.fullName, {
-              number: issue.number,
-              title: issue.title,
-              type: "issue",
-              updatedAt: issue.updatedAt,
-              priority: gh.hasPriorityLabel(issue.labels),
-              labels: issue.labels.map((l) => l.name),
-            });
+            gh.populateQueueCacheFor("refined", repo.fullName, issue, "issue");
             worker.enqueue(AGENT_KINDS.ISSUE_WORKER, repo.fullName, issue.number, {
               priority: gh.hasPriorityLabel(issue.labels),
             });
@@ -104,11 +97,7 @@ export async function run(repos: Repo[]): Promise<void> {
           for (const issue of allIssues) {
             if (isRateLimited()) break;
             if (gh.isDispatchSkippable(repo.fullName, issue)) continue;
-            if (!await gh.isAllowedActor(issue.author.login) && !gh.isCiFailureAlertIssue(issue)) {
-              if (gh.isCiAlertBotAuthor(issue)) {
-                log.info(`[issue-dispatcher] Silently skipping CI-bot issue #${issue.number} from @${issue.author.login} (not a disallowed human actor)`);
-                continue;
-              }
+            if (!await gh.isAllowedActor(issue.author.login) && !gh.isCiAlertBotAuthor(issue)) {
               log.info(`[issue-dispatcher] Skipping planner dispatch for issue #${issue.number} from non-allowed actor @${issue.author.login}`);
               await notifyUntrustedActorSkip(repo.fullName, issue);
               continue;
@@ -124,14 +113,7 @@ export async function run(repos: Repo[]): Promise<void> {
               );
               if (hasPlan && unreacted.length > 0) {
                 populated.add(issue.number);
-                gh.populateQueueCache("needs-refinement", repo.fullName, {
-                  number: issue.number,
-                  title: issue.title,
-                  type: "issue",
-                  updatedAt: issue.updatedAt,
-                  priority: gh.hasPriorityLabel(issue.labels),
-                  labels: issue.labels.map((l) => l.name),
-                });
+                gh.populateQueueCacheFor("needs-refinement", repo.fullName, issue, "issue");
                 worker.enqueue(AGENT_KINDS.ISSUE_REFINER_FOLLOWUP, repo.fullName, issue.number, {
                   priority: gh.hasPriorityLabel(issue.labels),
                 });
@@ -146,61 +128,48 @@ export async function run(repos: Repo[]): Promise<void> {
               if (!hasReport) continue;
             }
 
-            // Triage-before-refinement: skip game-ID issues without triage report (kwyjibo only)
-            if (repo.name === "kwyjibo" && issue.body && extractGameId(issue.body) !== null) {
-              const comments = await gh.getIssueComments(repo.fullName, issue.number);
-              const hasReport = comments.some((c) => c.body.includes(KWYJIBO_REPORT_HEADER));
-              if (!hasReport) continue;
-            }
-
             // Fetch comments to determine state
-            const { hasPlan, unreacted: unreactedComments } = await issueRefiner.findUnreactedFeedbackAfterPlan(
+            const { hasPlan, unreacted: unreactedComments, plannedOccurrences } = await issueRefiner.findUnreactedFeedbackAfterPlan(
               repo.fullName, issue.number, selfLogin,
             );
 
             if (!hasPlan) {
               // No plan comment exists — produce a new plan
               populated.add(issue.number);
-              gh.populateQueueCache("needs-refinement", repo.fullName, {
-                number: issue.number,
-                title: issue.title,
-                type: "issue",
-                updatedAt: issue.updatedAt,
-                priority: gh.hasPriorityLabel(issue.labels),
-                labels: issue.labels.map((l) => l.name),
-              });
+              gh.populateQueueCacheFor("needs-refinement", repo.fullName, issue, "issue");
               worker.enqueue(AGENT_KINDS.ISSUE_REFINER_PLAN, repo.fullName, issue.number, {
                 priority: gh.hasPriorityLabel(issue.labels),
               });
             } else if (unreactedComments.length > 0) {
               // Human feedback needs addressing
               populated.add(issue.number);
-              gh.populateQueueCache("needs-refinement", repo.fullName, {
-                number: issue.number,
-                title: issue.title,
-                type: "issue",
-                updatedAt: issue.updatedAt,
-                priority: gh.hasPriorityLabel(issue.labels),
-                labels: issue.labels.map((l) => l.name),
-              });
+              gh.populateQueueCacheFor("needs-refinement", repo.fullName, issue, "issue");
               await gh.removeLabel(repo.fullName, issue.number, LABELS.ready);
               worker.enqueue(AGENT_KINDS.ISSUE_REFINER_REFINE, repo.fullName, issue.number, {
                 priority: gh.hasPriorityLabel(issue.labels),
               });
             } else {
-              // All feedback addressed — waiting for "Refined" or more feedback
-              populated.add(issue.number);
-              gh.populateQueueCache("ready", repo.fullName, {
-                number: issue.number,
-                title: issue.title,
-                type: "issue",
-                updatedAt: issue.updatedAt,
-                priority: gh.hasPriorityLabel(issue.labels),
-                labels: issue.labels.map((l) => l.name),
-              });
-              if (issueRefiner.isCiUnrelatedIssue(issue) && !issue.labels.some((l) => l.name === LABELS.refined)) {
-                await gh.addLabel(repo.fullName, issue.number, LABELS.refined);
-                log.info(`[issue-dispatcher] Auto-refined ci-unrelated issue ${repo.fullName}#${issue.number}`);
+              // All feedback addressed. Before parking it as "ready", check whether the
+              // issue has recurred enough since the plan was written to warrant a re-plan.
+              const currentOcc = parseOccurrenceCount(issue.body);
+              // Legacy plans (posted before the marker existed) default to 1 — the count
+              // every pre-marker plan implicitly assumed. This backfills existing stale
+              // alert issues with one re-plan that then stamps the marker.
+              const planned = plannedOccurrences ?? 1;
+              if (currentOcc !== null && currentOcc >= planned * REPLAN_OCCURRENCE_FACTOR && currentOcc > planned) {
+                populated.add(issue.number);
+                gh.populateQueueCacheFor("needs-refinement", repo.fullName, issue, "issue");
+                log.info(`[issue-dispatcher] Re-planning ${repo.fullName}#${issue.number}: occurrences ${currentOcc} >= planned ${planned} * ${REPLAN_OCCURRENCE_FACTOR}`);
+                worker.enqueue(AGENT_KINDS.ISSUE_REFINER_REPLAN, repo.fullName, issue.number, {
+                  priority: gh.hasPriorityLabel(issue.labels),
+                });
+              } else {
+                populated.add(issue.number);
+                gh.populateQueueCacheFor("ready", repo.fullName, issue, "issue");
+                if (issueRefiner.isCiUnrelatedIssue(issue) && !issue.labels.some((l) => l.name === LABELS.refined)) {
+                  await gh.addLabel(repo.fullName, issue.number, LABELS.refined);
+                  log.info(`[issue-dispatcher] Auto-refined ci-unrelated issue ${repo.fullName}#${issue.number}`);
+                }
               }
             }
           }

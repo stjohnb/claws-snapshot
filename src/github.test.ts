@@ -69,6 +69,7 @@ import {
   listRepos,
   clearRepoCache,
   searchIssues,
+  findIssueByExactTitle,
   createIssue,
   createPR,
   listIssuesByLabel,
@@ -94,6 +95,7 @@ import {
   getOpenPRForIssue,
   updatePR,
   populateQueueCache,
+  populateQueueCacheFor,
   getQueueSnapshot,
   clearQueueCache,
   isItemSkipped,
@@ -114,7 +116,10 @@ import {
   getRunAnnotations,
   isBillingBlocked,
   BILLING_ANNOTATION_PATTERN,
-  isCiFailureAlertIssue,
+  isCiAlertBotAuthor,
+  parseArtifactLines,
+  fetchRepoSbomPackages,
+  dismissDependabotAlert,
 } from "./github.js";
 
 // Backward-compat marker used in test fixtures (no longer exported from github.ts)
@@ -308,6 +313,27 @@ describe("gh retry logic", () => {
       attempt++;
       if (attempt < 3) {
         const msg = 'Post "https://api.github.com/graphql": dial tcp 20.26.156.210:443: i/o timeout';
+        cb(new Error(msg), "", msg);
+      } else {
+        cb(null, "[]", "");
+      }
+    });
+
+    const promise = searchIssues("org/repo", "test");
+
+    await vi.advanceTimersByTimeAsync(1000);
+    await vi.advanceTimersByTimeAsync(2000);
+
+    await promise;
+    expect(attempt).toBe(3);
+  });
+
+  it("retries on unexpected EOF errors", async () => {
+    let attempt = 0;
+    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: any, cb: any) => {
+      attempt++;
+      if (attempt < 3) {
+        const msg = "unexpected EOF";
         cb(new Error(msg), "", msg);
       } else {
         cb(null, "[]", "");
@@ -2102,6 +2128,45 @@ describe("searchIssues", () => {
   });
 });
 
+describe("findIssueByExactTitle", () => {
+  beforeEach(() => {
+    mockExecFile.mockReset();
+    clearRateLimitState();
+  });
+
+  it("returns the exact match when results include substring matches", async () => {
+    const issues = [
+      { number: 1, title: "Foo bar" },
+      { number: 2, title: "Foo" },
+    ];
+    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: any, cb: any) => {
+      cb(null, JSON.stringify(issues), "");
+    });
+
+    const result = await findIssueByExactTitle("org/repo", "Foo");
+    expect(result).toEqual({ number: 2, title: "Foo" });
+  });
+
+  it("returns null when no result has an exact title match", async () => {
+    const issues = [{ number: 1, title: "Foo bar" }];
+    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: any, cb: any) => {
+      cb(null, JSON.stringify(issues), "");
+    });
+
+    const result = await findIssueByExactTitle("org/repo", "Foo");
+    expect(result).toBeNull();
+  });
+
+  it("returns null when search returns empty results", async () => {
+    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: any, cb: any) => {
+      cb(null, "[]", "");
+    });
+
+    const result = await findIssueByExactTitle("org/repo", "Foo");
+    expect(result).toBeNull();
+  });
+});
+
 describe("repo cache", () => {
   const repoEntry = {
     owner: "test-owner",
@@ -2398,6 +2463,39 @@ describe("populateQueueCache skip/priority integration", () => {
   });
 });
 
+describe("populateQueueCacheFor", () => {
+  beforeEach(() => {
+    clearQueueCache();
+  });
+
+  it("derives priority and label names from a raw item", () => {
+    populateQueueCacheFor("refined", "org/repo", {
+      number: 42,
+      title: "X",
+      updatedAt: "2026-06-22T00:00:00Z",
+      labels: [{ name: "Priority" }, { name: "bug" }],
+    }, "issue");
+    const snap = getQueueSnapshot(["refined"]);
+    const item = snap.items.find((i) => i.number === 42);
+    expect(item?.type).toBe("issue");
+    expect(item?.labels).toEqual(["Priority", "bug"]);
+    expect(item?.prioritized).toBe(true);
+  });
+
+  it("sets prioritized false when no priority label", () => {
+    populateQueueCacheFor("refined", "org/repo", {
+      number: 43,
+      title: "Y",
+      updatedAt: "2026-06-22T00:00:00Z",
+      labels: [{ name: "bug" }],
+    }, "pr");
+    const snap = getQueueSnapshot(["refined"]);
+    const item = snap.items.find((i) => i.number === 43);
+    expect(item?.type).toBe("pr");
+    expect(item?.prioritized).toBeFalsy();
+  });
+});
+
 describe("removeQueueItem", () => {
   beforeEach(() => {
     clearQueueCache();
@@ -2687,102 +2785,135 @@ describe("isAllowedActor", () => {
   });
 });
 
-describe("isCiFailureAlertIssue", () => {
-  it("returns true for app/github-actions author with matching title", () => {
-    expect(isCiFailureAlertIssue({
-      title: "[main] Bump app version failed on main",
+describe("isCiAlertBotAuthor", () => {
+  it("returns true for app/github-actions regardless of title (regression: #1217 dispatches)", () => {
+    expect(isCiAlertBotAuthor({
+      title: "Production database migration failure",
       author: { login: "app/github-actions" },
     })).toBe(true);
   });
 
-  it("returns true for github-actions[bot] author with matching title", () => {
-    expect(isCiFailureAlertIssue({
-      title: "[main] Bump app version failed on main",
+  it("returns true for github-actions[bot] with an arbitrary title", () => {
+    expect(isCiAlertBotAuthor({
       author: { login: "github-actions[bot]" },
     })).toBe(true);
   });
 
-  it("returns false when author is not a github-actions bot", () => {
-    expect(isCiFailureAlertIssue({
-      title: "[main] Bump app version failed on main",
+  it("returns true for app/github-actions with the legacy '[main] … failed on main' title", () => {
+    expect(isCiAlertBotAuthor({
+      title: "[main] Deploy failed on main",
+      author: { login: "app/github-actions" },
+    })).toBe(true);
+  });
+
+  it("returns false for a human author", () => {
+    expect(isCiAlertBotAuthor({
       author: { login: "stjohnb" },
     })).toBe(false);
   });
+});
 
-  it("returns false when title does not match the notify-failures convention", () => {
-    expect(isCiFailureAlertIssue({
-      title: "Some bug",
-      author: { login: "app/github-actions" },
-    })).toBe(false);
+describe("parseArtifactLines", () => {
+  it("sums non-expired sizes, counts them, and tracks the oldest", () => {
+    const raw = [
+      JSON.stringify({ size: 100, created: "2026-02-01T00:00:00Z", expired: false }),
+      JSON.stringify({ size: 200, created: "2026-01-01T00:00:00Z", expired: false }),
+      JSON.stringify({ size: 999, created: "2025-01-01T00:00:00Z", expired: true }),
+    ].join("\n");
+
+    const result = parseArtifactLines(raw);
+
+    expect(result.bytes).toBe(300);
+    expect(result.count).toBe(2);
+    expect(result.oldestAt).toBe("2026-01-01T00:00:00Z");
   });
 
-  it("returns false when title has extra content after 'failed on main'", () => {
-    expect(isCiFailureAlertIssue({
-      title: "[main] CI failed on main and more",
-      author: { login: "app/github-actions" },
-    })).toBe(false);
+  it("returns zeros and null for empty input", () => {
+    expect(parseArtifactLines("")).toEqual({ bytes: 0, count: 0, oldestAt: null });
+    expect(parseArtifactLines("  \n  ")).toEqual({ bytes: 0, count: 0, oldestAt: null });
+  });
+});
+
+describe("fetchRepoSbomPackages", () => {
+  beforeEach(() => {
+    mockExecFile.mockReset();
+    clearRateLimitState();
+    clearApiCache();
   });
 
-  it("returns true for app/github-actions author with 'Build failure:' title", () => {
-    expect(isCiFailureAlertIssue({
-      title: "Build failure: Main Verification",
-      author: { login: "app/github-actions" },
-    })).toBe(true);
+  it("strips the manager prefix, lowercases the name, and keeps the version verbatim", async () => {
+    const sbom = {
+      sbom: {
+        packages: [
+          { name: "pip:ONNX", versionInfo: "1.21.0" },
+          { name: "npm:Lodash", versionInfo: "4.17.21" },
+          { name: "no-prefix", versionInfo: "2.0.0" },
+        ],
+      },
+    };
+    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: any, cb: any) => {
+      cb(null, JSON.stringify(sbom), "");
+    });
+
+    const pkgs = await fetchRepoSbomPackages("org/repo");
+
+    expect(pkgs).toEqual([
+      { name: "onnx", version: "1.21.0" },
+      { name: "lodash", version: "4.17.21" },
+      { name: "no-prefix", version: "2.0.0" },
+    ]);
   });
 
-  it("returns true for github-actions[bot] author with 'Cypress:' title", () => {
-    expect(isCiFailureAlertIssue({
-      title: "Cypress: production tests failing",
-      author: { login: "github-actions[bot]" },
-    })).toBe(true);
+  it("drops packages missing a name or version", async () => {
+    const sbom = {
+      sbom: {
+        packages: [
+          { name: "pip:onnx" },
+          { versionInfo: "1.0.0" },
+          { name: "pip:torch", versionInfo: "2.12.0" },
+        ],
+      },
+    };
+    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: any, cb: any) => {
+      cb(null, JSON.stringify(sbom), "");
+    });
+
+    const pkgs = await fetchRepoSbomPackages("org/repo");
+
+    expect(pkgs).toEqual([{ name: "torch", version: "2.12.0" }]);
   });
 
-  it("returns true for app/github-actions author with 'Lighthouse regression' title", () => {
-    expect(isCiFailureAlertIssue({
-      title: "Lighthouse regression detected",
-      author: { login: "app/github-actions" },
-    })).toBe(true);
+  it("returns [] when the dependency graph is unavailable (404)", async () => {
+    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: any, cb: any) => {
+      cb(new Error("HTTP 404: Not Found"), "", "HTTP 404: Not Found");
+    });
+
+    expect(await fetchRepoSbomPackages("org/repo")).toEqual([]);
+  });
+});
+
+describe("dismissDependabotAlert", () => {
+  beforeEach(() => {
+    mockExecFile.mockReset();
+    clearRateLimitState();
+    clearApiCache();
   });
 
-  it("returns false for 'Build failure:' title when author is a human", () => {
-    expect(isCiFailureAlertIssue({
-      title: "Build failure: Main Verification",
-      author: { login: "stjohnb" },
-    })).toBe(false);
-  });
+  it("issues a PATCH with state, reason, and comment fields", async () => {
+    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: any, cb: any) => {
+      cb(null, "{}", "");
+    });
 
-  it("returns false for a bot author with an unrelated title", () => {
-    expect(isCiFailureAlertIssue({
-      title: "Fix the login bug",
-      author: { login: "github-actions[bot]" },
-    })).toBe(false);
-  });
+    await dismissDependabotAlert("org/repo", 42, "inaccurate", "stale");
 
-  it("returns true for github-actions[bot] author with 'Database backup:' title", () => {
-    expect(isCiFailureAlertIssue({
-      title: "Database backup: production backup failed",
-      author: { login: "github-actions[bot]" },
-    })).toBe(true);
-  });
-
-  it("returns false for 'Database backup:' title when author is a human", () => {
-    expect(isCiFailureAlertIssue({
-      title: "Database backup: production backup failed",
-      author: { login: "stjohnb" },
-    })).toBe(false);
-  });
-
-  it("returns true for github-actions[bot] author with 'Docker publish failure' title", () => {
-    expect(isCiFailureAlertIssue({
-      title: "Docker publish failure",
-      author: { login: "github-actions[bot]" },
-    })).toBe(true);
-  });
-
-  it("returns false for 'Docker publish failure' title when author is a human", () => {
-    expect(isCiFailureAlertIssue({
-      title: "Docker publish failure",
-      author: { login: "stjohnb" },
-    })).toBe(false);
+    const argv = mockExecFile.mock.calls[0]![1] as string[];
+    expect(argv).toEqual([
+      "api",
+      "--method", "PATCH",
+      "repos/org/repo/dependabot/alerts/42",
+      "-f", "state=dismissed",
+      "-f", "dismissed_reason=inaccurate",
+      "-f", "dismissed_comment=stale",
+    ]);
   });
 });

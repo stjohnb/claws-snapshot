@@ -63,6 +63,7 @@ const { mockGh, mockClaude, mockDb } = vi.hoisted(() => ({
     updateTaskWorktree: vi.fn(),
     updateTaskModel: vi.fn(),
     updateTaskTokenUsage: vi.fn(),
+    trackTaskTokens: vi.fn().mockReturnValue(vi.fn()),
     recordTaskComplete: vi.fn(),
     recordTaskFailed: vi.fn(),
     withTaskRecording: vi.fn(async (jobName: string, repo: string, itemNumber: number, triggerLabel: string | null, fn: (taskId: number) => Promise<unknown>) => {
@@ -94,7 +95,14 @@ import {
   isCiUnrelatedIssue,
   parseDuplicateOf,
   stripDuplicateMarker,
+  stripLeadingPlanHeader,
+  parseNoCodeChanges,
+  stripNoCodeChangesMarker,
+  NO_CODE_CHANGES_MARKER,
   FABLE_MODEL,
+  PLAN_HEADER,
+  PLAN_OCCURRENCES_MARKER,
+  parsePlannedOccurrences,
 } from "./issue-refiner.js";
 
 describe("issue-refiner", () => {
@@ -265,6 +273,32 @@ describe("issue-refiner", () => {
       await processIssue(repo, issue);
       expect(mockDb.updateTaskModel).toHaveBeenCalledWith(1, FABLE_MODEL);
     });
+
+    it("posts exactly one plan header when runClaude output already starts with it", async () => {
+      const issue = mockIssue({ body: "Test issue body" });
+      mockClaude.runClaude.mockResolvedValue(`${PLAN_HEADER}\n\nplan body`);
+
+      await processIssue(repo, issue);
+
+      const body = mockGh.commentOnIssue.mock.calls[0][2] as string;
+      expect((body.match(/## Implementation Plan/g) ?? []).length).toBe(1);
+    });
+
+    it("includes Fable planning context in prompt when Plan: Fable label is present", async () => {
+      const issue = mockIssue({ body: "Test issue body", labels: [{ name: "Plan: Fable" }] });
+      await processIssue(repo, issue);
+
+      const prompt = mockClaude.runClaude.mock.calls[0][0] as string;
+      expect(prompt).toContain("Claude Fable 5, a model tier above");
+    });
+
+    it("does not include Fable planning context when Plan: Fable label is absent", async () => {
+      const issue = mockIssue({ body: "Test issue body" });
+      await processIssue(repo, issue);
+
+      const prompt = mockClaude.runClaude.mock.calls[0][0] as string;
+      expect(prompt).not.toContain("Claude Fable 5, a model tier above");
+    });
   });
 
   describe("processRefinement", () => {
@@ -415,6 +449,31 @@ describe("issue-refiner", () => {
 
       expect(mockDb.updateTaskModel).toHaveBeenCalledWith(1, FABLE_MODEL);
     });
+
+    it("includes Fable planning context in refinement prompt when Plan: Fable label is present", async () => {
+      const issue = mockIssue({ body: "Test issue body", labels: [{ name: "Plan: Fable" }] });
+      const planComment = { id: 501, body: "*— Automated by Claws —*\n\n## Implementation Plan\n\nOriginal plan here", body_html: "", login: "claws-bot" };
+      const humanComment = { id: 502, body: "Please re-plan with Fable", body_html: "", login: "reviewer" };
+      mockGh.getIssueComments.mockResolvedValue([planComment, humanComment]);
+
+      await processRefinement(repo, issue, [humanComment]);
+
+      const prompt = mockClaude.runClaude.mock.calls[0][0] as string;
+      expect(prompt).toContain("Claude Fable 5, a model tier above");
+    });
+
+    it("edited comment body has exactly one plan header when runClaude output starts with it", async () => {
+      const issue = mockIssue({ body: "Test issue body" });
+      const planComment = { id: 501, body: "*— Automated by Claws —*\n\n## Implementation Plan\n\nOriginal plan here", body_html: "", login: "claws-bot" };
+      const humanComment = { id: 502, body: "Please update", body_html: "", login: "reviewer" };
+      mockGh.getIssueComments.mockResolvedValue([planComment, humanComment]);
+      mockClaude.runClaude.mockResolvedValue(`${PLAN_HEADER}\n\nupdated plan body`);
+
+      await processRefinement(repo, issue, [humanComment]);
+
+      const body = mockGh.editIssueComment.mock.calls[0][2] as string;
+      expect((body.match(/## Implementation Plan/g) ?? []).length).toBe(1);
+    });
   });
 
   describe("processFollowUp", () => {
@@ -514,6 +573,40 @@ describe("issue-refiner", () => {
       expect(result).toHaveLength(1);
       expect(result[0].id).toBe(2);
     });
+
+    it("returns unreacted comments in input order with parallel fetches", async () => {
+      const comments = [
+        { id: 1, body: "Comment A", body_html: "", login: "reviewer" },
+        { id: 2, body: "Comment B", body_html: "", login: "reviewer" },
+        { id: 3, body: "Comment C", body_html: "", login: "reviewer" },
+      ];
+      mockGh.getCommentReactions
+        .mockResolvedValueOnce([{ user: { login: "claws-bot[bot]" }, content: "+1" }]) // id:1 reacted
+        .mockResolvedValueOnce([]) // id:2 unreacted
+        .mockResolvedValueOnce([]); // id:3 unreacted
+
+      const result = await findUnreactedHumanComments(repo.fullName, comments, "claws-bot[bot]");
+
+      expect(result).toHaveLength(2);
+      expect(result[0].id).toBe(2);
+      expect(result[1].id).toBe(3);
+    });
+
+    it("treats a failed reaction fetch as unreacted (catch path)", async () => {
+      const comments = [
+        { id: 1, body: "Comment A", body_html: "", login: "reviewer" },
+        { id: 2, body: "Comment B", body_html: "", login: "reviewer" },
+      ];
+      mockGh.getCommentReactions
+        .mockRejectedValueOnce(new Error("network error")) // id:1 fails → unreacted
+        .mockResolvedValueOnce([]); // id:2 unreacted
+
+      const result = await findUnreactedHumanComments(repo.fullName, comments, "claws-bot[bot]");
+
+      expect(result).toHaveLength(2);
+      expect(result[0].id).toBe(1);
+      expect(result[1].id).toBe(2);
+    });
   });
 
   describe("isCiUnrelatedIssue", () => {
@@ -568,6 +661,89 @@ describe("issue-refiner", () => {
       expect(
         stripDuplicateMarker("## Plan\nDUPLICATE_OF: #458\nmore text\nDUPLICATE_OF: none")
       ).toBe("## Plan\nmore text");
+    });
+  });
+
+  describe("stripLeadingPlanHeader", () => {
+    it("strips a bare leading header", () => {
+      expect(stripLeadingPlanHeader("## Implementation Plan")).toBe("");
+    });
+
+    it("strips header followed by content", () => {
+      expect(stripLeadingPlanHeader("## Implementation Plan\n\nplan body")).toBe("plan body");
+    });
+
+    it("leaves '## Implementation Plan for X' untouched", () => {
+      expect(stripLeadingPlanHeader("## Implementation Plan for Feature X\n\nbody")).toBe(
+        "## Implementation Plan for Feature X\n\nbody",
+      );
+    });
+
+    it("is a no-op when header is absent", () => {
+      expect(stripLeadingPlanHeader("plan body without header")).toBe("plan body without header");
+    });
+
+    it("strips when output has leading whitespace before the header", () => {
+      expect(stripLeadingPlanHeader("  ## Implementation Plan\n\ncontent")).toBe("content");
+    });
+  });
+
+  describe("parseNoCodeChanges", () => {
+    it("returns true when marker is on its own line", () => {
+      expect(parseNoCodeChanges(`This fix is already shipped.\n\n${NO_CODE_CHANGES_MARKER}`)).toBe(true);
+    });
+
+    it("returns true when marker has surrounding whitespace on the line", () => {
+      expect(parseNoCodeChanges(`Explanation.\n  ${NO_CODE_CHANGES_MARKER}  \ntrailing`)).toBe(true);
+    });
+
+    it("returns false when output has no marker", () => {
+      expect(parseNoCodeChanges("## Implementation Plan\nDo the thing")).toBe(false);
+    });
+
+    it("returns false when marker appears mid-sentence (not on its own line)", () => {
+      expect(parseNoCodeChanges(`Please do not emit CLAWS_NO_CODE_CHANGES here`)).toBe(false);
+    });
+  });
+
+  describe("stripNoCodeChangesMarker", () => {
+    it("removes the marker line and trims", () => {
+      expect(stripNoCodeChangesMarker(`Explanation here.\n\n${NO_CODE_CHANGES_MARKER}`)).toBe("Explanation here.");
+    });
+
+    it("leaves non-marker content intact", () => {
+      expect(stripNoCodeChangesMarker("## Plan\nDo work")).toBe("## Plan\nDo work");
+    });
+
+    it("removes multiple occurrences", () => {
+      expect(stripNoCodeChangesMarker(`${NO_CODE_CHANGES_MARKER}\ntext\n${NO_CODE_CHANGES_MARKER}`)).toBe("text");
+    });
+  });
+
+  describe("processIssue — no-code-changes verdict", () => {
+    it("applies Claws Ignore label and posts explanation comment, does NOT add Ready", async () => {
+      const issue = mockIssue({ number: 42, body: "Disk usage was already cleaned up." });
+      mockClaude.runClaude.mockResolvedValue(
+        `The underlying fix was already deployed in the last release.\n\n${NO_CODE_CHANGES_MARKER}`,
+      );
+
+      await processIssue(repo, issue);
+
+      expect(mockGh.addLabel).toHaveBeenCalledWith(repo.fullName, issue.number, "Claws Ignore");
+      expect(mockGh.addLabel).not.toHaveBeenCalledWith(repo.fullName, issue.number, "Ready");
+      const commentCall = mockGh.commentOnIssue.mock.calls.find((c: unknown[]) => c[1] === 42);
+      expect(commentCall).toBeDefined();
+      expect(commentCall![2]).toContain("## Implementation Plan");
+      expect(commentCall![2]).toContain("does **not** require any code change");
+      expect(commentCall![2]).toContain("The underlying fix was already deployed");
+      expect(commentCall![2]).not.toContain(NO_CODE_CHANGES_MARKER);
+    });
+
+    it("prompt includes no-code-changes instruction", async () => {
+      const issue = mockIssue({ body: "Operational task only" });
+      await processIssue(repo, issue);
+      const prompt = mockClaude.runClaude.mock.calls[0][0] as string;
+      expect(prompt).toContain(NO_CODE_CHANGES_MARKER);
     });
   });
 
@@ -796,5 +972,82 @@ describe("issue-refiner", () => {
       expect(prompt).toContain("gh run view");
       expect(prompt).toContain("ONE diagnosed root cause");
     });
+  });
+});
+
+describe("parsePlannedOccurrences", () => {
+  it("returns the number from a plan body containing the marker", () => {
+    expect(parsePlannedOccurrences(`## Implementation Plan\n\nDo stuff\n\n*Models used: opus*\n\n${PLAN_OCCURRENCES_MARKER} 3`)).toBe(3);
+  });
+
+  it("returns null when marker is absent", () => {
+    expect(parsePlannedOccurrences("## Implementation Plan\n\nDo stuff\n\n*Models used: opus*")).toBeNull();
+  });
+
+  it("returns 1 for marker with value 1", () => {
+    expect(parsePlannedOccurrences(`body\n\n${PLAN_OCCURRENCES_MARKER} 1`)).toBe(1);
+  });
+});
+
+describe("occurrence marker in posted plan comments", () => {
+  const OCCURRENCE_BODY = `Some alert body.\n\n---\n**First seen:** 2024-01-01T00:00:00.000Z\n**Last seen:** 2024-01-02T00:00:00.000Z\n**Occurrences:** 4`;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockClaude.withNewWorktree.mockImplementation(async (_r: unknown, _b: unknown, _n: unknown, fn: (p: string) => Promise<unknown>) => fn("/tmp/worktree"));
+    mockClaude.enqueue.mockImplementation((fn: () => Promise<string>) => fn());
+    mockClaude.runClaude.mockImplementation(async () => "## Plan\nDo the thing");
+    mockGh.getCommentReactions.mockResolvedValue([]);
+    mockGh.addReaction.mockResolvedValue(undefined);
+    mockGh.addLabel.mockResolvedValue(undefined);
+    mockGh.removeLabel.mockResolvedValue(undefined);
+    mockGh.commentOnIssue.mockResolvedValue(undefined);
+    mockGh.editIssueComment.mockResolvedValue(undefined);
+    mockGh.getIssueComments.mockResolvedValue([]);
+    mockGh.listOpenIssues.mockResolvedValue([]);
+    mockGh.isItemSkipped.mockReturnValue(false);
+  });
+
+  const repo = { fullName: "test-org/test-repo", owner: "test-org", name: "test-repo", defaultBranch: "main", worktreeBase: "/tmp" };
+
+  it("processIssue — appends CLAWS_PLAN_OCCURRENCES marker when issue body has tracking", async () => {
+    const issue = { number: 1, title: "Alert", body: OCCURRENCE_BODY, labels: [], author: { login: "bot" }, state: "open", html_url: "" };
+
+    await processIssue(repo, issue);
+
+    const body = mockGh.commentOnIssue.mock.calls[0][2] as string;
+    expect(body).toContain(`${PLAN_OCCURRENCES_MARKER} 4`);
+  });
+
+  it("processIssue — omits marker when issue body has no occurrence tracking", async () => {
+    const issue = { number: 1, title: "Bug", body: "Just a plain description.", labels: [], author: { login: "human" }, state: "open", html_url: "" };
+
+    await processIssue(repo, issue);
+
+    const body = mockGh.commentOnIssue.mock.calls[0][2] as string;
+    expect(body).not.toContain(PLAN_OCCURRENCES_MARKER);
+  });
+
+  it("processRefinement (edit path) — stamps updated marker with current occurrence count", async () => {
+    const issue = { number: 2, title: "Alert recurrence", body: OCCURRENCE_BODY, labels: [], author: { login: "bot" }, state: "open", html_url: "" };
+    const planComment = { id: 501, body: `*— Automated by Claws —*\n\n## Implementation Plan\n\nOld plan\n\n*Models used: opus (provider: claude)*\n\n${PLAN_OCCURRENCES_MARKER} 1`, body_html: "", login: "claws-bot" };
+    const humanComment = { id: 502, body: "Please re-evaluate", body_html: "", login: "reviewer" };
+    mockGh.getIssueComments.mockResolvedValue([planComment, humanComment]);
+
+    await processRefinement(repo, issue, [humanComment]);
+
+    const body = mockGh.editIssueComment.mock.calls[0][2] as string;
+    expect(body).toContain(`${PLAN_OCCURRENCES_MARKER} 4`);
+  });
+
+  it("processRefinement (fresh-plan fallback) — stamps marker when no existing plan comment", async () => {
+    const issue = { number: 3, title: "Alert recurrence", body: OCCURRENCE_BODY, labels: [], author: { login: "bot" }, state: "open", html_url: "" };
+    // No plan comment returned — processRefinement takes the lastPlanIdx === -1 branch
+    mockGh.getIssueComments.mockResolvedValue([]);
+
+    await processRefinement(repo, issue, []);
+
+    const body = mockGh.commentOnIssue.mock.calls[0][2] as string;
+    expect(body).toContain(`${PLAN_OCCURRENCES_MARKER} 4`);
   });
 });

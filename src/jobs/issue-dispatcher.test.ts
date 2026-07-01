@@ -42,15 +42,15 @@ const mockGh = vi.hoisted(() => ({
   getIssueComments: vi.fn().mockResolvedValue([]),
   listMergedPRsForIssue: vi.fn().mockResolvedValue([]),
   populateQueueCache: vi.fn(),
+  populateQueueCacheFor: vi.fn(),
   removeLabel: vi.fn().mockResolvedValue(undefined),
   addLabel: vi.fn().mockResolvedValue(undefined),
   isRateLimited: vi.fn().mockReturnValue(false),
   isClawsComment: vi.fn().mockReturnValue(false),
   RateLimitError: class RateLimitError extends Error {},
   isAllowedActor: vi.fn().mockResolvedValue(true),
-  isCiFailureAlertIssue: vi.fn().mockReturnValue(false),
   isCiAlertBotAuthor: vi.fn().mockReturnValue(false),
-  searchIssues: vi.fn().mockResolvedValue([]),
+  findIssueByExactTitle: vi.fn().mockResolvedValue(null),
   createIssue: vi.fn().mockResolvedValue(1),
 }));
 vi.mock("../github.js", () => mockGh);
@@ -74,7 +74,7 @@ const mockIssueRefiner = vi.hoisted(() => ({
   processFollowUp: vi.fn().mockResolvedValue(undefined),
   findUnreactedHumanComments: vi.fn().mockResolvedValue([]),
   isCiUnrelatedIssue: vi.fn().mockReturnValue(false),
-  findUnreactedFeedbackAfterPlan: vi.fn().mockResolvedValue({ hasPlan: false, unreacted: [] }),
+  findUnreactedFeedbackAfterPlan: vi.fn().mockResolvedValue({ hasPlan: false, unreacted: [], plannedOccurrences: null }),
   PLAN_HEADER: "## Implementation Plan",
 }));
 vi.mock("../agents/issue-refiner.js", () => mockIssueRefiner);
@@ -87,11 +87,6 @@ vi.mock("../plan-parser.js", () => ({
 vi.mock("./triage-claws-errors.js", () => ({
   extractFingerprint: vi.fn().mockReturnValue(null),
   REPORT_HEADER: "## Claws Error Investigation Report",
-}));
-
-vi.mock("./triage-kwyjibo-errors.js", () => ({
-  extractGameId: vi.fn().mockReturnValue(null),
-  REPORT_HEADER: "## Bug Investigation Report",
 }));
 
 import { run } from "./issue-dispatcher.js";
@@ -139,7 +134,7 @@ describe("issue-dispatcher", () => {
     });
     mockGh.listOpenIssues.mockResolvedValue([issue]);
     mockGh.isAllowedActor.mockResolvedValue(false);
-    mockGh.isCiFailureAlertIssue.mockReturnValue(true);
+    mockGh.isCiAlertBotAuthor.mockReturnValue(true);
 
     await run([repo]);
 
@@ -157,7 +152,7 @@ describe("issue-dispatcher", () => {
     });
     mockGh.listOpenIssues.mockResolvedValue([issue]);
     mockGh.isAllowedActor.mockResolvedValue(false);
-    mockGh.isCiFailureAlertIssue.mockReturnValue(true);
+    mockGh.isCiAlertBotAuthor.mockReturnValue(true);
 
     await run([repo]);
 
@@ -170,7 +165,7 @@ describe("issue-dispatcher", () => {
     const issue = mockIssue({ number: 100 });
     mockGh.listOpenIssues.mockResolvedValue([issue]);
     mockGh.isAllowedActor.mockResolvedValue(false);
-    mockGh.isCiFailureAlertIssue.mockReturnValue(false);
+    mockGh.isCiAlertBotAuthor.mockReturnValue(false);
     mockDb.markUntrustedActorNotified.mockReturnValue(true);
 
     await run([repo]);
@@ -185,7 +180,7 @@ describe("issue-dispatcher", () => {
     const issue = mockIssue({ number: 100 });
     mockGh.listOpenIssues.mockResolvedValue([issue]);
     mockGh.isAllowedActor.mockResolvedValue(false);
-    mockGh.isCiFailureAlertIssue.mockReturnValue(false);
+    mockGh.isCiAlertBotAuthor.mockReturnValue(false);
     mockDb.markUntrustedActorNotified.mockReturnValue(false);
 
     await run([repo]);
@@ -202,7 +197,7 @@ describe("issue-dispatcher", () => {
     });
     mockGh.listOpenIssues.mockResolvedValue([issue]);
     mockGh.isAllowedActor.mockResolvedValue(false);
-    mockGh.isCiFailureAlertIssue.mockReturnValue(true);
+    mockGh.isCiAlertBotAuthor.mockReturnValue(true);
 
     await run([repo]);
 
@@ -212,7 +207,7 @@ describe("issue-dispatcher", () => {
     expect(mockGh.createIssue).not.toHaveBeenCalled();
   });
 
-  it("silently skips a github-actions[bot] issue that is not a recognised CI alert", async () => {
+  it("dispatches any github-actions[bot] issue regardless of title", async () => {
     const issue = mockIssue({
       number: 500,
       title: "Weekly dependency digest",
@@ -220,12 +215,12 @@ describe("issue-dispatcher", () => {
     });
     mockGh.listOpenIssues.mockResolvedValue([issue]);
     mockGh.isAllowedActor.mockResolvedValue(false);
-    mockGh.isCiFailureAlertIssue.mockReturnValue(false);
     mockGh.isCiAlertBotAuthor.mockReturnValue(true);
 
     await run([repo]);
 
-    expect(listQueuedWork()).toHaveLength(0);
+    const queued = listQueuedWork();
+    expect(queued.some((w) => w.kind === AGENT_KINDS.ISSUE_REFINER_PLAN && w.item_number === 500)).toBe(true);
     expect(slack.notify).not.toHaveBeenCalled();
     expect(mockGh.createIssue).not.toHaveBeenCalled();
     expect(mockDb.markUntrustedActorNotified).not.toHaveBeenCalled();
@@ -235,7 +230,6 @@ describe("issue-dispatcher", () => {
     const issue = mockIssue({ number: 200, author: { login: "random-human" } });
     mockGh.listOpenIssues.mockResolvedValue([issue]);
     mockGh.isAllowedActor.mockResolvedValue(false);
-    mockGh.isCiFailureAlertIssue.mockReturnValue(false);
     mockGh.isCiAlertBotAuthor.mockReturnValue(false);
     mockDb.markUntrustedActorNotified.mockReturnValue(true);
 
@@ -243,5 +237,58 @@ describe("issue-dispatcher", () => {
 
     expect(slack.notify).toHaveBeenCalledOnce();
     expect(mockGh.createIssue).toHaveBeenCalledOnce();
+  });
+
+  it("enqueues ISSUE_REFINER_REPLAN when occurrences >= planned * factor and no feedback", async () => {
+    const occurrenceBody = `Alert body.\n\n---\n**First seen:** 2024-01-01T00:00:00.000Z\n**Last seen:** 2024-01-02T00:00:00.000Z\n**Occurrences:** 2`;
+    const issue = mockIssue({ number: 300, body: occurrenceBody });
+    mockGh.listOpenIssues.mockResolvedValue([issue]);
+    mockGh.isAllowedActor.mockResolvedValue(true);
+    // Plan exists, plannedOccurrences=1, no unreacted feedback
+    mockIssueRefiner.findUnreactedFeedbackAfterPlan.mockResolvedValue({
+      hasPlan: true,
+      unreacted: [],
+      plannedOccurrences: 1,
+    });
+
+    await run([repo]);
+
+    const queued = listQueuedWork();
+    expect(queued.some((w) => w.kind === AGENT_KINDS.ISSUE_REFINER_REPLAN && w.item_number === 300)).toBe(true);
+  });
+
+  it("does not enqueue ISSUE_REFINER_REPLAN when current occurrences equals planned (no growth)", async () => {
+    const occurrenceBody = `Alert body.\n\n---\n**First seen:** 2024-01-01T00:00:00.000Z\n**Last seen:** 2024-01-01T00:00:00.000Z\n**Occurrences:** 1`;
+    const issue = mockIssue({ number: 301, body: occurrenceBody });
+    mockGh.listOpenIssues.mockResolvedValue([issue]);
+    mockGh.isAllowedActor.mockResolvedValue(true);
+    mockIssueRefiner.findUnreactedFeedbackAfterPlan.mockResolvedValue({
+      hasPlan: true,
+      unreacted: [],
+      plannedOccurrences: 1,
+    });
+
+    await run([repo]);
+
+    const queued = listQueuedWork();
+    expect(queued.some((w) => w.kind === AGENT_KINDS.ISSUE_REFINER_REPLAN && w.item_number === 301)).toBe(false);
+  });
+
+  it("enqueues ISSUE_REFINER_REPLAN for legacy plan (plannedOccurrences=null) when occurrences >= 2", async () => {
+    const occurrenceBody = `Alert body.\n\n---\n**First seen:** 2024-01-01T00:00:00.000Z\n**Last seen:** 2024-01-02T00:00:00.000Z\n**Occurrences:** 2`;
+    const issue = mockIssue({ number: 302, body: occurrenceBody });
+    mockGh.listOpenIssues.mockResolvedValue([issue]);
+    mockGh.isAllowedActor.mockResolvedValue(true);
+    // Legacy plan: no marker → plannedOccurrences is null, defaults to 1
+    mockIssueRefiner.findUnreactedFeedbackAfterPlan.mockResolvedValue({
+      hasPlan: true,
+      unreacted: [],
+      plannedOccurrences: null,
+    });
+
+    await run([repo]);
+
+    const queued = listQueuedWork();
+    expect(queued.some((w) => w.kind === AGENT_KINDS.ISSUE_REFINER_REPLAN && w.item_number === 302)).toBe(true);
   });
 });

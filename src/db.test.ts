@@ -61,6 +61,7 @@ import {
   hasActiveWorkForPR,
   clearAllWorkQueueForTests,
   markUntrustedActorNotified,
+  trackTaskTokens,
   type Task,
   type TaskOutcome,
   type WorkflowRunRow,
@@ -1503,9 +1504,44 @@ describe("workflow runs", () => {
         );
         
         const errors = getRecentCIFixerErrors(repo, prNumber, 5);
-        
+
         expect(errors).toHaveLength(2);
       });
+    });
+  });
+
+  describe("trackTaskTokens", () => {
+    function getTokenRow(taskId: number) {
+      return _rawDb()
+        .prepare(`SELECT tokens_used, cost_usd FROM tasks WHERE id = ?`)
+        .get(taskId) as { tokens_used: number | null; cost_usd: number | null };
+    }
+
+    it("single invocation writes tokens and cost to the task row", () => {
+      const taskId = recordTaskStart("test-job", "org/repo", 1, null);
+      const cb = trackTaskTokens(taskId);
+      cb(100, 0.5);
+      const row = getTokenRow(taskId);
+      expect(row.tokens_used).toBe(100);
+      expect(row.cost_usd).toBe(0.5);
+    });
+
+    it("two invocations of the same callback accumulate the totals", () => {
+      const taskId = recordTaskStart("test-job", "org/repo", 2, null);
+      const cb = trackTaskTokens(taskId);
+      cb(10, 1);
+      cb(5, 0.5);
+      const row = getTokenRow(taskId);
+      expect(row.tokens_used).toBe(15);
+      expect(row.cost_usd).toBeCloseTo(1.5);
+    });
+
+    it("never invoking the callback leaves token/cost columns at their initial state", () => {
+      const taskId = recordTaskStart("test-job", "org/repo", 3, null);
+      trackTaskTokens(taskId); // returned callback intentionally not called
+      const row = getTokenRow(taskId);
+      expect(row.tokens_used).toBeNull();
+      expect(row.cost_usd).toBeNull();
     });
   });
 

@@ -1,6 +1,7 @@
 import {
   PROD_K8S_MONITOR_ENABLED,
   PROD_K8S_KUBECONFIG_PATH,
+  PROD_K8S_KUBECONFIG_REFRESH,
   PROD_K8S_IGNORED_NODES,
   PROD_K8S_REPO,
 } from "../config.js";
@@ -16,6 +17,7 @@ export async function run(): Promise<void> {
   await runK8sMonitor({
     repo: PROD_K8S_REPO,
     kubeconfigPath: PROD_K8S_KUBECONFIG_PATH,
+    kubeconfigRefresh: PROD_K8S_KUBECONFIG_REFRESH ?? undefined,
     ignoredNodes: PROD_K8S_IGNORED_NODES,
     logPrefix: "prod-k8s-monitor",
     tailLines: 100,

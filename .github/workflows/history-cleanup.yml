@@ -85,7 +85,7 @@ jobs:
 
           # Generate mailmap file
           cat > /tmp/mailmap <<'EOF'
-          opiestjohn <264143558+opiestjohn@users.noreply.github.com> opiestjohn <brendanserver@gmail.com>
+          opiestjohn <264143558+opiestjohn@users.noreply.github.com> opiestjohn <maintainer@example.invalid>
           EOF
 
           # Count commits before rewrite

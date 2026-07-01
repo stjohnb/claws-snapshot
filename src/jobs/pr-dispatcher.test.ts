@@ -41,6 +41,7 @@ const mockGh = vi.hoisted(() => ({
   getPRReviewComments: vi.fn().mockResolvedValue({ formatted: "", commentIds: [], reviewCommentIds: [] }),
   getPRMergeableState: vi.fn().mockResolvedValue("MERGEABLE"),
   populateQueueCache: vi.fn(),
+  populateQueueCacheFor: vi.fn(),
   removeLabel: vi.fn().mockResolvedValue(undefined),
   isRateLimited: vi.fn().mockReturnValue(false),
   RateLimitError: class RateLimitError extends Error {},
@@ -175,10 +176,11 @@ describe("pr-dispatcher — enqueue coordination", () => {
     expect(calls[0][1]).toBe(repo.fullName);
     expect(calls[0][2]).toBe(pr.number);
     // problematic PR is also surfaced in the queue UI
-    expect(mockGh.populateQueueCache).toHaveBeenCalledWith(
+    expect(mockGh.populateQueueCacheFor).toHaveBeenCalledWith(
       "problematic",
       repo.fullName,
       expect.objectContaining({ number: 77 }),
+      "pr",
     );
   });
 
@@ -192,10 +194,11 @@ describe("pr-dispatcher — enqueue coordination", () => {
     const kinds = mockWorker.enqueue.mock.calls.map((c) => c[0]);
     expect(kinds).not.toContain("ci-fixer:problematic");
     // But the queue cache is still populated so the dashboard surfaces it
-    expect(mockGh.populateQueueCache).toHaveBeenCalledWith(
+    expect(mockGh.populateQueueCacheFor).toHaveBeenCalledWith(
       "problematic",
       repo.fullName,
       expect.objectContaining({ number: 77 }),
+      "pr",
     );
   });
 
@@ -209,10 +212,11 @@ describe("pr-dispatcher — enqueue coordination", () => {
     const kinds = mockWorker.enqueue.mock.calls.map((c) => c[0]);
     expect(kinds).not.toContain("ci-fixer:problematic");
     // Queue UI still shows it
-    expect(mockGh.populateQueueCache).toHaveBeenCalledWith(
+    expect(mockGh.populateQueueCacheFor).toHaveBeenCalledWith(
       "problematic",
       repo.fullName,
       expect.objectContaining({ number: 77 }),
+      "pr",
     );
   });
 
@@ -254,14 +258,11 @@ describe("pr-dispatcher — enqueue coordination", () => {
 
       await run([repo]);
 
-      expect(mockGh.populateQueueCache).toHaveBeenCalledWith("ready", repo.fullName, {
-        number: 55,
-        title: "Ready PR",
-        type: "pr",
-        updatedAt: pr.updatedAt,
-        priority: false,
-        labels: ["Ready"],
-      });
+      expect(mockGh.populateQueueCacheFor).toHaveBeenCalledWith(
+        "ready", repo.fullName,
+        expect.objectContaining({ number: 55, title: "Ready PR" }),
+        "pr",
+      );
     });
 
     it("does not populate ready cache for PR processed by review-addresser this cycle", async () => {
@@ -275,7 +276,7 @@ describe("pr-dispatcher — enqueue coordination", () => {
 
       await run([repo]);
 
-      const readyCalls = mockGh.populateQueueCache.mock.calls.filter((c) => c[0] === "ready");
+      const readyCalls = mockGh.populateQueueCacheFor.mock.calls.filter((c) => c[0] === "ready");
       expect(readyCalls).toHaveLength(0);
     });
 
@@ -287,7 +288,7 @@ describe("pr-dispatcher — enqueue coordination", () => {
 
       await run([repo]);
 
-      const readyCalls = mockGh.populateQueueCache.mock.calls.filter((c) => c[0] === "ready");
+      const readyCalls = mockGh.populateQueueCacheFor.mock.calls.filter((c) => c[0] === "ready");
       expect(readyCalls).toHaveLength(0);
     });
 
@@ -299,7 +300,7 @@ describe("pr-dispatcher — enqueue coordination", () => {
 
       await run([repo]);
 
-      const readyCalls = mockGh.populateQueueCache.mock.calls.filter((c) => c[0] === "ready");
+      const readyCalls = mockGh.populateQueueCacheFor.mock.calls.filter((c) => c[0] === "ready");
       expect(readyCalls).toHaveLength(0);
     });
 
@@ -310,7 +311,7 @@ describe("pr-dispatcher — enqueue coordination", () => {
 
       await run([repo]);
 
-      const readyCalls = mockGh.populateQueueCache.mock.calls.filter((c) => c[0] === "ready");
+      const readyCalls = mockGh.populateQueueCacheFor.mock.calls.filter((c) => c[0] === "ready");
       expect(readyCalls).toHaveLength(0);
     });
 
@@ -322,7 +323,7 @@ describe("pr-dispatcher — enqueue coordination", () => {
 
       await run([repo]);
 
-      const readyCalls = mockGh.populateQueueCache.mock.calls.filter((c) => c[0] === "ready");
+      const readyCalls = mockGh.populateQueueCacheFor.mock.calls.filter((c) => c[0] === "ready");
       expect(readyCalls).toHaveLength(0);
     });
   });

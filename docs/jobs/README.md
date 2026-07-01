@@ -38,7 +38,6 @@ Each agent's comments include an agent-aware header:
 |-----|-------------|
 | [issue-dispatcher](issue-dispatcher.md) | Fetches open issues, dispatches to Planner and Implementer agents |
 | [pr-dispatcher](pr-dispatcher.md) | Fetches open PRs, dispatches to CI Fixer, Review Addresser, Reviewer, and Merger agents |
-| [triage-kwyjibo-errors](triage-kwyjibo-errors.md) | Investigates Kwyjibo game errors via API debug data |
 | [triage-claws-errors](triage-claws-errors.md) | Investigates internal Claws errors with fingerprint deduplication |
 | [doc-maintainer](doc-maintainer.md) | Daily documentation updates from recent implementation plans |
 | [repo-standards](repo-standards.md) | Syncs label definitions and cleans up legacy labels |

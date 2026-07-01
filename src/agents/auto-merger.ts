@@ -58,12 +58,16 @@ export async function tryMerge(repo: Repo, pr: gh.PR): Promise<boolean> {
     }
   }
 
-  // Auto-bump PRs must only touch apps/<app>/deployment.yaml image lines
+  // Auto-bump PRs may only touch the image-pin manifests the bump-app-version
+  // workflow rewrites: deployment.yaml plus the optional migrate-job.yaml and
+  // cleanup-test-data-cronjob.yaml (in the app's base/ or prod/ overlay).
   if (isAutoBump) {
     const files = await gh.getPRChangedFiles(repo.fullName, pr.number);
     const allBumps =
       files.length > 0 &&
-      files.every((f) => /^apps\/[^/]+\/(?:base\/)?deployment\.yaml$/.test(f));
+      files.every((f) =>
+        /^apps\/[^/]+\/(?:base\/|prod\/)?(?:deployment|migrate-job|cleanup-test-data-cronjob)\.yaml$/.test(f),
+      );
     if (!allBumps) {
       log.warn(`[auto-merger] Auto-bump PR ${repo.fullName}#${pr.number} touches non-bump files, skipping`);
       return false;

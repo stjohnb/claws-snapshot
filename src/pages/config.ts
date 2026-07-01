@@ -18,8 +18,6 @@ export function buildConfigPage(saved: boolean, theme: Theme): string {
     githubOwners: "CLAWS_GITHUB_OWNERS",
     selfRepo: "CLAWS_SELF_REPO",
     port: "PORT",
-    kwyjiboBaseUrl: "KWYJIBO_BASE_URL",
-    kwyjiboApiKey: "KWYJIBO_AUTOMATION_API_KEY",
     whatsappEnabled: "WHATSAPP_ENABLED",
     whatsappAllowedNumbers: "WHATSAPP_ALLOWED_NUMBERS",
     openaiApiKey: "OPENAI_API_KEY",
@@ -152,15 +150,6 @@ ${htmlOpenTag(theme)}
     <input type="text" name="slackIdeasChannel" id="slackIdeasChannel" value="${escapeHtml(String(cfg.slackIdeasChannel ?? ""))}"${isDisabled("slackIdeasChannel") ? " disabled" : ""}>
     ${envNote("slackIdeasChannel")}
 
-    <label for="kwyjiboBaseUrl">Kwyjibo Base URL</label>
-    <input type="text" name="kwyjiboBaseUrl" id="kwyjiboBaseUrl" value="${escapeHtml(String(cfg.kwyjiboBaseUrl ?? ""))}"${isDisabled("kwyjiboBaseUrl") ? " disabled" : ""}>
-    ${envNote("kwyjiboBaseUrl")}
-
-    <label for="kwyjiboApiKey">Kwyjibo API Key</label>
-    <input type="password" name="kwyjiboApiKey" id="kwyjiboApiKey" placeholder="${escapeHtml(String(cfg.kwyjiboApiKey ?? ""))}"${isDisabled("kwyjiboApiKey") ? " disabled" : ""}>
-    ${envNote("kwyjiboApiKey")}
-    <div class="field-note">Leave empty to keep current value</div>
-
     <label for="whatsappEnabled">WhatsApp Enabled</label>
     <div><input type="checkbox" name="whatsappEnabled" id="whatsappEnabled" value="true"${cfg.whatsappEnabled ? " checked" : ""} disabled>
     <span class="field-note">Read-only — requires restart. Pair via <a href="/whatsapp">/whatsapp</a></span></div>
@@ -214,7 +203,7 @@ ${htmlOpenTag(theme)}
     <label for="oidcBaseUrl">Authentik Base URL</label>
     <input type="text" name="oidcBaseUrl" id="oidcBaseUrl" value="${escapeHtml(String(cfg.oidcBaseUrl ?? ""))}"${isDisabled("oidcBaseUrl") ? " disabled" : ""}>
     ${envNote("oidcBaseUrl")}
-    <div class="field-note">e.g. https://auth.home.bstjohn.net — all four OIDC fields are required to enable login; without them the dashboard is inaccessible</div>
+    <div class="field-note">e.g. https://auth.home.example.invalid — all four OIDC fields are required to enable login; without them the dashboard is inaccessible</div>
 
     <label for="oidcApplicationSlug">Application Slug</label>
     <input type="text" name="oidcApplicationSlug" id="oidcApplicationSlug" value="${escapeHtml(String(cfg.oidcApplicationSlug ?? ""))}"${isDisabled("oidcApplicationSlug") ? " disabled" : ""}>
@@ -233,7 +222,7 @@ ${htmlOpenTag(theme)}
     <label for="oidcRedirectUri">Redirect URI</label>
     <input type="text" name="oidcRedirectUri" id="oidcRedirectUri" value="${escapeHtml(String(cfg.oidcRedirectUri ?? ""))}"${isDisabled("oidcRedirectUri") ? " disabled" : ""}>
     ${envNote("oidcRedirectUri")}
-    <div class="field-note">e.g. https://claws.home.bstjohn.net/auth/callback</div>
+    <div class="field-note">e.g. https://claws.home.example.invalid/auth/callback</div>
 
     <h2>Disabled Agents</h2>
     <div class="field-note">Uncheck agents to disable them within the issue-dispatcher/pr-dispatcher jobs.</div>
@@ -250,7 +239,7 @@ ${htmlOpenTag(theme)}
     <div class="field-note">Leave empty to keep current value. Required for OpenCode/OpenRouter provider.</div>
 
     <label for="ollamaBaseUrl">Ollama Base URL</label>
-    <input type="text" name="ollamaBaseUrl" id="ollamaBaseUrl" value="${escapeHtml(String(cfg.ollamaBaseUrl ?? "https://ollama.home.bstjohn.net"))}">
+    <input type="text" name="ollamaBaseUrl" id="ollamaBaseUrl" value="${escapeHtml(String(cfg.ollamaBaseUrl ?? "https://ollama.home.example.invalid"))}">
     <div class="field-note">Base URL for local Ollama instance used for rate-limit classification</div>
 
     <label for="ollamaTimeoutMs">Ollama Classification Timeout (seconds)</label>

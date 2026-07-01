@@ -73,6 +73,17 @@ export interface DatasetteExport {
   remotePath: string;
 }
 
+export interface KubeconfigRefresh {
+  tailscaleHostname?: string;
+  host?: string;
+  user?: string;
+  port?: number;
+  identityFile?: string;
+  remotePath: string;
+  serverPort?: number;
+  serverOverride?: string;
+}
+
 export interface OwnerAppCredential {
   appId: number;
   privateKeyPath: string;
@@ -86,8 +97,6 @@ export interface ConfigFile {
   githubOwners?: string[];
   selfRepo?: string;
   port?: number;
-  kwyjiboBaseUrl?: string;
-  kwyjiboApiKey?: string;
   whatsappEnabled?: boolean;
   whatsappAllowedNumbers?: string[];
   openaiApiKey?: string;
@@ -139,7 +148,6 @@ export interface ConfigFile {
     issueRefinerMs?: number;
     ciFixerMs?: number;
     reviewAddresserMs?: number;
-    triageKwyjiboErrorsMs?: number;
     autoMergerMs?: number;
     triageClawsErrorsMs?: number;
     ideaCollectorMs?: number;
@@ -156,9 +164,13 @@ export interface ConfigFile {
     haUpgraderMs?: number;
     haDeployWatcherMs?: number;
     worktreeCleanerMs?: number;
+    binDayMonitorMs?: number;
+    batteryMonitorMs?: number;
   };
   schedules?: {
     repoStandardsHour?: number;
+    publicRepoScannerHour?: number;
+    actionsStorageMonitorHour?: number;
   };
   smartScheduling?: {
     enabled?: boolean;
@@ -171,11 +183,14 @@ export interface ConfigFile {
     maxConcurrentJobTasks?: number;
     ignoreBusyKinds?: string[];
   };
+  dependabotAutoDismissStale?: boolean;
   k3sMonitorEnabled?: boolean;
   k3sIgnoredNodes?: string[];
   fleetInfraRepo?: string;
   prodK8sMonitorEnabled?: boolean;
   prodK8sKubeconfigPath?: string;
+  fleetKubeconfigPath?: string;
+  prodK8sKubeconfigRefresh?: KubeconfigRefresh;
   prodK8sIgnoredNodes?: string[];
   prodK8sRepo?: string;
   logRetentionDays?: number;
@@ -194,6 +209,7 @@ export interface ConfigFile {
     maxConsecutiveFailures?: number;
   };
   disabledJobsByRepo?: Record<string, string[]>;
+  dependabotIgnoredAdvisories?: Record<string, string[]>;
   enabledJobsByRepo?: Record<string, string[]>;
   activationState?: "verify-only" | "active";
   homeAssistantBaseUrl?: string;
@@ -203,6 +219,10 @@ export interface ConfigFile {
   homeAssistantUpgraderExcludePatterns?: string[];
   homeAssistantDeployWatcherEnabled?: boolean;
   homeAssistantGitPullAddonSlug?: string;
+  homeAssistantBinDayMonitorEnabled?: boolean;
+  homeAssistantBinDaySensorPrefix?: string;
+  homeAssistantBatteryMonitorEnabled?: boolean;
+  homeAssistantBatteryThresholdPercent?: number;
 }
 
 export type ActivationState = "verify-only" | "active";
@@ -224,6 +244,17 @@ const DatasetteExportSchema = z.object({
   remotePath: z.string(),
 });
 
+const KubeconfigRefreshSchema = z.object({
+  tailscaleHostname: z.string().optional(),
+  host: z.string().optional(),
+  user: z.string().optional(),
+  port: z.number().optional(),
+  identityFile: z.string().optional(),
+  remotePath: z.string(),
+  serverPort: z.number().optional(),
+  serverOverride: z.string().optional(),
+});
+
 const OwnerAppCredentialSchema = z.object({
   appId: z.number(),
   privateKeyPath: z.string(),
@@ -239,8 +270,6 @@ const ConfigFileSchema = z.object({
   githubOwners: z.array(z.string()).optional(),
   selfRepo: z.string().optional(),
   port: z.number().optional(),
-  kwyjiboBaseUrl: z.string().optional(),
-  kwyjiboApiKey: z.string().optional(),
   whatsappEnabled: z.boolean().optional(),
   whatsappAllowedNumbers: z.array(z.string()).optional(),
   openaiApiKey: z.string().optional(),
@@ -292,7 +321,6 @@ const ConfigFileSchema = z.object({
     issueRefinerMs: z.number().optional(),
     ciFixerMs: z.number().optional(),
     reviewAddresserMs: z.number().optional(),
-    triageKwyjiboErrorsMs: z.number().optional(),
     autoMergerMs: z.number().optional(),
     triageClawsErrorsMs: z.number().optional(),
     ideaCollectorMs: z.number().optional(),
@@ -309,9 +337,13 @@ const ConfigFileSchema = z.object({
     haUpgraderMs: z.number().optional(),
     haDeployWatcherMs: z.number().optional(),
     worktreeCleanerMs: z.number().optional(),
+    binDayMonitorMs: z.number().optional(),
+    batteryMonitorMs: z.number().optional(),
   }).optional(),
   schedules: z.object({
     repoStandardsHour: z.number().optional(),
+    publicRepoScannerHour: z.number().optional(),
+    actionsStorageMonitorHour: z.number().optional(),
   }).optional(),
   smartScheduling: z.object({
     enabled: z.boolean().optional(),
@@ -324,11 +356,14 @@ const ConfigFileSchema = z.object({
     maxConcurrentJobTasks: z.number().optional(),
     ignoreBusyKinds: z.array(z.string()).optional(),
   }).optional(),
+  dependabotAutoDismissStale: z.boolean().optional(),
   k3sMonitorEnabled: z.boolean().optional(),
   k3sIgnoredNodes: z.array(z.string()).optional(),
   fleetInfraRepo: z.string().optional(),
   prodK8sMonitorEnabled: z.boolean().optional(),
   prodK8sKubeconfigPath: z.string().optional(),
+  fleetKubeconfigPath: z.string().optional(),
+  prodK8sKubeconfigRefresh: KubeconfigRefreshSchema.optional(),
   prodK8sIgnoredNodes: z.array(z.string()).optional(),
   prodK8sRepo: z.string().optional(),
   logRetentionDays: z.number().optional(),
@@ -347,6 +382,7 @@ const ConfigFileSchema = z.object({
     maxConsecutiveFailures: z.number().optional(),
   }).optional(),
   disabledJobsByRepo: z.record(z.string(), z.array(z.string())).optional(),
+  dependabotIgnoredAdvisories: z.record(z.string(), z.array(z.string())).optional(),
   enabledJobsByRepo: z.record(z.string(), z.array(z.string())).optional(),
   homeAssistantBaseUrl: z.string().optional(),
   homeAssistantToken: z.string().optional(),
@@ -355,13 +391,17 @@ const ConfigFileSchema = z.object({
   homeAssistantUpgraderExcludePatterns: z.array(z.string()).optional(),
   homeAssistantDeployWatcherEnabled: z.boolean().optional(),
   homeAssistantGitPullAddonSlug: z.string().optional(),
+  homeAssistantBinDayMonitorEnabled: z.boolean().optional(),
+  homeAssistantBinDaySensorPrefix: z.string().optional(),
+  homeAssistantBatteryMonitorEnabled: z.boolean().optional(),
+  homeAssistantBatteryThresholdPercent: z.number().optional(),
   activationState: z.enum(["verify-only", "active"]).optional(),
 });
 
 const DEFAULT_RUNNERS: RunnerHost[] = [
   {
     name: "hetzner-actions-runner",
-    host: "46.62.155.156",
+    host: "203.0.113.10",
     user: "actions",
     port: 22,
     identityFile: "~/.ssh/id_ed25519",
@@ -369,11 +409,11 @@ const DEFAULT_RUNNERS: RunnerHost[] = [
   },
   {
     name: "hetzner-beefy-actions",
-    host: "46.224.44.218",
-    user: "brendan",
+    host: "203.0.113.11",
+    user: "user",
     port: 22,
     identityFile: "~/.ssh/id_ed25519",
-    actionsDir: "/home/brendan/actions-runner",
+    actionsDir: "/home/user/actions-runner",
   },
 ];
 
@@ -425,12 +465,6 @@ export function loadConfig() {
     10,
   );
 
-  const kwyjiboBaseUrl =
-    process.env["KWYJIBO_BASE_URL"] ?? file.kwyjiboBaseUrl ?? "https://kwyjibo.vercel.app";
-
-  const kwyjiboApiKey =
-    process.env["KWYJIBO_AUTOMATION_API_KEY"] ?? file.kwyjiboApiKey ?? "";
-
   const runners = file.runners ?? DEFAULT_RUNNERS;
   const datasetteExport = file.datasetteExport ?? null;
 
@@ -440,7 +474,7 @@ export function loadConfig() {
       : file.emailEnabled ?? true;
 
   const emailUser =
-    process.env["CLAWS_EMAIL_USER"] ?? file.emailUser ?? "brendanserver@gmail.com";
+    process.env["CLAWS_EMAIL_USER"] ?? file.emailUser ?? "";
 
   const emailAppPassword =
     process.env["BRENDAN_SERVER_GMAIL_APP_PASSWORD"] ?? file.emailAppPassword ?? "";
@@ -461,7 +495,7 @@ export function loadConfig() {
     file.githubOwnerAppCredentials ?? {};
 
   const emailRecipient =
-    process.env["CLAWS_EMAIL_RECIPIENT"] ?? file.emailRecipient ?? "brendan@bstjohn.net";
+    process.env["CLAWS_EMAIL_RECIPIENT"] ?? file.emailRecipient ?? "";
 
   const codexDefaultModel =
     process.env["CLAWS_CODEX_DEFAULT_MODEL"] ?? file.codexDefaultModel ?? "o3";
@@ -547,10 +581,10 @@ export function loadConfig() {
   );
 
   const ollamaBaseUrl =
-    process.env["CLAWS_OLLAMA_BASE_URL"] ?? file.ollamaBaseUrl ?? "https://ollama.home.bstjohn.net";
+    process.env["CLAWS_OLLAMA_BASE_URL"] ?? file.ollamaBaseUrl ?? "https://ollama.home.example.invalid";
 
   const whisperBaseUrl =
-    process.env["CLAWS_WHISPER_BASE_URL"] ?? file.whisperBaseUrl ?? "https://whisper.home.bstjohn.net";
+    process.env["CLAWS_WHISPER_BASE_URL"] ?? file.whisperBaseUrl ?? "https://whisper.home.example.invalid";
 
   const ollamaTimeoutMs = parseInt(
     process.env["CLAWS_OLLAMA_TIMEOUT_MS"] ?? String(file.ollamaTimeoutMs ?? 60_000),
@@ -567,7 +601,6 @@ export function loadConfig() {
     issueRefinerMs: file.intervals?.issueRefinerMs ?? 5 * 60 * 1000,
     ciFixerMs: file.intervals?.ciFixerMs ?? 10 * 60 * 1000,
     reviewAddresserMs: file.intervals?.reviewAddresserMs ?? 5 * 60 * 1000,
-    triageKwyjiboErrorsMs: file.intervals?.triageKwyjiboErrorsMs ?? 10 * 60 * 1000,
     autoMergerMs: file.intervals?.autoMergerMs ?? 10 * 60 * 1000,
     triageClawsErrorsMs: file.intervals?.triageClawsErrorsMs ?? 10 * 60 * 1000,
     ideaCollectorMs: file.intervals?.ideaCollectorMs ?? 30 * 60 * 1000,
@@ -584,10 +617,14 @@ export function loadConfig() {
     haUpgraderMs: file.intervals?.haUpgraderMs ?? 24 * 60 * 60 * 1000,
     haDeployWatcherMs: file.intervals?.haDeployWatcherMs ?? 5 * 60 * 1000,
     worktreeCleanerMs: file.intervals?.worktreeCleanerMs ?? 24 * 60 * 60 * 1000,
+    binDayMonitorMs: file.intervals?.binDayMonitorMs ?? 15 * 60 * 1000,
+    batteryMonitorMs: file.intervals?.batteryMonitorMs ?? 60 * 60 * 1000,
   };
 
   const schedules = {
     repoStandardsHour: file.schedules?.repoStandardsHour ?? 2, // 2 AM local time
+    publicRepoScannerHour: file.schedules?.publicRepoScannerHour ?? 4, // 4 AM local time
+    actionsStorageMonitorHour: file.schedules?.actionsStorageMonitorHour ?? 5, // 5 AM local time
   };
 
   const smartScheduling = {
@@ -707,6 +744,11 @@ export function loadConfig() {
   const rawReviewModelTier = process.env["CLAWS_REVIEW_MODEL_TIER"] ?? file.reviewModelTier ?? "sonnet";
   const reviewModelTier: "sonnet" | "opus" = rawReviewModelTier === "opus" ? "opus" : "sonnet";
 
+  const dependabotAutoDismissStale =
+    process.env["CLAWS_DEPENDABOT_AUTO_DISMISS_STALE"] !== undefined
+      ? process.env["CLAWS_DEPENDABOT_AUTO_DISMISS_STALE"] === "true"
+      : file.dependabotAutoDismissStale ?? true;
+
   const k3sMonitorEnabled =
     process.env["CLAWS_K3S_MONITOR_ENABLED"] !== undefined
       ? process.env["CLAWS_K3S_MONITOR_ENABLED"] === "true"
@@ -724,6 +766,11 @@ export function loadConfig() {
 
   const prodK8sKubeconfigPath =
     process.env["CLAWS_PROD_K8S_KUBECONFIG_PATH"] ?? file.prodK8sKubeconfigPath ?? "";
+
+  const fleetKubeconfigPath =
+    process.env["CLAWS_FLEET_KUBECONFIG_PATH"] ?? file.fleetKubeconfigPath ?? "~/.kube/config";
+
+  const prodK8sKubeconfigRefresh = file.prodK8sKubeconfigRefresh ?? null;
 
   const prodK8sIgnoredNodes = file.prodK8sIgnoredNodes ?? [];
 
@@ -759,6 +806,24 @@ export function loadConfig() {
     process.env["CLAWS_HOME_ASSISTANT_GIT_PULL_ADDON_SLUG"] ??
     file.homeAssistantGitPullAddonSlug ?? "core_git_pull";
 
+  const homeAssistantBinDayMonitorEnabled =
+    process.env["CLAWS_HOME_ASSISTANT_BIN_DAY_MONITOR_ENABLED"] !== undefined
+      ? process.env["CLAWS_HOME_ASSISTANT_BIN_DAY_MONITOR_ENABLED"] === "true"
+      : file.homeAssistantBinDayMonitorEnabled ?? false;
+
+  const homeAssistantBinDaySensorPrefix =
+    process.env["CLAWS_HOME_ASSISTANT_BIN_DAY_SENSOR_PREFIX"] ??
+    file.homeAssistantBinDaySensorPrefix ?? "sensor.bin_scraper_";
+
+  const homeAssistantBatteryMonitorEnabled =
+    process.env["CLAWS_HOME_ASSISTANT_BATTERY_MONITOR_ENABLED"] !== undefined
+      ? process.env["CLAWS_HOME_ASSISTANT_BATTERY_MONITOR_ENABLED"] === "true"
+      : file.homeAssistantBatteryMonitorEnabled ?? false;
+  const homeAssistantBatteryThresholdPercent =
+    process.env["CLAWS_HOME_ASSISTANT_BATTERY_THRESHOLD_PERCENT"] !== undefined
+      ? Number(process.env["CLAWS_HOME_ASSISTANT_BATTERY_THRESHOLD_PERCENT"])
+      : file.homeAssistantBatteryThresholdPercent ?? 10;
+
   const ciFixerCircuitBreaker = {
     maxAttempts: file.ciFixerCircuitBreaker?.maxAttempts ?? 5,
     windowMs: file.ciFixerCircuitBreaker?.windowMs ?? 24 * 60 * 60 * 1000,
@@ -766,6 +831,7 @@ export function loadConfig() {
   };
 
   const disabledJobsByRepo: Record<string, string[]> = file.disabledJobsByRepo ?? {};
+  const dependabotIgnoredAdvisories: Record<string, string[]> = file.dependabotIgnoredAdvisories ?? {};
   const enabledJobsByRepo: Record<string, string[]> = file.enabledJobsByRepo ?? {};
 
   // Activation state: env wins > config file > default-based-on-existing-db.
@@ -796,7 +862,7 @@ export function loadConfig() {
     );
   }
 
-  return { slackWebhook, slackBotToken, slackIdeasChannel, githubOwners, selfRepo, port, kwyjiboBaseUrl, kwyjiboApiKey, runners, datasetteExport, intervals, schedules, smartScheduling, logRetentionDays, logRetentionPerJob, whatsappEnabled, whatsappAllowedNumbers, whatsappAuthDir, openaiApiKey, oidcClientId, oidcClientSecret, oidcBaseUrl, oidcApplicationSlug, oidcRedirectUri, maxWorkWorkers, claudeTimeoutMs, worktreeStaleMs, claudeLivenessTimeoutMs, claudeWorkerMemoryMaxBytes, pausedJobs, disabledAgents, skippedItems, prioritizedItems, itemTimeoutOverrides, allowedActors, emailEnabled, emailUser, emailAppPassword, emailRecipient, nameyDbUrl, githubAppId, githubAppPrivateKeyPath, githubAppInstallationIds, githubOwnerAppCredentials, codexDefaultModel, codexLightModel, openrouterApiKey, opencodeBestModel, opencodeAdequateModel, opencodeCheapModel, opencodeTextBestModel, opencodeTextAdequateModel, opencodeTextCheapModel, openrouterBestModel, openrouterAdequateModel, openrouterCheapModel, claudeCheapModel, codexCheapModel, toolUseProviderFallbackOrder, textOnlyProviderFallbackOrder, providerRateLimitCooldownMs, ollamaBaseUrl, whisperBaseUrl, ollamaTimeoutMs, ollamaConsecutiveFailuresBeforeDisable, notifyDashboardActions, reviewModelTier, k3sMonitorEnabled, k3sIgnoredNodes, fleetInfraRepo, prodK8sMonitorEnabled, prodK8sKubeconfigPath, prodK8sIgnoredNodes, prodK8sRepo, ciFixerCircuitBreaker, disabledJobsByRepo, enabledJobsByRepo, activationState, activationStateIsExplicit, bindHost, homeAssistantBaseUrl, homeAssistantToken, homeAssistantConfigRepo, homeAssistantUpgraderEnabled, homeAssistantUpgraderExcludePatterns, homeAssistantDeployWatcherEnabled, homeAssistantGitPullAddonSlug };
+  return { slackWebhook, slackBotToken, slackIdeasChannel, githubOwners, selfRepo, port, runners, datasetteExport, intervals, schedules, smartScheduling, logRetentionDays, logRetentionPerJob, whatsappEnabled, whatsappAllowedNumbers, whatsappAuthDir, openaiApiKey, oidcClientId, oidcClientSecret, oidcBaseUrl, oidcApplicationSlug, oidcRedirectUri, maxWorkWorkers, claudeTimeoutMs, worktreeStaleMs, claudeLivenessTimeoutMs, claudeWorkerMemoryMaxBytes, pausedJobs, disabledAgents, skippedItems, prioritizedItems, itemTimeoutOverrides, allowedActors, emailEnabled, emailUser, emailAppPassword, emailRecipient, nameyDbUrl, githubAppId, githubAppPrivateKeyPath, githubAppInstallationIds, githubOwnerAppCredentials, codexDefaultModel, codexLightModel, openrouterApiKey, opencodeBestModel, opencodeAdequateModel, opencodeCheapModel, opencodeTextBestModel, opencodeTextAdequateModel, opencodeTextCheapModel, openrouterBestModel, openrouterAdequateModel, openrouterCheapModel, claudeCheapModel, codexCheapModel, toolUseProviderFallbackOrder, textOnlyProviderFallbackOrder, providerRateLimitCooldownMs, ollamaBaseUrl, whisperBaseUrl, ollamaTimeoutMs, ollamaConsecutiveFailuresBeforeDisable, notifyDashboardActions, reviewModelTier, dependabotAutoDismissStale, k3sMonitorEnabled, k3sIgnoredNodes, fleetInfraRepo, prodK8sMonitorEnabled, prodK8sKubeconfigPath, fleetKubeconfigPath, prodK8sKubeconfigRefresh, prodK8sIgnoredNodes, prodK8sRepo, ciFixerCircuitBreaker, disabledJobsByRepo, dependabotIgnoredAdvisories, enabledJobsByRepo, activationState, activationStateIsExplicit, bindHost, homeAssistantBaseUrl, homeAssistantToken, homeAssistantConfigRepo, homeAssistantUpgraderEnabled, homeAssistantUpgraderExcludePatterns, homeAssistantDeployWatcherEnabled, homeAssistantGitPullAddonSlug, homeAssistantBinDayMonitorEnabled, homeAssistantBinDaySensorPrefix, homeAssistantBatteryMonitorEnabled, homeAssistantBatteryThresholdPercent };
 }
 
 const config = loadConfig();
@@ -807,8 +873,6 @@ export let SLACK_IDEAS_CHANNEL = config.slackIdeasChannel;
 export let GITHUB_OWNERS: readonly string[] = config.githubOwners;
 export let SELF_REPO = config.selfRepo;
 export const SERVER_PORT = config.port; // immutable — requires restart
-export let KWYJIBO_BASE_URL = config.kwyjiboBaseUrl;
-export let KWYJIBO_API_KEY = config.kwyjiboApiKey;
 export let RUNNER_HOSTS: readonly RunnerHost[] = config.runners;
 export let DATASETTE_EXPORT: DatasetteExport | null = config.datasetteExport;
 export let INTERVALS = config.intervals;
@@ -868,15 +932,19 @@ export let OLLAMA_TIMEOUT_MS = config.ollamaTimeoutMs;
 export let OLLAMA_CONSECUTIVE_FAILURES_BEFORE_DISABLE = config.ollamaConsecutiveFailuresBeforeDisable;
 export let NOTIFY_DASHBOARD_ACTIONS = config.notifyDashboardActions;
 export let REVIEW_MODEL_TIER: "sonnet" | "opus" = config.reviewModelTier;
+export let DEPENDABOT_AUTO_DISMISS_STALE = config.dependabotAutoDismissStale;
 export let K3S_MONITOR_ENABLED = config.k3sMonitorEnabled;
 export let K3S_IGNORED_NODES: readonly string[] = config.k3sIgnoredNodes;
 export let FLEET_INFRA_REPO = config.fleetInfraRepo;
 export let PROD_K8S_MONITOR_ENABLED = config.prodK8sMonitorEnabled;
 export let PROD_K8S_KUBECONFIG_PATH = config.prodK8sKubeconfigPath;
+export let FLEET_KUBECONFIG_PATH = config.fleetKubeconfigPath;
+export let PROD_K8S_KUBECONFIG_REFRESH: KubeconfigRefresh | null = config.prodK8sKubeconfigRefresh;
 export let PROD_K8S_IGNORED_NODES: readonly string[] = config.prodK8sIgnoredNodes;
 export let PROD_K8S_REPO = config.prodK8sRepo;
 export let CI_FIXER_CIRCUIT_BREAKER = config.ciFixerCircuitBreaker;
 export let DISABLED_JOBS_BY_REPO: Readonly<Record<string, readonly string[]>> = config.disabledJobsByRepo;
+export let DEPENDABOT_IGNORED_ADVISORIES: Readonly<Record<string, readonly string[]>> = config.dependabotIgnoredAdvisories;
 export let ENABLED_JOBS_BY_REPO: Readonly<Record<string, readonly string[]>> = config.enabledJobsByRepo;
 export let ACTIVATION_STATE: ActivationState = config.activationState;
 export let HOME_ASSISTANT_BASE_URL = config.homeAssistantBaseUrl;
@@ -886,6 +954,10 @@ export let HOME_ASSISTANT_UPGRADER_ENABLED = config.homeAssistantUpgraderEnabled
 export let HOME_ASSISTANT_UPGRADER_EXCLUDE_PATTERNS: ReadonlyArray<string> = config.homeAssistantUpgraderExcludePatterns;
 export let HOME_ASSISTANT_DEPLOY_WATCHER_ENABLED = config.homeAssistantDeployWatcherEnabled;
 export let HOME_ASSISTANT_GIT_PULL_ADDON_SLUG = config.homeAssistantGitPullAddonSlug;
+export let HOME_ASSISTANT_BIN_DAY_MONITOR_ENABLED = config.homeAssistantBinDayMonitorEnabled;
+export let HOME_ASSISTANT_BIN_DAY_SENSOR_PREFIX = config.homeAssistantBinDaySensorPrefix;
+export let HOME_ASSISTANT_BATTERY_MONITOR_ENABLED = config.homeAssistantBatteryMonitorEnabled;
+export let HOME_ASSISTANT_BATTERY_THRESHOLD_PERCENT = config.homeAssistantBatteryThresholdPercent;
 
 /** Jobs disabled by default for all repos; must be explicitly opted in via enabledJobsByRepo. */
 export const OPT_IN_JOB_NAMES: ReadonlySet<string> = new Set(["main-build-monitor-scanner"]);
@@ -905,6 +977,16 @@ export const VALID_AGENT_NAMES = ["planner", "implementer", "ci-fixer", "review-
 /** Check whether a specific agent is disabled. */
 export function isAgentDisabled(name: string): boolean {
   return DISABLED_AGENTS.includes(name);
+}
+
+/** GHSA advisory IDs to suppress for a repo (merges the "*" global list). Lowercased. */
+export function getIgnoredAdvisoriesForRepo(repoFullName: string): Set<string> {
+  const out = new Set<string>();
+  for (const key of ["*", repoFullName]) {
+    const list = DEPENDABOT_IGNORED_ADVISORIES[key];
+    if (list) for (const id of list) out.add(id.toLowerCase());
+  }
+  return out;
 }
 
 /** Check whether a specific job is disabled for a given repo. */
@@ -947,8 +1029,6 @@ export function reloadConfig(): void {
   SLACK_IDEAS_CHANNEL = fresh.slackIdeasChannel;
   GITHUB_OWNERS = fresh.githubOwners;
   SELF_REPO = fresh.selfRepo;
-  KWYJIBO_BASE_URL = fresh.kwyjiboBaseUrl;
-  KWYJIBO_API_KEY = fresh.kwyjiboApiKey;
   RUNNER_HOSTS = fresh.runners;
   DATASETTE_EXPORT = fresh.datasetteExport;
   INTERVALS = fresh.intervals;
@@ -1006,15 +1086,19 @@ export function reloadConfig(): void {
   OLLAMA_CONSECUTIVE_FAILURES_BEFORE_DISABLE = fresh.ollamaConsecutiveFailuresBeforeDisable;
   NOTIFY_DASHBOARD_ACTIONS = fresh.notifyDashboardActions;
   REVIEW_MODEL_TIER = fresh.reviewModelTier;
+  DEPENDABOT_AUTO_DISMISS_STALE = fresh.dependabotAutoDismissStale;
   K3S_MONITOR_ENABLED = fresh.k3sMonitorEnabled;
   K3S_IGNORED_NODES = fresh.k3sIgnoredNodes;
   FLEET_INFRA_REPO = fresh.fleetInfraRepo;
   PROD_K8S_MONITOR_ENABLED = fresh.prodK8sMonitorEnabled;
   PROD_K8S_KUBECONFIG_PATH = fresh.prodK8sKubeconfigPath;
+  FLEET_KUBECONFIG_PATH = fresh.fleetKubeconfigPath;
+  PROD_K8S_KUBECONFIG_REFRESH = fresh.prodK8sKubeconfigRefresh;
   PROD_K8S_IGNORED_NODES = fresh.prodK8sIgnoredNodes;
   PROD_K8S_REPO = fresh.prodK8sRepo;
   CI_FIXER_CIRCUIT_BREAKER = fresh.ciFixerCircuitBreaker;
   DISABLED_JOBS_BY_REPO = fresh.disabledJobsByRepo;
+  DEPENDABOT_IGNORED_ADVISORIES = fresh.dependabotIgnoredAdvisories;
   ENABLED_JOBS_BY_REPO = fresh.enabledJobsByRepo;
   HOME_ASSISTANT_BASE_URL = fresh.homeAssistantBaseUrl;
   HOME_ASSISTANT_TOKEN = fresh.homeAssistantToken;
@@ -1023,6 +1107,10 @@ export function reloadConfig(): void {
   HOME_ASSISTANT_UPGRADER_EXCLUDE_PATTERNS = fresh.homeAssistantUpgraderExcludePatterns;
   HOME_ASSISTANT_DEPLOY_WATCHER_ENABLED = fresh.homeAssistantDeployWatcherEnabled;
   HOME_ASSISTANT_GIT_PULL_ADDON_SLUG = fresh.homeAssistantGitPullAddonSlug;
+  HOME_ASSISTANT_BIN_DAY_MONITOR_ENABLED = fresh.homeAssistantBinDayMonitorEnabled;
+  HOME_ASSISTANT_BIN_DAY_SENSOR_PREFIX = fresh.homeAssistantBinDaySensorPrefix;
+  HOME_ASSISTANT_BATTERY_MONITOR_ENABLED = fresh.homeAssistantBatteryMonitorEnabled;
+  HOME_ASSISTANT_BATTERY_THRESHOLD_PERCENT = fresh.homeAssistantBatteryThresholdPercent;
   // Only overwrite ACTIVATION_STATE when the value is explicit (env var or
   // config file). Without this guard, re-deriving from dbExists after initDb()
   // creates the DB would silently flip verify-only → active on any reload.
@@ -1037,7 +1125,7 @@ export function reloadConfig(): void {
 
 // ReadonlySet provides compile-time immutability; Object.freeze on a Set does not
 // prevent .add()/.delete() at runtime (they operate on internal slots, not own properties).
-export const SENSITIVE_KEYS: ReadonlySet<string> = new Set(["slackWebhook", "slackBotToken", "kwyjiboApiKey", "openaiApiKey", "emailAppPassword", "nameyDbUrl", "openrouterApiKey", "oidcClientSecret", "githubAppPrivateKeyPath", "githubOwnerAppCredentials", "homeAssistantToken"]);
+export const SENSITIVE_KEYS: ReadonlySet<string> = new Set(["slackWebhook", "slackBotToken", "openaiApiKey", "emailAppPassword", "nameyDbUrl", "openrouterApiKey", "oidcClientSecret", "githubAppPrivateKeyPath", "githubOwnerAppCredentials", "homeAssistantToken"]);
 
 function maskValue(value: unknown): string {
   if (!value) return "Not configured";

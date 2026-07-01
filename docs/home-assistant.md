@@ -100,7 +100,7 @@ Alternatively, export via the REST API:
 
 ```sh
 curl -s -H "Authorization: Bearer $CLAWS_HOME_ASSISTANT_TOKEN" \
-  https://homeassistant.home.bstjohn.net/api/config/automation/config \
+  https://homeassistant.home.example.invalid/api/config/automation/config \
   | jq .
 ```
 
@@ -118,7 +118,7 @@ pattern as `OPENAI_API_KEY`):
 ```sh
 # In /etc/systemd/system/claws.service or the EnvironmentFile it references:
 CLAWS_HOME_ASSISTANT_TOKEN=<the token>
-CLAWS_HOME_ASSISTANT_BASE_URL=https://homeassistant.home.bstjohn.net
+CLAWS_HOME_ASSISTANT_BASE_URL=https://homeassistant.home.example.invalid
 ```
 
 Alternatively, add to `~/.claws/config.json`:
@@ -126,7 +126,7 @@ Alternatively, add to `~/.claws/config.json`:
 ```json
 {
   "homeAssistantToken": "<the token>",
-  "homeAssistantBaseUrl": "https://homeassistant.home.bstjohn.net"
+  "homeAssistantBaseUrl": "https://homeassistant.home.example.invalid"
 }
 ```
 

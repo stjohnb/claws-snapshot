@@ -198,7 +198,7 @@ ${htmlOpenTag(theme)}
   ${LOCAL_TIME_SCRIPT}
   <h2><a href="/repos/${encodeURIComponent(repo.split("/")[0])}/${encodeURIComponent(repo.split("/")[1] ?? "")}">${escapeHtml(shortRepo)}</a>#${itemNumber}</h2>
   <div style="margin-bottom:1rem;font-size:0.85rem">
-    <a href="https://github.com/${encodeURI(repo)}/issues/${itemNumber}">View on GitHub</a>
+    <a href="https://github.com/${escapeHtml(encodeURI(repo))}/issues/${itemNumber}">View on GitHub</a>
     | ${runs.length} run${runs.length !== 1 ? "s" : ""}
   </div>
   ${emptyState}

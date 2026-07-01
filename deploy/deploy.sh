@@ -43,7 +43,7 @@ slack() {
 }
 
 # 1. Get latest release tag
-LATEST_TAG=$(sudo -u brendan gh release list -R "$REPO" --limit 1 --json tagName --jq '.[0].tagName')
+LATEST_TAG=$(sudo -u user gh release list -R "$REPO" --limit 1 --json tagName --jq '.[0].tagName')
 if [[ -z "$LATEST_TAG" ]]; then
   log "No releases found"
   exit 0
@@ -68,11 +68,11 @@ fi
 
 log "Updating from $CURRENT_TAG to $LATEST_TAG"
 
-RELEASE_BODY=$(sudo -u brendan gh release view "$LATEST_TAG" -R "$REPO" --json body --jq '.body' 2>/dev/null || echo "")
+RELEASE_BODY=$(sudo -u user gh release view "$LATEST_TAG" -R "$REPO" --json body --jq '.body' 2>/dev/null || echo "")
 
 # 3. Download and extract
-TMPFILE=$(sudo -u brendan mktemp /tmp/claws-XXXXXX.tar.gz)
-sudo -u brendan gh release download "$LATEST_TAG" -R "$REPO" -p "claws.tar.gz" -O "$TMPFILE" --clobber
+TMPFILE=$(sudo -u user mktemp /tmp/claws-XXXXXX.tar.gz)
+sudo -u user gh release download "$LATEST_TAG" -R "$REPO" -p "claws.tar.gz" -O "$TMPFILE" --clobber
 rm -rf "$STAGING_DIR"
 mkdir -p "$STAGING_DIR"
 tar -xzf "$TMPFILE" -C "$STAGING_DIR"
@@ -108,7 +108,7 @@ if [[ -f "$CURRENT_UNIT" ]]; then
   CLAWS_USER=$(grep '^User=' "$CURRENT_UNIT" | cut -d= -f2)
   CLAWS_PATH=$(grep '^Environment=PATH=' "$CURRENT_UNIT" | sed 's/^Environment=PATH=//')
   log "Reinstalling systemd units for $CLAWS_USER..."
-  sed "s/User=brendan/User=$CLAWS_USER/;s/Group=brendan/Group=$CLAWS_USER/;s|/home/brendan/|$CLAWS_HOME/|" \
+  sed "s/User=user/User=$CLAWS_USER/;s/Group=user/Group=$CLAWS_USER/;s|/home/user/|$CLAWS_HOME/|" \
     "$INSTALL_DIR/deploy/claws.service" | \
     sed "/\[Service\]/a Environment=PATH=$CLAWS_PATH" | \
     tee /etc/systemd/system/claws.service >/dev/null

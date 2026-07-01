@@ -128,7 +128,7 @@ async function processVegBoxEmail(client: ImapFlow, uid: number): Promise<void> 
     guardContent(emailBody, guardCtx("email-body")),
   ].join("\n");
 
-  const vegListResult = await claude.runClaude(extractPrompt, process.cwd(), { capability: "text-only", tier: "sonnet", agent: "plan" });
+  const vegListResult = await claude.runClaude(extractPrompt, process.cwd(), { capability: "text-only", tier: "sonnet", agent: "plan", provider: "claude" });
 
   const vegList = vegListResult.trim();
 
@@ -154,7 +154,7 @@ async function processVegBoxEmail(client: ImapFlow, uid: number): Promise<void> 
     vegList,
   ].join("\n");
 
-  const recipes = await claude.runClaude(recipePrompt, process.cwd(), { capability: "text-only", tier: "sonnet", agent: "plan" });
+  const recipes = await claude.runClaude(recipePrompt, process.cwd(), { capability: "text-only", tier: "sonnet", agent: "plan", provider: "claude" });
 
   // Step 3: Send recipe email
   const today = new Date().toISOString().slice(0, 10);

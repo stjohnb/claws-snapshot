@@ -437,3 +437,67 @@ describe("buildQueuePage refined button", () => {
     expect(html).toContain("Claws Ignore");
   });
 });
+
+describe("buildQueuePage ordering", () => {
+  const makeOrderItem = (
+    category: QueueItem["category"],
+    type: QueueItem["type"],
+    number: number,
+    updatedAt: string,
+  ): QueueItem => ({
+    repo: "org/repo",
+    number,
+    title: `Item ${number}`,
+    category,
+    updatedAt,
+    type,
+  });
+
+  const fetchAt = Date.now();
+
+  it("PRs render before issues regardless of updatedAt", () => {
+    const issue = makeOrderItem("refined", "issue", 1, "2024-01-03T00:00:00Z");
+    const pr = makeOrderItem("refined", "pr", 2, "2024-01-01T00:00:00Z"); // older than issue
+    const html = buildQueuePage(
+      { items: [], oldestFetchAt: null },
+      { items: [issue, pr], oldestFetchAt: fetchAt },
+      "light",
+    );
+    // Use queue-item IDs which are unique and unambiguous in the rendered HTML
+    expect(html.indexOf('id="item-org/repo-2"')).toBeLessThan(html.indexOf('id="item-org/repo-1"'));
+  });
+
+  it("within PRs, newer updatedAt renders first", () => {
+    const olderPR = makeOrderItem("auto-mergeable", "pr", 10, "2024-01-01T00:00:00Z");
+    const newerPR = makeOrderItem("needs-review-addressing", "pr", 11, "2024-01-02T00:00:00Z");
+    const html = buildQueuePage(
+      { items: [], oldestFetchAt: null },
+      { items: [olderPR, newerPR], oldestFetchAt: fetchAt },
+      "light",
+    );
+    expect(html.indexOf('id="item-org/repo-11"')).toBeLessThan(html.indexOf('id="item-org/repo-10"'));
+  });
+
+  it("within issues, newer updatedAt renders first", () => {
+    const olderIssue = makeOrderItem("needs-refinement", "issue", 20, "2024-01-01T00:00:00Z");
+    const newerIssue = makeOrderItem("refined", "issue", 21, "2024-01-02T00:00:00Z");
+    const html = buildQueuePage(
+      { items: [], oldestFetchAt: null },
+      { items: [olderIssue, newerIssue], oldestFetchAt: fetchAt },
+      "light",
+    );
+    expect(html.indexOf('id="item-org/repo-21"')).toBeLessThan(html.indexOf('id="item-org/repo-20"'));
+  });
+
+  it("renders queue-label category badge for each item", () => {
+    const item = makeOrderItem("refined", "issue", 30, "2024-01-01T00:00:00Z");
+    const html = buildQueuePage(
+      { items: [], oldestFetchAt: null },
+      { items: [item], oldestFetchAt: fetchAt },
+      "light",
+    );
+    expect(html).toContain('class="queue-label"');
+    // "Refined" is the CATEGORY_DISPLAY label for "refined"
+    expect(html).toContain("Refined");
+  });
+});

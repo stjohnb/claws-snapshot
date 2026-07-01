@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { LABELS, type Repo } from "../config.js";
-import { runRepoScanner, type ScannerSpec } from "./scanner-runner.js";
+import { renderViolationTable, runRepoScanner, type ScannerSpec } from "./scanner-runner.js";
 
 interface Violation {
   dir: string;
@@ -110,30 +110,27 @@ function scanMigrationDir(dirPath: string, repoDir: string): Violation | null {
 }
 
 function formatIssueBody(violations: Violation[]): string {
-  const lines = [
-    "The following directories contain migration files using incremental numbering instead of date stamps.\n",
-    "| Directory | Example files | Total |",
-    "|-----------|--------------|-------|",
-  ];
-
-  for (const v of violations) {
-    const examples = v.files.map((f) => `\`${f}\``).join(", ");
-    lines.push(`| \`${v.dir}\` | ${examples} | ${v.totalCount} |`);
-  }
-
-  lines.push(
-    "",
-    "**Why this matters:** Incrementally numbered migrations cause merge conflicts when concurrent PRs add migrations — both PRs may claim the same number. Date-stamped migrations avoid this entirely and support out-of-order application.",
-    "",
-    "**Recommended convention:**",
-    "- Use `YYYYMMDDHHMMSS_description.ext` filenames (e.g. `20260321143000_add_orders.ts`)",
-    "- The migration runner discovers files by scanning the directory (no barrel/index file)",
-    "- Track applied migrations by name in a `schema_migrations` table",
-    "- Apply any unapplied migration regardless of whether later-timestamped migrations have already run",
-    "- Each migration file exports an `up()` function (or equivalent)",
-  );
-
-  return lines.join("\n");
+  return renderViolationTable({
+    intro:
+      "The following directories contain migration files using incremental numbering instead of date stamps.\n",
+    columns: ["Directory", "Example files", "Total"],
+    rows: violations,
+    cells: (v) => [
+      `\`${v.dir}\``,
+      v.files.map((f) => `\`${f}\``).join(", "),
+      String(v.totalCount),
+    ],
+    footer: [
+      "**Why this matters:** Incrementally numbered migrations cause merge conflicts when concurrent PRs add migrations — both PRs may claim the same number. Date-stamped migrations avoid this entirely and support out-of-order application.",
+      "",
+      "**Recommended convention:**",
+      "- Use `YYYYMMDDHHMMSS_description.ext` filenames (e.g. `20260321143000_add_orders.ts`)",
+      "- The migration runner discovers files by scanning the directory (no barrel/index file)",
+      "- Track applied migrations by name in a `schema_migrations` table",
+      "- Apply any unapplied migration regardless of whether later-timestamped migrations have already run",
+      "- Each migration file exports an `up()` function (or equivalent)",
+    ],
+  });
 }
 
 function scanRepo(repoDir: string, repo: Repo): { body: string; summary?: string } | null {

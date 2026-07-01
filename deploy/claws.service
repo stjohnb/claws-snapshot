@@ -4,10 +4,10 @@ After=network.target
 
 [Service]
 Type=simple
-User=brendan
-Group=brendan
+User=user
+Group=user
 WorkingDirectory=/opt/claws
-EnvironmentFile=-/home/brendan/.claws/env
+EnvironmentFile=-/home/user/.claws/env
 ExecStart=/usr/bin/node /opt/claws/dist/main.js
 Restart=on-failure
 RestartSec=5
@@ -16,7 +16,7 @@ TimeoutStopSec=330
 KillMode=process
 MemoryHigh=2.5G
 MemoryMax=3G
-TasksMax=400
+TasksMax=800
 CPUWeight=80
 OOMScoreAdjust=200
 

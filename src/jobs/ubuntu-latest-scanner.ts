@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { LABELS, type Repo } from "../config.js";
-import { runRepoScanner, type ScannerSpec } from "./scanner-runner.js";
+import { renderViolationTable, runRepoScanner, type ScannerSpec } from "./scanner-runner.js";
 import { listWorkflowFiles } from "./workflow-parser.js";
 
 interface Violation {
@@ -55,22 +55,16 @@ function scanWorkflowFile(filePath: string): Violation[] {
 }
 
 function formatIssueBody(violations: Violation[]): string {
-  const lines = [
-    "The following workflow files use GitHub-hosted runners. All GitHub Actions workflows should use `self-hosted` runners.\n",
-    "| File | Line | `runs-on` value |",
-    "|------|------|-----------------|",
-  ];
-
-  for (const v of violations) {
-    lines.push(`| \`${v.file}\` | ${v.line} | \`${v.value}\` |`);
-  }
-
-  lines.push(
-    "",
-    "Please update these workflows to use `runs-on: self-hosted` (or `runs-on: [self-hosted, ...]`).",
-  );
-
-  return lines.join("\n");
+  return renderViolationTable({
+    intro:
+      "The following workflow files use GitHub-hosted runners. All GitHub Actions workflows should use `self-hosted` runners.\n",
+    columns: ["File", "Line", "`runs-on` value"],
+    rows: violations,
+    cells: (v) => [`\`${v.file}\``, String(v.line), `\`${v.value}\``],
+    footer: [
+      "Please update these workflows to use `runs-on: self-hosted` (or `runs-on: [self-hosted, ...]`).",
+    ],
+  });
 }
 
 function scan(repoDir: string, repo: Repo): { body: string; summary?: string } | null {

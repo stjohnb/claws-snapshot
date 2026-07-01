@@ -9,11 +9,11 @@ import * as db from "../db.js";
 import * as slack from "../slack.js";
 import { reportError } from "../error-reporter.js";
 import * as smartSchedule from "../smart-schedule.js";
-import { guardContent, makeGuardCtx } from "../prompt-guard.js";
+import { formatGuardedTitleList, guardContent, makeGuardCtx } from "../prompt-guard.js";
 import { MARKETING_RESOURCE } from "../resources/marketing.js";
 import { getModel } from "../model-selector.js";
 import { sleep } from "../util.js";
-import { extractJsonCandidates } from "../json-extract.js";
+import { parseFirstValidJson } from "../json-extract.js";
 
 const MAX_IDEAS_TEXT_BYTES = 50_000;
 const MAX_IDEAS_PER_REPO = 5;
@@ -179,15 +179,8 @@ export function buildPrompt(
   declaredFocusAreas: string[] = [],
 ): string {
   const guardCtx = makeGuardCtx(fullName, 0);
-  const issueList =
-    openIssueTitles.length > 0
-      ? openIssueTitles.map((t) => `  - ${guardContent(t, guardCtx("issue-title"))}`).join("\n")
-      : "  (none)";
-
-  const prList =
-    openPRTitles.length > 0
-      ? openPRTitles.map((t) => `  - ${guardContent(t, guardCtx("pr-title"))}`).join("\n")
-      : "  (none)";
+  const issueList = formatGuardedTitleList(openIssueTitles, guardCtx, "issue-title");
+  const prList = formatGuardedTitleList(openPRTitles, guardCtx, "pr-title");
 
   const existingSection = existingIdeasText
     ? [
@@ -272,36 +265,21 @@ export function buildPrompt(
 export function parseSuggestions(output: string): Suggestions {
   const empty: Suggestions = { focusAreas: [], ideas: {} };
 
-  const candidates = extractJsonCandidates(output);
-  if (candidates.length === 0) {
-    log.warn("[idea-suggester] Could not find JSON in Claude output");
-    return empty;
+  const data = parseFirstValidJson(output, SuggestionsResponseSchema, "idea-suggester");
+  if (!data) return empty;
+
+  const focusAreas = (data.focusAreas ?? []).filter(
+    (a): a is string => typeof a === "string",
+  );
+  const ideas: Record<string, Idea[]> = {};
+  for (const [area, entries] of Object.entries(data.ideas ?? {})) {
+    const valid = entries
+      .map((item) => IdeaSchema.safeParse(item))
+      .filter((r): r is z.ZodSafeParseSuccess<Idea> => r.success)
+      .map((r) => r.data);
+    if (valid.length > 0) ideas[area] = valid;
   }
-
-  for (const candidate of candidates) {
-    try {
-      const result = SuggestionsResponseSchema.safeParse(JSON.parse(candidate));
-      if (!result.success) continue;
-
-      const focusAreas = (result.data.focusAreas ?? []).filter(
-        (a): a is string => typeof a === "string",
-      );
-      const ideas: Record<string, Idea[]> = {};
-      for (const [area, entries] of Object.entries(result.data.ideas ?? {})) {
-        const valid = entries
-          .map((item) => IdeaSchema.safeParse(item))
-          .filter((r): r is z.ZodSafeParseSuccess<Idea> => r.success)
-          .map((r) => r.data);
-        if (valid.length > 0) ideas[area] = valid;
-      }
-      return { focusAreas, ideas };
-    } catch {
-      continue;
-    }
-  }
-
-  log.warn("[idea-suggester] Could not parse JSON from any candidate in Claude output");
-  return empty;
+  return { focusAreas, ideas };
 }
 
 /** Flatten all ideas from a Suggestions object into a list with focus area attached, sorted by score descending. */
@@ -372,12 +350,7 @@ async function processRepoInner(repo: Repo): Promise<ProcessResult> {
       const prompt = buildPrompt(fullName, existingIdeasText, openIssueTitles, openPRTitles, MARKETING_RESOURCE, declaredFocusAreas);
       const model = getModel("sonnet", "text-only", "opencode");
       db.updateTaskModel(taskId, model);
-      let taskTokensUsed: number | undefined;
-      let taskCostUsd: number | undefined;
-      const output = await claude.runClaude(prompt, wt, { capability: "text-only", tier: "sonnet", model, agent: "plan", onTokensUsed: (t, c) => { taskTokensUsed = t; taskCostUsd = c; } });
-      if (taskTokensUsed !== undefined && taskCostUsd !== undefined) {
-        db.updateTaskTokenUsage(taskId, taskTokensUsed, taskCostUsd);
-      }
+      const output = await claude.runClaude(prompt, wt, { capability: "text-only", tier: "sonnet", model, agent: "plan", onTokensUsed: db.trackTaskTokens(taskId) });
 
       const suggestions = parseSuggestions(output);
 

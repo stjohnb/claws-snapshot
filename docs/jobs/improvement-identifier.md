@@ -42,30 +42,27 @@ Security findings are filed first (before improvement implementation). For each 
 
 Issues include a footer: *"Automated security review by claws improvement-identifier"*
 
-## Phase 2B: Implement improvements
+## Phase 2B: File improvement issues
 
-Suggested improvements (up to 10 per run) are implemented **concurrently** via `Promise.allSettled`.
+Suggested improvements (up to 10 per run) are filed as GitHub issues via `fileIssueIfAbsent`
+(no PRs are created — improvement-identifier no longer opens PRs).
 This phase is **skipped** if:
-- An open `claws/improve-*` PR already exists for this repo, OR
+- An open `claws/improve-*` PR already exists for this repo (legacy guard — no longer triggered), OR
 - At least one security finding was actually filed this tick (security priority lever)
 
-When security findings are filed, improvement implementation is deferred to the next tick.
-This ensures operator attention and Claude budget go toward security fixes first.
-If security findings are always filed, improvements never run until operators resolve the security issues.
+When security findings are filed, improvement filing is deferred to the next tick.
+This ensures operator attention goes toward security fixes first.
 
 Each improvement:
 
 - Searches existing issues **and PRs** for duplicates (skips if found)
-- Creates a fresh worktree on branch `claws/improve-<hex4>`
-- Instructs Claude to implement the specific improvement
-- If commits were produced: pushes the branch, creates a PR titled
-  `refactor: <improvement title>` (no labels applied)
+- Calls `gh.createIssue` with the improvement title and body (no labels applied)
 - Errors in one improvement do not block processing of others
 
 Conservative by design: only tangible improvements, no stylistic or
 documentation suggestions. "No improvements found" is acceptable.
 
-PRs include a footer: *"Automated improvement by claws improvement-identifier"*
+Issues include a footer: *"Automated improvement by claws improvement-identifier"*
 
 ## What it looks for
 
@@ -77,3 +74,16 @@ defense-in-depth speculation.
 **Improvements**: duplicate/near-duplicate logic, overcomplicated code, dead code,
 performance issues, missing error handling at system boundaries, stale TODOs/FIXMEs.
 No stylistic changes, type annotations, or documentation suggestions.
+
+**Web / SEO** (conditional): For repos that appear to serve user-facing web pages
+(detected by `*.html` files, static-site generator configs such as Hugo/Jekyll/Astro/Next.js,
+or output directories like `public/`, `static/`, `_site/`, `dist/`), the prompt also checks for:
+- Missing or incomplete JSON-LD structured data (`<script type="application/ld+json">`) using
+  schema.org types: `WebSite`, `Person`, `ProfilePage`, `BreadcrumbList`, `BlogPosting`, `Blog`,
+  `SoftwareApplication`, `CollectionPage`
+- Standard SEO basics: unique `<title>`, `<meta name="description">`, canonical link tags,
+  Open Graph (`og:*`) and Twitter Card meta tags, `sitemap.xml`, `robots.txt`, descriptive
+  `alt` text, semantic heading structure
+
+Findings are emitted as `improvements` entries (same JSON shape). Backend, library, CLI,
+and infra repos with no user-facing HTML are excluded from this check.

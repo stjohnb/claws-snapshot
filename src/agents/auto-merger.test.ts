@@ -534,6 +534,26 @@ describe("auto-merger", () => {
     expect(mockGh.removeQueueItem).toHaveBeenCalledWith(repo.fullName, pr.number);
   });
 
+  it("merges auto-bump PR touching deployment, migrate-job, and cleanup cronjob files", async () => {
+    const pr = mockPR({
+      headRefName: "automation/bump-bonkus-v2026-06-15.4",
+      labels: [{ name: "dependencies" }, { name: "auto-bump" }],
+    });
+    mockGh.getPRCheckStatus.mockResolvedValue("passing");
+    mockGh.getPRChangedFiles.mockResolvedValue([
+      "apps/bonkus/base/deployment.yaml",
+      "apps/bonkus/prod/cleanup-test-data-cronjob.yaml",
+      "apps/bonkus/prod/migrate-job.yaml",
+    ]);
+
+    const result = await tryMerge(repo, pr);
+
+    expect(result).toBe(true);
+    expect(mockGh.hasValidLGTM).not.toHaveBeenCalled();
+    expect(mockGh.mergePR).toHaveBeenCalledWith(repo.fullName, pr.number);
+    expect(mockGh.removeQueueItem).toHaveBeenCalledWith(repo.fullName, pr.number);
+  });
+
   it("does not merge auto-bump PR when checks are not passing", async () => {
     const pr = mockPR({
       headRefName: "automation/bump-bonkus-1.2.3",

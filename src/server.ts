@@ -38,7 +38,8 @@ import { buildUsagePage } from "./pages/usage.js";
 import { buildJobsMatrixPage, REPO_JOB_NAMES, OPT_IN_JOB_NAMES } from "./pages/jobs-matrix.js";
 import { buildVerifyPage } from "./pages/verify.js";
 import { runConnectivityVerification, loadLatestReport } from "./jobs/connectivity-verifier.js";
-import { createSession, getSession, listSessions, killSession, disconnectAllSessions, describeCreateSessionError, SESSION_MODES, type Session, type SessionMode } from "./sessions.js";
+import { createSession, createMultiWorktreeSession, getSession, listSessions, killSession, resumeSession, disconnectAllSessions, describeCreateSessionError, SESSION_MODES, type Session, type SessionMode } from "./sessions.js";
+import { validCapabilityIds } from "./capabilities.js";
 import { buildSessionsListPage, buildSessionTerminalPage } from "./pages/sessions.js";
 import { buildHaUpgraderPage } from "./pages/ha-upgrader.js";
 import { buildK8sPage, type K8sClusterView } from "./pages/k8s.js";
@@ -52,11 +53,10 @@ const ALPINE_JS_ETAG = `"${crypto.createHash("sha256").update(ALPINE_JS_SOURCE).
 const TAILWIND_CSS_ETAG = `"${crypto.createHash("sha256").update(TAILWIND_CSS_SOURCE).digest("hex").slice(0, 16)}"`;
 
 // Re-export for backwards compatibility with tests and other consumers
-export { formatUptime, formatRelativeTime } from "./pages/layout.js";
+export { formatUptime } from "./pages/layout.js";
 export type { Theme } from "./pages/layout.js";
 export { buildQueuePage } from "./pages/queue.js";
 export { buildLogsListPage, buildLogDetailPage, buildIssueLogsPage } from "./pages/logs.js";
-export { buildTopologyPage } from "./pages/topology.js";
 
 const startedAt = new Date().toISOString();
 
@@ -230,6 +230,23 @@ function parseFormBody(body: string): Record<string, string> {
     }
   }
   return params;
+}
+
+/** Parse all values for a repeated form key (parseFormBody keeps only the last). */
+function parseFormBodyMulti(body: string, key: string): string[] {
+  const out: string[] = [];
+  for (const pair of body.split("&")) {
+    const eq = pair.indexOf("=");
+    if (eq < 0) continue;
+    try {
+      const k = decodeURIComponent(pair.slice(0, eq));
+      if (k !== key) continue;
+      out.push(decodeURIComponent(pair.slice(eq + 1).replace(/\+/g, " ")));
+    } catch {
+      continue;
+    }
+  }
+  return out;
 }
 
 /** Strip control characters and truncate to prevent confusing audit messages from crafted URL paths. */
@@ -557,6 +574,19 @@ function registerRoutes(
         log.error("OIDC userinfo: missing sub claim");
         return htmlOk(c, "Authentication failed: user identity missing.", 502);
       }
+
+      // No in-app identity allowlist by design. Dashboard authorization is
+      // enforced upstream by the Authentik group policy bindings for the
+      // claws-app application (fleet-infra:
+      // apps/authentik/configmap-blueprints.yaml, "Claws bindings"), which
+      // restrict completion of OIDC authorization to members of group-infra
+      // or group-all-apps (policy_engine_mode: any). A user who can merely
+      // authenticate to the IdP but is not in those groups is rejected at the
+      // application-authorization step and never reaches this callback with a
+      // valid code, so any sub/email arriving here is already authorized.
+      // Adding a second allowlist here would duplicate that version-controlled
+      // authorization across two systems (drift hazard) for a single-tenant
+      // deployment. See issue #1792.
 
       const expiresAt = Date.now() + 24 * 60 * 60 * 1000;
       const sessionValue = signSession(userinfo.sub, expiresAt, config.OIDC_CLIENT_SECRET);
@@ -897,53 +927,59 @@ function registerRoutes(
     const body = await readTextBody(c);
     const params = parseFormBody(body);
 
-    const repos = await listRepos();
-    const newDisabled: Record<string, string[]> = {};
-    const newEnabled: Record<string, string[]> = {};
+    try {
+      const repos = await listRepos();
+      const newDisabled: Record<string, string[]> = {};
+      const newEnabled: Record<string, string[]> = {};
 
-    for (const repo of repos) {
-      const disabledJobs: string[] = [];
-      const enabledOptInJobs: string[] = [];
-      for (const job of REPO_JOB_NAMES) {
-        const fieldName = `${repo.fullName}::${job}`;
-        const checked = params[fieldName] === "true";
-        if (OPT_IN_JOB_NAMES.has(job)) {
-          if (checked) enabledOptInJobs.push(job);
-        } else {
-          if (!checked) disabledJobs.push(job);
+      for (const repo of repos) {
+        const disabledJobs: string[] = [];
+        const enabledOptInJobs: string[] = [];
+        for (const job of REPO_JOB_NAMES) {
+          const fieldName = `${repo.fullName}::${job}`;
+          const checked = params[fieldName] === "true";
+          if (OPT_IN_JOB_NAMES.has(job)) {
+            if (checked) enabledOptInJobs.push(job);
+          } else {
+            if (!checked) disabledJobs.push(job);
+          }
+        }
+        if (disabledJobs.length > 0) {
+          newDisabled[repo.fullName] = disabledJobs;
+        }
+        if (enabledOptInJobs.length > 0) {
+          newEnabled[repo.fullName] = enabledOptInJobs;
         }
       }
-      if (disabledJobs.length > 0) {
-        newDisabled[repo.fullName] = disabledJobs;
-      }
-      if (enabledOptInJobs.length > 0) {
-        newEnabled[repo.fullName] = enabledOptInJobs;
-      }
-    }
 
-    const existingDisabled = config.DISABLED_JOBS_BY_REPO;
-    for (const [repoFullName, jobs] of Object.entries(existingDisabled)) {
-      if (!repos.some((r) => r.fullName === repoFullName) && jobs.length > 0) {
-        newDisabled[repoFullName] = [...jobs];
+      const existingDisabled = config.DISABLED_JOBS_BY_REPO;
+      for (const [repoFullName, jobs] of Object.entries(existingDisabled)) {
+        if (!repos.some((r) => r.fullName === repoFullName) && jobs.length > 0) {
+          newDisabled[repoFullName] = [...jobs];
+        }
       }
-    }
-    const existingEnabled = config.ENABLED_JOBS_BY_REPO;
-    for (const [repoFullName, jobs] of Object.entries(existingEnabled)) {
-      if (!repos.some((r) => r.fullName === repoFullName) && jobs.length > 0) {
-        newEnabled[repoFullName] = [...jobs];
+      const existingEnabled = config.ENABLED_JOBS_BY_REPO;
+      for (const [repoFullName, jobs] of Object.entries(existingEnabled)) {
+        if (!repos.some((r) => r.fullName === repoFullName) && jobs.length > 0) {
+          newEnabled[repoFullName] = [...jobs];
+        }
       }
+
+      writeConfig({ disabledJobsByRepo: newDisabled, enabledJobsByRepo: newEnabled });
+
+      if (config.NOTIFY_DASHBOARD_ACTIONS) {
+        const ip = getClientIP(c);
+        const totalDisabled = Object.values(newDisabled).reduce((sum, arr) => sum + arr.length, 0);
+        const totalEnabled = Object.values(newEnabled).reduce((sum, arr) => sum + arr.length, 0);
+        notify(`[dashboard] Job toggles updated: ${totalDisabled} disabled, ${totalEnabled} opt-in enabled (by ${sanitizeForNotification(ip)})`);
+      }
+
+      return c.redirect("/jobs?saved=1", 303);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`Failed to save job toggles: ${message}`);
+      return c.redirect("/jobs", 303);
     }
-
-    writeConfig({ disabledJobsByRepo: newDisabled, enabledJobsByRepo: newEnabled });
-
-    if (config.NOTIFY_DASHBOARD_ACTIONS) {
-      const ip = getClientIP(c);
-      const totalDisabled = Object.values(newDisabled).reduce((sum, arr) => sum + arr.length, 0);
-      const totalEnabled = Object.values(newEnabled).reduce((sum, arr) => sum + arr.length, 0);
-      notify(`[dashboard] Job toggles updated: ${totalDisabled} disabled, ${totalEnabled} opt-in enabled (by ${sanitizeForNotification(ip)})`);
-    }
-
-    return c.redirect("/jobs?saved=1", 303);
   });
 
   app.post("/config/remove-unknown-keys", authMiddleware, (c) => {
@@ -985,8 +1021,6 @@ function registerRoutes(
     if (params["slackWebhook"] !== undefined) updates.slackWebhook = params["slackWebhook"];
     if (params["slackBotToken"] !== undefined) updates.slackBotToken = params["slackBotToken"];
     if (params["slackIdeasChannel"] !== undefined) updates.slackIdeasChannel = params["slackIdeasChannel"];
-    if (params["kwyjiboBaseUrl"] !== undefined) updates.kwyjiboBaseUrl = params["kwyjiboBaseUrl"];
-    if (params["kwyjiboApiKey"] !== undefined) updates.kwyjiboApiKey = params["kwyjiboApiKey"];
     if (params["whatsappAllowedNumbers"] !== undefined) {
       updates.whatsappAllowedNumbers = params["whatsappAllowedNumbers"].split(",").map((s) => s.trim()).filter(Boolean);
     }
@@ -1155,7 +1189,8 @@ function registerRoutes(
       return textPlain(c, "Invalid mode", 400);
     }
     const mode = rawMode as SessionMode;
-    const result = await createSession(repo, mode);
+    const capabilities = validCapabilityIds(parseFormBodyMulti(body, "capability"));
+    const result = await createSession(repo, mode, capabilities);
     if (!result.ok) {
       const status = result.reason === "shutting-down" ? 503
         : result.reason === "repo-required-for-mode" ? 400
@@ -1165,7 +1200,27 @@ function registerRoutes(
     }
     const session = result.session;
     if (config.NOTIFY_DASHBOARD_ACTIONS) {
-      notify(`[dashboard] Session created: ${session.id.slice(0, 8)} (${session.cwd}, mode=${mode}) (from ${sanitizeForNotification(getClientIP(c))})`);
+      notify(`[dashboard] Session created: ${session.id.slice(0, 8)} (${session.cwd}, mode=${mode}, caps=${capabilities.join(",") || "none"}) (from ${sanitizeForNotification(getClientIP(c))})`);
+    }
+    return c.redirect(`/sessions/${session.id}`, 303);
+  });
+
+  app.post("/sessions/create-multi", authMiddleware, async (c) => {
+    const body = await readTextBody(c);
+    const repos = parseFormBodyMulti(body, "repo").filter(Boolean);
+    const capabilities = validCapabilityIds(parseFormBodyMulti(body, "capability"));
+    const result = await createMultiWorktreeSession(repos, capabilities);
+    if (!result.ok) {
+      const status = result.reason === "shutting-down" ? 503
+        : result.reason === "too-few-repos" ? 400
+        : result.reason === "repo-not-found" || result.reason === "repo-not-listed" ? 404
+        : 500;
+      return textPlain(c, `Cannot create session: ${describeCreateSessionError(result)}`, status);
+    }
+    const session = result.session;
+    if (config.NOTIFY_DASHBOARD_ACTIONS) {
+      const notifyRepos = [session.repo, ...session.extraWorktrees.map(w => w.repo)].filter(Boolean).join(", ");
+      notify(`[dashboard] Multi-repo session created: ${session.id.slice(0, 8)} (${notifyRepos}, caps=${capabilities.join(",") || "none"}) (from ${sanitizeForNotification(getClientIP(c))})`);
     }
     return c.redirect(`/sessions/${session.id}`, 303);
   });
@@ -1183,6 +1238,24 @@ function registerRoutes(
       notify(`[dashboard] Session killed: ${id.slice(0, 8)} (from ${sanitizeForNotification(getClientIP(c))})`);
     }
     return c.redirect("/sessions", 303);
+  });
+
+  app.post("/sessions/:id/resume", authMiddleware, async (c) => {
+    const id = c.req.param("id");
+    if (!/^[a-f0-9]+$/.test(id)) {
+      return textPlain(c, "Not found", 404);
+    }
+    const result = await resumeSession(id);
+    if (!result.ok) {
+      const status = result.reason === "shutting-down" ? 503
+        : result.reason === "repo-not-found" || result.reason === "repo-not-listed" ? 404
+        : 500;
+      return textPlain(c, `Cannot resume session: ${describeCreateSessionError(result)}`, status);
+    }
+    if (config.NOTIFY_DASHBOARD_ACTIONS) {
+      notify(`[dashboard] Session resumed: ${id.slice(0, 8)} (from ${sanitizeForNotification(getClientIP(c))})`);
+    }
+    return c.redirect(`/sessions/${id}`, 303);
   });
 
   app.post("/logs/:runId/cancel", authMiddleware, (c) => {
@@ -1601,13 +1674,17 @@ function registerRoutes(
   });
 
   // /logs/issue must come BEFORE /logs/:runId so it isn't captured as a runId.
-  app.get("/logs/issue", authMiddleware, (c) => {
+  app.get("/logs/issue", authMiddleware, async (c) => {
     const theme = getTheme(c);
     const repoParam = c.req.query("repo");
     const numberParam = c.req.query("number");
     const num = parseInt(numberParam ?? "", 10);
     if (!repoParam || !numberParam || !Number.isFinite(num) || num < 1) {
       return textPlain(c, "Missing or invalid repo/number query params", 400);
+    }
+    const repos = await listRepos();
+    if (!repos.some((r) => r.fullName === repoParam)) {
+      return c.body(null, 404);
     }
     const runs = getRunsForIssue(repoParam, num);
     const runIds = runs.map((r) => r.run_id);

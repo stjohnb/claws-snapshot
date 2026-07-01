@@ -10,25 +10,18 @@ import * as log from "../log.js";
 import * as db from "../db.js";
 import { reportError } from "../error-reporter.js";
 import * as smartSchedule from "../smart-schedule.js";
-import { guardContent, makeGuardCtx } from "../prompt-guard.js";
+import { formatGuardedTitleList, makeGuardCtx } from "../prompt-guard.js";
 import { getModel } from "../model-selector.js";
 import { classifyComplexity } from "../classify-complexity.js";
-import { extractJsonCandidates } from "../json-extract.js";
+import { parseFirstValidJson } from "../json-extract.js";
 
 const MAX_IMPROVEMENTS_PER_RUN = 10;
 const MAX_FINDINGS_PER_RUN = 5;
 
 export function buildPrompt(fullName: string, openIssueTitles: string[], openPRTitles: string[], isPrivate: boolean): string {
   const guardCtx = makeGuardCtx(fullName, 0);
-  const issueList =
-    openIssueTitles.length > 0
-      ? openIssueTitles.map((t) => `  - ${guardContent(t, guardCtx("issue-title"))}`).join("\n")
-      : "  (none)";
-
-  const prList =
-    openPRTitles.length > 0
-      ? openPRTitles.map((t) => `  - ${guardContent(t, guardCtx("pr-title"))}`).join("\n")
-      : "  (none)";
+  const issueList = formatGuardedTitleList(openIssueTitles, guardCtx, "issue-title");
+  const prList = formatGuardedTitleList(openPRTitles, guardCtx, "pr-title");
 
   return [
     `You are analyzing the repository ${fullName} for security issues and improvement opportunities.`,
@@ -80,6 +73,35 @@ export function buildPrompt(fullName: string, openIssueTitles: string[], openPRT
     `- Group related improvements into a single suggestion when they should be addressed together.`,
     `- Each suggestion should be specific and actionable, referencing exact files and line numbers.`,
     ``,
+    `### Web / SEO improvements (conditional)`,
+    ``,
+    `ONLY consider this section if the repository actually serves user-facing web pages or`,
+    `generates a static site. Detect this by looking for: HTML files (\`*.html\`), a static-site`,
+    `generator config (Hugo, Jekyll, Astro, Next.js, Gatsby, Eleventy/11ty, Hexo, etc.), a`,
+    `\`public/\`, \`static/\`, \`_site/\`, or \`dist/\` web-output directory, or templates that emit`,
+    `\`<head>\`/\`<html>\`. If the repo is a backend service, library, CLI, infra, or config repo`,
+    `with NO user-facing HTML, SKIP this section entirely and report nothing for it.`,
+    ``,
+    `When the repo IS a website, check whether each rendered page does its best on SEO and`,
+    `structured data, and suggest concrete fixes where it falls short:`,
+    `- JSON-LD structured data via \`<script type="application/ld+json">\` in the page \`<head>\`,`,
+    `  using appropriate schema.org types: WebSite, Person, ProfilePage, BreadcrumbList,`,
+    `  BlogPosting, Blog, SoftwareApplication, CollectionPage. Start minimal (WebSite + Person`,
+    `  + ProfilePage on the root/home page) rather than over-engineering.`,
+    `- Node \`@id\` values using the URL-with-hash pattern (e.g. \`https://site/#person\`) so`,
+    `  properties merge across pages, and \`sameAs\` linking social/external profiles.`,
+    `- Standard SEO basics where missing: unique \`<title>\`, \`<meta name="description">\`,`,
+    `  canonical link tags, Open Graph (\`og:*\`) and Twitter Card meta tags, \`sitemap.xml\`,`,
+    `  \`robots.txt\`, descriptive \`alt\` text on images, and semantic heading structure.`,
+    ``,
+    `Web/SEO guidelines:`,
+    `- Report these as \`improvements\` entries (same JSON shape below). There is no separate`,
+    `  output field for SEO.`,
+    `- Be specific: name the exact file(s) and what JSON-LD/meta block to add, with a concrete`,
+    `  example snippet in the body. Do NOT file a vague "improve SEO" suggestion.`,
+    `- Only suggest what is genuinely missing or substandard — if the site already has solid`,
+    `  JSON-LD and meta tags, report nothing here.`,
+    ``,
     `The following issues are already open in this repository — do NOT re-suggest these:`,
     issueList,
     ``,
@@ -127,40 +149,18 @@ export function parseReviewOutput(
   output: string,
   onFailure?: (err: unknown, candidates: string[]) => void,
 ): { securityFindings: ReviewItem[]; improvements: ReviewItem[] } {
-  const candidates = extractJsonCandidates(output);
+  const data = parseFirstValidJson(output, ResponseSchema, "improvement-identifier", onFailure);
+  if (!data) return { securityFindings: [], improvements: [] };
 
-  if (candidates.length === 0) {
-    const err = new Error("No JSON candidates found in Claude output");
-    log.warn(`[improvement-identifier] ${err.message}`);
-    onFailure?.(err, []);
-    return { securityFindings: [], improvements: [] };
-  }
-
-  let lastErr: unknown;
-  for (const candidate of candidates) {
-    try {
-      const result = ResponseSchema.safeParse(JSON.parse(candidate));
-      if (!result.success) {
-        lastErr = new Error(`Schema validation failed: ${result.error.message}`);
-        continue;
-      }
-      const securityFindings = (result.data.securityFindings ?? [])
-        .map((item) => ReviewItemSchema.safeParse(item))
-        .filter((r): r is z.ZodSafeParseSuccess<ReviewItem> => r.success)
-        .map((r) => r.data);
-      const improvements = (result.data.improvements ?? [])
-        .map((item) => ReviewItemSchema.safeParse(item))
-        .filter((r): r is z.ZodSafeParseSuccess<ReviewItem> => r.success)
-        .map((r) => r.data);
-      return { securityFindings, improvements };
-    } catch (err) {
-      lastErr = err;
-    }
-  }
-
-  log.warn(`[improvement-identifier] Failed to parse JSON: ${lastErr}`);
-  onFailure?.(lastErr, candidates);
-  return { securityFindings: [], improvements: [] };
+  const securityFindings = (data.securityFindings ?? [])
+    .map((item) => ReviewItemSchema.safeParse(item))
+    .filter((r): r is z.ZodSafeParseSuccess<ReviewItem> => r.success)
+    .map((r) => r.data);
+  const improvements = (data.improvements ?? [])
+    .map((item) => ReviewItemSchema.safeParse(item))
+    .filter((r): r is z.ZodSafeParseSuccess<ReviewItem> => r.success)
+    .map((r) => r.data);
+  return { securityFindings, improvements };
 }
 
 // Kept separate for traceability in GitHub issues and PR footers
@@ -244,14 +244,20 @@ async function processRepoInner(repo: Repo): Promise<void> {
       const model = getModel(analysisTier, "text-only", "claude");
       db.updateTaskModel(analysisTaskId, model);
       log.info(`[improvement-identifier] Using model "${model}" for analysis of ${fullName}`);
-      let analysisTokensUsed: number | undefined;
-      let analysisCostUsd: number | undefined;
-      const output = await claude.runClaude(prompt, analysisWt, { capability: "text-only", mcpConfig: analysisMcpConfig, tier: analysisTier, model, provider: "claude", agent: "plan", onTokensUsed: (t, c) => { analysisTokensUsed = t; analysisCostUsd = c; } });
-      if (analysisTokensUsed !== undefined && analysisCostUsd !== undefined) {
-        db.updateTaskTokenUsage(analysisTaskId, analysisTokensUsed, analysisCostUsd);
-      }
+      const output = await claude.runClaude(prompt, analysisWt, { capability: "text-only", mcpConfig: analysisMcpConfig, tier: analysisTier, model, provider: "claude", agent: "plan", onTokensUsed: db.trackTaskTokens(analysisTaskId) });
 
       const result = parseReviewOutput(output, (err, candidates) => {
+        // A complete fenced response ends with a closing ``` fence. If it does not,
+        // Claude's output was truncated (e.g. hit the max-tokens limit mid-JSON) and
+        // returned by the CLI as a non-error partial. That is a transient condition,
+        // not a parser/logic failure — warn and skip rather than filing an error issue.
+        const isTruncated = !output.trimEnd().endsWith("```");
+        if (isTruncated) {
+          log.warn(
+            `[improvement-identifier] Truncated/incomplete analysis output for ${fullName} — skipping parse, will retry next tick`,
+          );
+          return;
+        }
         const head = candidates[0]?.slice(0, 500) ?? "(no JSON candidates)";
         reportError(
           "improvement-identifier:parse-findings",

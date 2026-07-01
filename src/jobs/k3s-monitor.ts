@@ -1,11 +1,13 @@
 import { execFile } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { K3S_MONITOR_ENABLED, K3S_IGNORED_NODES, FLEET_INFRA_REPO, LABELS } from "../config.js";
+import type { KubeconfigRefresh } from "../config.js";
 import * as gh from "../github.js";
 import * as log from "../log.js";
 import { notify } from "../slack.js";
 import { reportError } from "../error-reporter.js";
 import { ensureAlertIssue } from "../occurrence-tracking.js";
+import { refreshKubeconfig, isStaleKubeconfigError } from "./kubeconfig-refresh.js";
 
 // ── Kubernetes types ──
 
@@ -262,6 +264,15 @@ export function detectPodAlerts(pods: K8sPod[], ignoredNodes: ReadonlyArray<stri
   return alerts;
 }
 
+function isNodeNotReady(node: K8sNode): boolean {
+  const ready = node.status.conditions.find((c) => c.type === "Ready");
+  return !ready || ready.status !== "True";
+}
+
+function countNodesNotReady(nodes: K8sNode[]): number {
+  return nodes.filter(isNodeNotReady).length;
+}
+
 export function detectNodeAlerts(nodes: K8sNode[], ignoredNodes: ReadonlyArray<string> = []): Alert[] {
   const alerts: Alert[] = [];
   const TWO_MINUTES_MS = 2 * 60 * 1000;
@@ -373,6 +384,7 @@ async function raiseAlert(alert: Alert, repo: string, logPrefix: string): Promis
 export interface K8sMonitorConfig {
   repo: string;
   kubeconfigPath?: string;
+  kubeconfigRefresh?: KubeconfigRefresh;
   ignoredNodes: ReadonlyArray<string>;
   logPrefix: string;
   tailLines?: number;
@@ -410,7 +422,7 @@ export function setDisabledStatus(logPrefix: string, repo: string, kubeconfigPat
 }
 
 export async function runK8sMonitor(config: K8sMonitorConfig): Promise<void> {
-  const { repo, kubeconfigPath, ignoredNodes, logPrefix, tailLines = 30 } = config;
+  const { repo, kubeconfigPath, kubeconfigRefresh, ignoredNodes, logPrefix, tailLines = 30 } = config;
 
   // Fetch nodes first so we can determine which ignored nodes are actually down.
   // Best-effort — don't abort the run if this fails.
@@ -422,6 +434,16 @@ export async function runK8sMonitor(config: K8sMonitorConfig): Promise<void> {
     log.warn(`[${logPrefix}] kubectl get nodes failed: ${err}`);
   }
 
+  const setErrorStatus = (err: unknown): void => {
+    statusByLogPrefix.set(logPrefix, {
+      logPrefix, repo, enabled: true, kubeconfigPath,
+      lastRunAt: null, lastError: String(err),
+      podCount: 0, nodeCount: fetchedNodes.length,
+      nodesNotReady: countNodesNotReady(fetchedNodes),
+      podAlertCount: 0, nodeAlertCount: 0, fluxAlertCount: 0, newIssuesRaised: 0,
+    });
+  };
+
   // Only suppress pods on an ignored node while that node is actually NotReady.
   // When fetchedNodes is empty (node fetch failed) we conservatively treat every
   // ignored node as down, preserving the old behaviour.
@@ -430,8 +452,7 @@ export async function runK8sMonitor(config: K8sMonitorConfig): Promise<void> {
       ? ignoredNodes.filter((nodeName) => {
           const node = fetchedNodes.find((n) => n.metadata.name === nodeName);
           if (!node) return true; // not visible in cluster → treat as down
-          const ready = node.status.conditions.find((c) => c.type === "Ready");
-          return !ready || ready.status !== "True";
+          return isNodeNotReady(node);
         })
       : [...ignoredNodes];
 
@@ -439,19 +460,31 @@ export async function runK8sMonitor(config: K8sMonitorConfig): Promise<void> {
   let podJson: string;
   try {
     podJson = await kubectlExec(["get", "pods", "--all-namespaces", "-o", "json"], kubeconfigPath);
-  } catch (err) {
-    log.warn(`[${logPrefix}] kubectl get pods failed: ${err}`);
-    try {
-      await reportError(`${logPrefix}:kubectl-get-pods`, "kubectl get pods --all-namespaces failed", err);
-    } catch { /* reporter failure must not crash the monitor */ }
-    statusByLogPrefix.set(logPrefix, {
-      logPrefix, repo, enabled: true, kubeconfigPath,
-      lastRunAt: null, lastError: String(err),
-      podCount: 0, nodeCount: fetchedNodes.length,
-      nodesNotReady: fetchedNodes.filter(n => { const r = n.status.conditions.find(c => c.type === "Ready"); return !r || r.status !== "True"; }).length,
-      podAlertCount: 0, nodeAlertCount: 0, fluxAlertCount: 0, newIssuesRaised: 0,
-    });
-    return;
+  } catch (firstErr) {
+    log.warn(`[${logPrefix}] kubectl get pods failed: ${firstErr}`);
+
+    // When the kubeconfig goes stale (cluster rebuilt → endpoint/cert changed),
+    // discover the current host via tailscale, SSH in, pull a fresh kubeconfig,
+    // and retry once. Best-effort: any failure falls through to reportError.
+    let recovered: string | null = null;
+    if (kubeconfigPath && kubeconfigRefresh && firstErr instanceof Error && isStaleKubeconfigError(firstErr)) {
+      try {
+        await refreshKubeconfig(kubeconfigRefresh, kubeconfigPath, logPrefix);
+        recovered = await kubectlExec(["get", "pods", "--all-namespaces", "-o", "json"], kubeconfigPath);
+        log.info(`[${logPrefix}] kubectl get pods succeeded after kubeconfig refresh`);
+      } catch (retryErr) {
+        log.warn(`[${logPrefix}] kubeconfig refresh + retry failed: ${retryErr}`);
+      }
+    }
+
+    if (recovered === null) {
+      try {
+        await reportError(`${logPrefix}:kubectl-get-pods`, "kubectl get pods --all-namespaces failed", firstErr);
+      } catch { /* reporter failure must not crash the monitor */ }
+      setErrorStatus(firstErr);
+      return;
+    }
+    podJson = recovered;
   }
 
   let pods: K8sPod[];
@@ -463,13 +496,7 @@ export async function runK8sMonitor(config: K8sMonitorConfig): Promise<void> {
     try {
       await reportError(`${logPrefix}:pods-json-parse`, "Failed to parse pods JSON from kubectl", err);
     } catch { /* reporter failure must not crash the monitor */ }
-    statusByLogPrefix.set(logPrefix, {
-      logPrefix, repo, enabled: true, kubeconfigPath,
-      lastRunAt: null, lastError: String(err),
-      podCount: 0, nodeCount: fetchedNodes.length,
-      nodesNotReady: fetchedNodes.filter(n => { const r = n.status.conditions.find(c => c.type === "Ready"); return !r || r.status !== "True"; }).length,
-      podAlertCount: 0, nodeAlertCount: 0, fluxAlertCount: 0, newIssuesRaised: 0,
-    });
+    setErrorStatus(err);
     return;
   }
 
@@ -533,10 +560,7 @@ export async function runK8sMonitor(config: K8sMonitorConfig): Promise<void> {
 
   log.info(`[${logPrefix}] Found ${allAlerts.length} alert(s), raised ${newIssues} new issue(s)`);
 
-  const nodesNotReady = fetchedNodes.filter(n => {
-    const r = n.status.conditions.find(c => c.type === "Ready");
-    return !r || r.status !== "True";
-  }).length;
+  const nodesNotReady = countNodesNotReady(fetchedNodes);
   statusByLogPrefix.set(logPrefix, {
     logPrefix, repo, enabled: true, kubeconfigPath,
     lastRunAt: new Date().toISOString(), lastError: null,

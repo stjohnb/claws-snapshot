@@ -43,6 +43,7 @@ const { mockFs, mockGh, mockClaude, mockDb, mockSlack } = vi.hoisted(() => ({
     updateTaskWorktree: vi.fn(),
     updateTaskModel: vi.fn(),
     updateTaskTokenUsage: vi.fn(),
+    trackTaskTokens: vi.fn().mockReturnValue(vi.fn()),
     recordTaskComplete: vi.fn(),
     recordTaskFailed: vi.fn(),
     markRepoProcessedDaily: vi.fn(),

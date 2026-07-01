@@ -16,10 +16,11 @@ import type { Repo } from "./config.js";
 import { runContext } from "./log.js";
 import * as issueAgent from "./jobs/issue-dispatcher.js";
 import * as prAgent from "./jobs/pr-dispatcher.js";
-import * as triageKwyjiboErrors from "./jobs/triage-kwyjibo-errors.js";
 import * as docMaintainer from "./jobs/doc-maintainer.js";
 import * as repoStandards from "./jobs/repo-standards.js";
 import * as improvementIdentifier from "./jobs/improvement-identifier.js";
+import * as publicRepoScanner from "./jobs/public-repo-scanner.js";
+import * as actionsStorageMonitor from "./jobs/actions-storage-monitor.js";
 import * as ideaSuggester from "./jobs/idea-suggester.js";
 import * as ideaCollector from "./jobs/idea-collector.js";
 import * as triageClawsErrors from "./jobs/triage-claws-errors.js";
@@ -32,10 +33,13 @@ import * as ideaReconciler from "./jobs/idea-reconciler.js";
 import * as emailMonitor from "./jobs/email-monitor.js";
 import * as qaPhase from "./jobs/qa-phase.js";
 import * as k3sMonitor from "./jobs/k3s-monitor.js";
+import * as dependabotAlertMonitor from "./jobs/dependabot-alert-monitor.js";
 import * as prodK8sMonitor from "./jobs/prod-k8s-monitor.js";
 import * as runnerMetricsSync from "./jobs/runner-metrics-sync.js";
 import * as haUpgrader from "./jobs/ha-upgrader.js";
 import * as haDeployWatcher from "./jobs/ha-deploy-watcher.js";
+import * as binDayMonitor from "./jobs/bin-day-monitor.js";
+import * as haBatteryMonitor from "./jobs/ha-battery-monitor.js";
 import * as worktreeCleaner from "./jobs/worktree-cleaner.js";
 import * as whatsapp from "./whatsapp.js";
 import { createHandler as createWhatsAppHandler } from "./jobs/whatsapp-handler.js";
@@ -44,6 +48,7 @@ import { sleep } from "./util.js";
 import { cancelCurrentTask } from "./claude.js";
 import { resetGitHubAppState, ensureGitHubAppConfigured } from "./github-app.js";
 import { reportError } from "./error-reporter.js";
+import { ensureAlertIssue } from "./occurrence-tracking.js";
 import { recoverSessions } from "./sessions.js";
 import { runConnectivityVerification } from "./jobs/connectivity-verifier.js";
 import { VERSION } from "./version.js";
@@ -106,35 +111,22 @@ if (unknownConfigKeys.length > 0) {
   if (Date.now() - lastReport >= COOLDOWN_MS) {
     const title = "[claws-config] Unknown keys in config.json";
     const keyList = unknownConfigKeys.map(k => `- \`${k}\``).join("\n");
-    gh.searchIssues(config.SELF_REPO, title).then(async results => {
-      const existing = results.find(r => r.title === title);
-      if (existing) {
-        const comment = [
-          `### Recurrence — ${new Date().toISOString()}`,
-          "",
-          "The following unknown keys are still present in `~/.claws/config.json` and will be discarded:",
-          "",
-          keyList,
-          "",
-          "Check for typos or remove keys that are no longer supported.",
-        ].join("\n");
-        await gh.commentOnIssue(config.SELF_REPO, existing.number, comment);
-      } else {
-        const body = [
-          "**Auto-created by Claws config validator**",
-          "",
-          `The following keys in \`~/.claws/config.json\` are not recognised by Claws and will be discarded:`,
-          "",
-          keyList,
-          "",
-          "Check for typos or remove keys that are no longer supported.",
-        ].join("\n");
-        await gh.createIssue(config.SELF_REPO, title, body, []);
-      }
-      fs.writeFileSync(stampFile, String(Date.now()));
-    }).catch(err => {
-      log.warn(`[config] Failed to report unknown config keys: ${err}`);
-    });
+    const body = [
+      "**Auto-created by Claws config validator**",
+      "",
+      "The following keys in `~/.claws/config.json` are not recognised by Claws and will be discarded:",
+      "",
+      keyList,
+      "",
+      "Check for typos or remove keys that are no longer supported.",
+    ].join("\n");
+    ensureAlertIssue({ repo: config.SELF_REPO, title, body, logPrefix: "config" })
+      .then(() => {
+        fs.writeFileSync(stampFile, String(Date.now()));
+      })
+      .catch(err => {
+        log.warn(`[config] Failed to report unknown config keys: ${err}`);
+      });
   }
 }
 
@@ -290,14 +282,6 @@ const jobs: Job[] = [
       await prAgent.run(repos);
     },
   },
-  {
-    name: "triage-kwyjibo-errors",
-    intervalMs: INTERVALS.triageKwyjiboErrorsMs,
-    async run() {
-      const repos = (await gh.listRepos()).filter(r => !config.isJobDisabledForRepo("triage-kwyjibo-errors", r.fullName));
-      await triageKwyjiboErrors.run(repos);
-    },
-  },
   smartScheduledJob("doc-maintainer", docMaintainer.processRepo),
   {
     name: "repo-standards",
@@ -310,6 +294,25 @@ const jobs: Job[] = [
     },
   },
   smartScheduledJob("improvement-identifier", improvementIdentifier.processRepo),
+  {
+    // Manages its own enumeration (incl. archived repos) and 7-day throttle, so
+    // it is NOT a smartScheduledBatchJob (those call gh.listRepos(), which skips
+    // archived repos).
+    name: "public-repo-scanner",
+    intervalMs: 0,
+    scheduledHour: SCHEDULES.publicRepoScannerHour,
+    async run() {
+      await publicRepoScanner.run();
+    },
+  },
+  {
+    name: "actions-storage-monitor",
+    intervalMs: 0,
+    scheduledHour: SCHEDULES.actionsStorageMonitorHour,
+    async run() {
+      await actionsStorageMonitor.run();
+    },
+  },
   smartScheduledJob("idea-suggester", ideaSuggester.processRepo, { skipWeekends: true }),
   {
     name: "idea-collector",
@@ -320,6 +323,7 @@ const jobs: Job[] = [
     },
   },
   smartScheduledJob("issue-auditor", issueAuditor.processRepo),
+  smartScheduledJob("dependabot-alert-monitor", dependabotAlertMonitor.processRepo),
   {
     name: "triage-claws-errors",
     intervalMs: INTERVALS.triageClawsErrorsMs,
@@ -400,6 +404,20 @@ const jobs: Job[] = [
     intervalMs: INTERVALS.worktreeCleanerMs,
     async run() {
       await worktreeCleaner.run();
+    },
+  },
+  {
+    name: "bin-day-monitor",
+    intervalMs: INTERVALS.binDayMonitorMs,
+    async run() {
+      await binDayMonitor.run();
+    },
+  },
+  {
+    name: "ha-battery-monitor",
+    intervalMs: INTERVALS.batteryMonitorMs,
+    async run() {
+      await haBatteryMonitor.run();
     },
   },
 ];

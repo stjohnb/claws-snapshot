@@ -60,6 +60,7 @@ const { mockGh, mockClaude, mockDb } = vi.hoisted(() => ({
     updateTaskWorktree: vi.fn(),
     updateTaskModel: vi.fn(),
     updateTaskTokenUsage: vi.fn(),
+    trackTaskTokens: vi.fn().mockReturnValue(vi.fn()),
     recordTaskComplete: vi.fn(),
     recordTaskFailed: vi.fn(),
     getRecentCIFixerErrors: vi.fn().mockReturnValue([]),
@@ -113,15 +114,35 @@ describe("problematic-pr-diagnoser", () => {
   const problematicPR = (overrides: Parameters<typeof mockPR>[0] = {}) =>
     mockPR({ labels: [{ name: "Claws Problematic" }], ...overrides });
 
-  it("dedup: skips when a prior diagnosis report comment exists", async () => {
+  it("dedup: skips diagnosis (and keeps label) when a prior report exists and CI still failing", async () => {
     const pr = problematicPR();
     mockGh.listPRs.mockResolvedValue([pr]);
     mockGh.getIssueComments.mockResolvedValue([
       { id: 1, body: `### 🩺 Problematic PR Diagnosis Report\n${DIAGNOSIS_COMMENT_MARKER}\n...`, login: "claws-bot" },
     ]);
+    mockGh.getFailingCheck.mockResolvedValue({ name: "build", state: "FAILURE" });
+    mockGh.getPRCheckStatus.mockResolvedValue("failing");
 
     await runDiagnosis(repo, pr);
 
+    expect(mockClaude.withExistingWorktree).not.toHaveBeenCalled();
+    expect(mockClaude.runClaude).not.toHaveBeenCalled();
+    expect(mockGh.commentOnIssue).not.toHaveBeenCalled();
+    expect(mockGh.removeLabel).not.toHaveBeenCalled();
+  });
+
+  it("dedup + green CI: removes stale problematic label without replaying diagnosis", async () => {
+    const pr = problematicPR();
+    mockGh.listPRs.mockResolvedValue([pr]);
+    mockGh.getIssueComments.mockResolvedValue([
+      { id: 1, body: `### 🩺 Problematic PR Diagnosis Report\n${DIAGNOSIS_COMMENT_MARKER}\n...`, login: "claws-bot" },
+    ]);
+    mockGh.getFailingCheck.mockResolvedValue(undefined);
+    mockGh.getPRCheckStatus.mockResolvedValue("passing");
+
+    await runDiagnosis(repo, pr);
+
+    expect(mockGh.removeLabel).toHaveBeenCalledWith(repo.fullName, pr.number, "Claws Problematic");
     expect(mockClaude.withExistingWorktree).not.toHaveBeenCalled();
     expect(mockClaude.runClaude).not.toHaveBeenCalled();
     expect(mockGh.commentOnIssue).not.toHaveBeenCalled();
@@ -148,6 +169,9 @@ describe("problematic-pr-diagnoser", () => {
     const pr = problematicPR();
     mockGh.listPRs.mockResolvedValue([pr]);
     mockGh.getFailedRunLog.mockResolvedValue("");
+    // CI is still pending (not green) — should yield no-fix-possible, not success
+    mockGh.getFailingCheck.mockResolvedValue(undefined);
+    mockGh.getPRCheckStatus.mockResolvedValue("pending");
 
     await runDiagnosis(repo, pr);
 
@@ -167,6 +191,44 @@ describe("problematic-pr-diagnoser", () => {
     );
     // Problematic label is NOT removed on no-fix-possible
     expect(mockGh.removeLabel).not.toHaveBeenCalled();
+  });
+
+  it("green CI on round 1 with no failure log: clears stale problematic label, posts success report, runs no rounds", async () => {
+    const pr = problematicPR();
+    mockGh.listPRs.mockResolvedValue([pr]);
+    mockGh.getFailedRunLog.mockResolvedValue("");
+    mockGh.getFailingCheck.mockResolvedValue(undefined);
+    mockGh.getPRCheckStatus.mockResolvedValue("passing");
+
+    await runDiagnosis(repo, pr);
+
+    expect(mockClaude.withExistingWorktree).not.toHaveBeenCalled();
+    expect(mockGh.removeLabel).toHaveBeenCalledWith(repo.fullName, pr.number, "Claws Problematic");
+    expect(mockGh.commentOnIssue).toHaveBeenCalledWith(
+      repo.fullName,
+      pr.number,
+      expect.stringContaining("Diagnosis succeeded"),
+      { agentName: "Problematic PR Diagnoser" },
+    );
+  });
+
+  it("green CI on round 1 with no failure log and no checks (status=none): clears stale problematic label", async () => {
+    const pr = problematicPR();
+    mockGh.listPRs.mockResolvedValue([pr]);
+    mockGh.getFailedRunLog.mockResolvedValue("");
+    mockGh.getFailingCheck.mockResolvedValue(undefined);
+    mockGh.getPRCheckStatus.mockResolvedValue("none");
+
+    await runDiagnosis(repo, pr);
+
+    expect(mockClaude.withExistingWorktree).not.toHaveBeenCalled();
+    expect(mockGh.removeLabel).toHaveBeenCalledWith(repo.fullName, pr.number, "Claws Problematic");
+    expect(mockGh.commentOnIssue).toHaveBeenCalledWith(
+      repo.fullName,
+      pr.number,
+      expect.stringContaining("Diagnosis succeeded"),
+      { agentName: "Problematic PR Diagnoser" },
+    );
   });
 
   it("success path: CI passes after round 1, removes problematic label, posts success report", async () => {

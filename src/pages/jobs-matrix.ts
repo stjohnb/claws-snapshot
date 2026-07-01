@@ -10,7 +10,6 @@ export const REPO_JOB_NAMES = [
   "issue-dispatcher",
   "pr-dispatcher",
   "ci-fixer",
-  "triage-kwyjibo-errors",
   "doc-maintainer",
   "repo-standards",
   "improvement-identifier",

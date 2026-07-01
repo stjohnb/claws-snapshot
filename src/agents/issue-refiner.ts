@@ -5,12 +5,25 @@ import * as log from "../log.js";
 import * as db from "../db.js";
 import { getItemTimeoutMs } from "../timeout-handler.js";
 import { processTextForImages } from "../images.js";
-import { RUNNER_POLICY_CONTEXT, homeAssistantContext } from "./agent-context.js";
+import { RUNNER_POLICY_CONTEXT, homeAssistantContext, formatIssueCommentsForPrompt } from "./agent-context.js";
 import { guardContent, makeGuardCtx } from "../prompt-guard.js";
 import { getModel, type ModelTier } from "../model-selector.js";
 import { extractModelsAttribution, type Provider } from "../plan-parser.js";
+import { parseOccurrenceCount } from "../occurrence-tracking.js";
 
 export const PLAN_HEADER = "## Implementation Plan";
+
+export const PLAN_OCCURRENCES_MARKER = "CLAWS_PLAN_OCCURRENCES:";
+
+function occurrenceMarkerFor(issueBody: string): string {
+  const n = parseOccurrenceCount(issueBody ?? "");
+  return n === null ? "" : `\n\n${PLAN_OCCURRENCES_MARKER} ${n}`;
+}
+
+export function parsePlannedOccurrences(planBody: string): number | null {
+  const m = planBody.match(/CLAWS_PLAN_OCCURRENCES:\s*(\d+)/);
+  return m ? parseInt(m[1], 10) : null;
+}
 
 /** API id for Claude Fable 5 — opt-in per-issue via the "Plan: Fable" label. */
 export const FABLE_MODEL = "claude-fable-5";
@@ -39,6 +52,17 @@ async function warnIfPlanTooLong(
   await gh.commentOnIssue(fullName, issueNumber, planLengthWarning(length), { agentName: "Planner" });
 }
 
+export const NO_CODE_CHANGES_MARKER = "CLAWS_NO_CODE_CHANGES";
+
+/** True when the planner concluded the issue needs no code change to the repo. */
+export function parseNoCodeChanges(output: string): boolean {
+  return /^\s*CLAWS_NO_CODE_CHANGES\s*$/m.test(output);
+}
+
+export function stripNoCodeChangesMarker(output: string): string {
+  return output.replace(/\n?^\s*CLAWS_NO_CODE_CHANGES\s*$/gm, "").trim();
+}
+
 export function parseDuplicateOf(output: string, allowedNumbers: number[]): number | null {
   const matches = [...output.matchAll(/DUPLICATE_OF:\s*(.+?)(?:\n|$)/g)];
   if (!matches.length) return null;
@@ -57,9 +81,37 @@ export function stripDuplicateMarker(output: string): string {
   return output.replace(/\n?DUPLICATE_OF:.*$/gm, "").trim();
 }
 
+export function stripLeadingPlanHeader(output: string): string {
+  const trimmed = output.trim();
+  if (!trimmed.startsWith(PLAN_HEADER)) return trimmed;
+  const rest = trimmed.slice(PLAN_HEADER.length);
+  // Only strip a standalone header line — "## Implementation Plan for X" must survive.
+  if (rest !== "" && !rest.startsWith("\n")) return trimmed;
+  return rest.trim();
+}
+
 export function isCiUnrelatedIssue(issue: gh.Issue): boolean {
   return issue.title.startsWith("[ci-unrelated]");
 }
+
+const NO_CODE_CHANGES_INSTRUCTION = [
+  `If, after investigating the codebase, you conclude that this issue requires`,
+  `NO changes to any file tracked in this repository — because it describes a`,
+  `purely operational/manual task (deleting artifacts, changing repo settings,`,
+  `rotating a secret, running a one-off command), because the underlying code fix`,
+  `has already been shipped, or because it is not actionable as a code change —`,
+  `then do NOT write an implementation plan. Instead output a SHORT paragraph (2-4`,
+  `sentences) explaining why no code change is warranted, followed by EXACTLY this`,
+  `line on its own:`,
+  ``,
+  NO_CODE_CHANGES_MARKER,
+  ``,
+  `Only use this when you are confident a code change is genuinely unnecessary. If`,
+  `there is any concrete file edit that would resolve or mitigate the issue`,
+  `(including editing a GitHub Actions workflow), produce the normal plan instead.`,
+  `Do NOT emit ${NO_CODE_CHANGES_MARKER} together with a plan body or with a`,
+  `DUPLICATE_OF verdict — choose exactly one outcome.`,
+].join("\n");
 
 const MULTI_PR_INSTRUCTIONS = [
   `Prefer a single PR. Do not split work into multiple PRs just because the change`,
@@ -100,6 +152,16 @@ const IMPLEMENTER_GUIDANCE_INSTRUCTIONS = [
   `make that judgment yourself here rather than deferring it.`,
 ].join("\n");
 
+const FABLE_PLANNING_CONTEXT = [
+  `This issue was explicitly labelled for planning with Claude Fable 5, a model tier above the`,
+  `default planner. The label signals the issue is unusually hard, ambiguous, or high-stakes.`,
+  `Invest the extra capability in deeper investigation — read more of the codebase, trace the`,
+  `actual code paths, verify assumptions against the real files — not in writing a longer plan.`,
+  `The implementer is unchanged (a much smaller model), so the capability gap between planner`,
+  `and implementer is wider than usual: resolve every judgment call yourself and make the plan`,
+  `fully self-contained. The plan length limits below still apply.`,
+].join("\n");
+
 const MODEL_SELECTION_INSTRUCTIONS = [
   `After your plan, include a model recommendation for implementation on its own line,`,
   `in this exact format:`,
@@ -124,7 +186,29 @@ const MODEL_SELECTION_INSTRUCTIONS = [
   `When in doubt, choose \`opus\`.`,
 ].join("\n");
 
+const WORKTREE_ENVIRONMENT_NOTE = [
+  `You are running inside a fresh git worktree checked out from the default branch.`,
+  `It contains the repository's tracked files only — dependencies are NOT installed`,
+  `(\`node_modules\` is absent, as are any other gitignored build/vendor artifacts).`,
+  `This is by design, not a restriction: you have full shell access and MAY run`,
+  `\`npm install\`/\`npm ci\` (or the project's package manager) yourself if you`,
+  `genuinely need installed dependencies to investigate. For dependency or version`,
+  `analysis, prefer reading the lockfile (\`package-lock.json\`) directly — it lists`,
+  `every resolved version and avoids a slow, costly install. Do not describe reading`,
+  `the lockfile as a workaround; it is the preferred approach.`,
+].join("\n");
+
 const NO_HTML_COMMENTS_INSTRUCTION = `Do not use HTML comments (<!-- ... -->) anywhere in your output. All content must be human-readable plain text or standard markdown.`;
+
+const OCCURRENCE_TRACKING_INSTRUCTION =
+  `If the issue body contains an occurrence-tracking block (lines like ` +
+  `"**First seen:**", "**Last seen:**", "**Occurrences:** N"), treat the ` +
+  `"Occurrences" count as load-bearing. An "Occurrences" value greater than 1 ` +
+  `means this is a RECURRING failure, not a one-off — do NOT diagnose it as a ` +
+  `transient blip that self-recovered. A high or growing count means the ` +
+  `underlying cause persists and the plan must address the recurrence itself ` +
+  `(e.g. make the operation resilient, add ret/refresh, or fix the root cause), ` +
+  `not merely explain why a single failure occurred.`;
 
 const LINKED_REFERENCES_INSTRUCTION = [
   `If the issue body or any comment references other GitHub issues or PRs — either by URL`,
@@ -270,6 +354,7 @@ function buildRefinementPrompt(
   existingPlan: string,
   feedback: gh.IssueComment[],
   selfLogin: string,
+  isFable = false,
 ): string {
   const guardCtx = makeGuardCtx(fullName, issue.number);
   return [
@@ -288,24 +373,17 @@ function buildRefinementPrompt(
       ? [
           `The following feedback was provided on the plan:`,
           ``,
-          ...feedback.flatMap((f) => {
-            const isClaws = f.login === selfLogin && gh.isClawsComment(f.body);
-            const label = isClaws
-              ? `Comment by @${f.login} (automated by Claws):`
-              : `Comment by @${f.login}:`;
-            const stripped = gh.stripClawsMarker(f.body);
-            // Self-authored Claws comments are not an injection risk; guarding produces false positives.
-            const body = isClaws ? stripped : guardContent(stripped, guardCtx("issue-comment"));
-            return [`---`, label, body, ``];
-          }),
+          ...formatIssueCommentsForPrompt(feedback, selfLogin, guardCtx),
         ]
       : [`No specific feedback comments were provided. Re-evaluate the plan for completeness and correctness.`, ``]),
     ``,
     `If \`docs/OVERVIEW.md\` exists in the repository, read it first (and any linked documents that seem relevant to the issue) for context about the codebase architecture and patterns.`,
     RUNNER_POLICY_CONTEXT,
+    WORKTREE_ENVIRONMENT_NOTE,
     LINKED_REFERENCES_INSTRUCTION,
     EXTERNAL_REFERENCES_INSTRUCTION,
     DIAGNOSTIC_REFERENCES_INSTRUCTION,
+    OCCURRENCE_TRACKING_INSTRUCTION,
     ...(HOME_ASSISTANT_BASE_URL && HOME_ASSISTANT_TOKEN ? [homeAssistantContext()] : []),
     ``,
     `Please produce an updated implementation plan that addresses the feedback.`,
@@ -318,6 +396,7 @@ function buildRefinementPrompt(
     MULTI_PR_INSTRUCTIONS,
     ``,
     IMPLEMENTER_GUIDANCE_INSTRUCTIONS,
+    ...(isFable ? [``, FABLE_PLANNING_CONTEXT] : []),
     ``,
     MODEL_SELECTION_INSTRUCTIONS,
     ``,
@@ -363,19 +442,11 @@ function buildFollowUpPrompt(
     ``,
     `The following follow-up comments were posted after the plan:`,
     ``,
-    ...followUpComments.flatMap((f) => {
-      const isClaws = f.login === selfLogin && gh.isClawsComment(f.body);
-      const label = isClaws
-        ? `Comment by @${f.login} (automated by Claws):`
-        : `Comment by @${f.login}:`;
-      const stripped = gh.stripClawsMarker(f.body);
-      // Self-authored Claws comments are not an injection risk; guarding produces false positives.
-      const body = isClaws ? stripped : guardContent(stripped, guardCtx("issue-comment"));
-      return [`---`, label, body, ``];
-    }),
+    ...formatIssueCommentsForPrompt(followUpComments, selfLogin, guardCtx),
     ``,
     `If \`docs/OVERVIEW.md\` exists in the repository, read it first (and any linked documents that seem relevant) for context about the codebase architecture and patterns.`,
     RUNNER_POLICY_CONTEXT,
+    WORKTREE_ENVIRONMENT_NOTE,
     LINKED_REFERENCES_INSTRUCTION,
     EXTERNAL_REFERENCES_INSTRUCTION,
     DIAGNOSTIC_REFERENCES_INSTRUCTION,
@@ -395,6 +466,7 @@ function buildNewPlanPrompt(
   comments: gh.IssueComment[],
   selfLogin: string,
   duplicateCandidates: gh.Issue[] = [],
+  isFable = false,
 ): string {
   const guardCtx = makeGuardCtx(fullName, issue.number);
   return [
@@ -403,21 +475,14 @@ function buildNewPlanPrompt(
     ``,
     guardContent(issue.body, guardCtx("issue-body")) || "(No description provided)",
     ``,
-    ...comments.flatMap((c) => {
-      const isClaws = c.login === selfLogin && gh.isClawsComment(c.body);
-      const label = isClaws
-        ? `Comment by @${c.login} (automated by Claws):`
-        : `Comment by @${c.login}:`;
-      const stripped = gh.stripClawsMarker(c.body);
-      // Self-authored Claws comments are not an injection risk; guarding produces false positives.
-      const body = isClaws ? stripped : guardContent(stripped, guardCtx("issue-comment"));
-      return [`---`, label, body, ``];
-    }),
+    ...formatIssueCommentsForPrompt(comments, selfLogin, guardCtx),
     `If \`docs/OVERVIEW.md\` exists in the repository, read it first (and any linked documents that seem relevant to the issue) for context about the codebase architecture and patterns.`,
     RUNNER_POLICY_CONTEXT,
+    WORKTREE_ENVIRONMENT_NOTE,
     LINKED_REFERENCES_INSTRUCTION,
     EXTERNAL_REFERENCES_INSTRUCTION,
     DIAGNOSTIC_REFERENCES_INSTRUCTION,
+    OCCURRENCE_TRACKING_INSTRUCTION,
     ...(HOME_ASSISTANT_BASE_URL && HOME_ASSISTANT_TOKEN ? [homeAssistantContext()] : []),
     ``,
     `Please produce a detailed implementation plan for this issue.`,
@@ -430,6 +495,7 @@ function buildNewPlanPrompt(
     MULTI_PR_INSTRUCTIONS,
     ``,
     IMPLEMENTER_GUIDANCE_INSTRUCTIONS,
+    ...(isFable ? [``, FABLE_PLANNING_CONTEXT] : []),
     ``,
     MODEL_SELECTION_INSTRUCTIONS,
     ``,
@@ -438,6 +504,8 @@ function buildNewPlanPrompt(
     NO_HTML_COMMENTS_INSTRUCTION,
     ``,
     CONCISENESS_INSTRUCTIONS,
+    ``,
+    NO_CODE_CHANGES_INSTRUCTION,
     ``,
     `Do NOT make any code changes. Only produce the plan as text output.`,
     buildDuplicateCandidatesSection(fullName, issue.number, duplicateCandidates),
@@ -478,7 +546,8 @@ export async function processIssue(repo: Repo, issue: gh.Issue): Promise<void> {
       const issueBodyHtml = await gh.getIssueBodyHtml(fullName, issue.number).catch(() => "");
       const htmlBodies = [issueBodyHtml, ...comments.map((c) => c.body_html)];
       const imageContext = await processTextForImages([issue.body, ...comments.map((c) => c.body)], wtPath, repo.owner, { repo: fullName, issueNumber: issue.number, agentName: "Planner" }, htmlBodies);
-      const prompt = buildNewPlanPrompt(fullName, issue, comments, selfLogin, duplicateCandidates) + imageContext;
+      const model = planModelForIssue(issue);
+      const prompt = buildNewPlanPrompt(fullName, issue, comments, selfLogin, duplicateCandidates, model === FABLE_MODEL) + imageContext;
 
       const mcpConfigPath = claude.writeClawsMcpConfig(wtPath, { includeNameyDb: false });
       const agentDoc = claude.readRepoAgentDoc(wtPath, "issue-refiner");
@@ -492,22 +561,17 @@ export async function processIssue(repo: Repo, issue: gh.Issue): Promise<void> {
       // implementer model then has to follow. Degrading the planner to a
       // cheaper model degrades every downstream implementation.
       const tier: ModelTier = "opus";
-      const model = planModelForIssue(issue);
       db.updateTaskModel(taskId, model);
       log.info(`[issue-refiner] Using model "${model}" for planning ${fullName}#${issue.number}`);
       let actualProvider: Provider = "claude";
-      let taskTokensUsed: number | undefined;
-      let taskCostUsd: number | undefined;
-      const planOutput = await claude.runClaude(prompt, wtPath, { capability: "text-only", mcpConfig: mcpConfigPath, timeoutMs, tier, model, provider: "claude", appendSystemPrompt: agentDoc, onProviderUsed: (p) => { actualProvider = p; }, onTokensUsed: (t, c) => { taskTokensUsed = t; taskCostUsd = c; } });
-      if (taskTokensUsed !== undefined && taskCostUsd !== undefined) {
-        db.updateTaskTokenUsage(taskId, taskTokensUsed, taskCostUsd);
-      }
+      const planOutput = await claude.runClaude(prompt, wtPath, { capability: "text-only", mcpConfig: mcpConfigPath, timeoutMs, tier, model, provider: "claude", appendSystemPrompt: agentDoc, onProviderUsed: (p) => { actualProvider = p; }, onTokensUsed: db.trackTaskTokens(taskId) });
 
       const candidateNumbers = duplicateCandidates.map((c) => c.number);
       const duplicateOf = candidateNumbers.length > 0 ? parseDuplicateOf(planOutput, candidateNumbers) : null;
-      const cleanedOutput = stripDuplicateMarker(planOutput);
+      const noCodeChanges = duplicateOf === null && parseNoCodeChanges(planOutput);
+      const cleanedOutput = stripNoCodeChangesMarker(stripLeadingPlanHeader(stripDuplicateMarker(planOutput)));
 
-      if (cleanedOutput.trim() || duplicateOf !== null) {
+      if (cleanedOutput.trim() || duplicateOf !== null || noCodeChanges) {
         const attribution = `*Models used: ${model} (provider: ${actualProvider})*`;
         if (duplicateOf !== null) {
           // Use plain text marker (CLAWS_DUPLICATE_OF:) not hidden HTML comment — aligns with NO_HTML_COMMENTS_INSTRUCTION
@@ -530,8 +594,22 @@ export async function processIssue(repo: Repo, issue: gh.Issue): Promise<void> {
           } catch (err) {
             log.warn(`[issue-refiner] Failed to post back-reference on canonical #${duplicateOf}: ${err}`);
           }
+        } else if (noCodeChanges) {
+          const ncBody = [
+            `The planner determined this issue does **not** require any code change to this repository.`,
+            ``,
+            cleanedOutput || "(no further detail provided)",
+            ``,
+            `Claws is applying the \`${LABELS.clawsIgnore}\` label so it stops re-planning and`,
+            `implementing this issue. The issue stays open as a record. If you believe a code`,
+            `change IS needed, remove the \`${LABELS.clawsIgnore}\` label and add the \`${LABELS.ready}\``,
+            `label — Claws will re-plan with your comment as context.`,
+          ].join("\n");
+          await gh.commentOnIssue(fullName, issue.number, `${PLAN_HEADER}\n\n${ncBody}\n\n${attribution}`, { agentName: "Planner" });
+          await gh.addLabel(fullName, issue.number, LABELS.clawsIgnore);
+          log.info(`[issue-refiner] ${fullName}#${issue.number} needs no code changes — applied ${LABELS.clawsIgnore}`);
         } else {
-          await gh.commentOnIssue(fullName, issue.number, `${PLAN_HEADER}\n\n${cleanedOutput}\n\n${attribution}`, { agentName: "Planner" });
+          await gh.commentOnIssue(fullName, issue.number, `${PLAN_HEADER}\n\n${cleanedOutput}\n\n${attribution}${occurrenceMarkerFor(issue.body)}`, { agentName: "Planner" });
           log.info(`[issue-refiner] Posted plan for ${fullName}#${issue.number}`);
           await warnIfPlanTooLong(fullName, issue.number, cleanedOutput.length, "Plan");
         }
@@ -539,7 +617,7 @@ export async function processIssue(repo: Repo, issue: gh.Issue): Promise<void> {
         log.warn(`[issue-refiner] Empty plan output for ${fullName}#${issue.number}`);
       }
 
-      if (duplicateOf === null) {
+      if (duplicateOf === null && !noCodeChanges) {
         await gh.addLabel(fullName, issue.number, LABELS.ready);
 
         if (isCiUnrelatedIssue(issue)) {
@@ -594,20 +672,16 @@ export async function processRefinement(
         const issueBodyHtml = await gh.getIssueBodyHtml(fullName, issue.number).catch(() => "");
         const htmlBodies = [issueBodyHtml, ...comments.map((c) => c.body_html)];
         const imageContext = await processTextForImages([issue.body, ...comments.map((c) => c.body)], wtPath, repo.owner, { repo: fullName, issueNumber: issue.number, agentName: "Planner" }, htmlBodies);
-        const prompt = buildNewPlanPrompt(fullName, issue, comments, selfLogin) + imageContext;
+        const prompt = buildNewPlanPrompt(fullName, issue, comments, selfLogin, [], model === FABLE_MODEL) + imageContext;
         let actualProvider: Provider = "claude";
-        let taskTokensUsed: number | undefined;
-        let taskCostUsd: number | undefined;
-        const planOutput = await claude.runClaude(prompt, wtPath, { capability: "text-only", mcpConfig: mcpConfigPath, timeoutMs, tier, model, provider: "claude", appendSystemPrompt: agentDoc, onProviderUsed: (p) => { actualProvider = p; }, onTokensUsed: (t, c) => { taskTokensUsed = t; taskCostUsd = c; } });
-        if (taskTokensUsed !== undefined && taskCostUsd !== undefined) {
-          db.updateTaskTokenUsage(taskId, taskTokensUsed, taskCostUsd);
-        }
+        const planOutput = await claude.runClaude(prompt, wtPath, { capability: "text-only", mcpConfig: mcpConfigPath, timeoutMs, tier, model, provider: "claude", appendSystemPrompt: agentDoc, onProviderUsed: (p) => { actualProvider = p; }, onTokensUsed: db.trackTaskTokens(taskId) });
 
         if (planOutput.trim()) {
+          const cleaned = stripLeadingPlanHeader(planOutput);
           const attribution = `*Models used: ${model} (provider: ${actualProvider})*`;
-          await gh.commentOnIssue(fullName, issue.number, `${PLAN_HEADER}\n\n${planOutput}\n\n${attribution}`, { agentName: "Planner" });
+          await gh.commentOnIssue(fullName, issue.number, `${PLAN_HEADER}\n\n${cleaned}\n\n${attribution}${occurrenceMarkerFor(issue.body)}`, { agentName: "Planner" });
           log.info(`[issue-refiner] Posted fresh plan for ${fullName}#${issue.number}`);
-          await warnIfPlanTooLong(fullName, issue.number, planOutput.length, "Fresh plan");
+          await warnIfPlanTooLong(fullName, issue.number, cleaned.length, "Fresh plan");
         } else {
           log.warn(`[issue-refiner] Empty plan output for ${fullName}#${issue.number}`);
         }
@@ -617,14 +691,9 @@ export async function processRefinement(
 
         const issueBodyHtml = await gh.getIssueBodyHtml(fullName, issue.number).catch(() => "");
         const imageContext = await processTextForImages([issue.body], wtPath, repo.owner, { repo: fullName, issueNumber: issue.number, agentName: "Planner" }, [issueBodyHtml, ...comments.map((c) => c.body_html)]);
-        const prompt = buildRefinementPrompt(fullName, issue, planComment.body, feedback, selfLogin) + imageContext;
+        const prompt = buildRefinementPrompt(fullName, issue, planComment.body, feedback, selfLogin, model === FABLE_MODEL) + imageContext;
         let actualProvider: Provider = "claude";
-        let taskTokensUsed: number | undefined;
-        let taskCostUsd: number | undefined;
-        const planOutput = await claude.runClaude(prompt, wtPath, { capability: "text-only", mcpConfig: mcpConfigPath, timeoutMs, tier, model, provider: "claude", appendSystemPrompt: agentDoc, onProviderUsed: (p) => { actualProvider = p; }, onTokensUsed: (t, c) => { taskTokensUsed = t; taskCostUsd = c; } });
-        if (taskTokensUsed !== undefined && taskCostUsd !== undefined) {
-          db.updateTaskTokenUsage(taskId, taskTokensUsed, taskCostUsd);
-        }
+        const planOutput = await claude.runClaude(prompt, wtPath, { capability: "text-only", mcpConfig: mcpConfigPath, timeoutMs, tier, model, provider: "claude", appendSystemPrompt: agentDoc, onProviderUsed: (p) => { actualProvider = p; }, onTokensUsed: db.trackTaskTokens(taskId) });
 
         if (planOutput.trim()) {
           // Check for "### Response" section to post as a separate follow-up comment
@@ -632,6 +701,7 @@ export async function processRefinement(
           const planBody = responseMatch
             ? planOutput.slice(0, responseMatch.index).trim()
             : planOutput;
+          const cleanedPlanBody = stripLeadingPlanHeader(planBody);
 
           // Build attribution, preserving the original model and replacing any prior
           // "Refined with" segment so it doesn't grow unboundedly on each refinement.
@@ -650,7 +720,7 @@ export async function processRefinement(
             return `*Models used: ${originalPart} | Refined with: ${model} (provider: ${actualProvider})*`;
           })();
 
-          await gh.editIssueComment(fullName, planComment.id, `${PLAN_HEADER}\n\n${planBody}\n\n${attribution}`, { agentName: "Planner" });
+          await gh.editIssueComment(fullName, planComment.id, `${PLAN_HEADER}\n\n${cleanedPlanBody}\n\n${attribution}${occurrenceMarkerFor(issue.body)}`, { agentName: "Planner" });
           log.info(`[issue-refiner] Updated plan comment for ${fullName}#${issue.number}`);
 
           if (responseMatch && responseMatch[1].trim()) {
@@ -658,7 +728,7 @@ export async function processRefinement(
             log.info(`[issue-refiner] Posted response comment for ${fullName}#${issue.number}`);
           }
 
-          await warnIfPlanTooLong(fullName, issue.number, planBody.length, "Refined plan");
+          await warnIfPlanTooLong(fullName, issue.number, cleanedPlanBody.length, "Refined plan");
         } else {
           log.warn(`[issue-refiner] Empty plan output for ${fullName}#${issue.number}`);
         }
@@ -740,39 +810,46 @@ export async function findUnreactedHumanComments(
   commentsAfterPlan: gh.IssueComment[],
   selfLogin: string,
 ): Promise<gh.IssueComment[]> {
-  const unreacted: gh.IssueComment[] = [];
+  // Phase A: synchronous filters + sequential isAllowedActor (async).
+  const candidates: gh.IssueComment[] = [];
   for (const comment of commentsAfterPlan) {
     if (gh.isClawsComment(comment.body)) continue;
     if (comment.login.endsWith("[bot]")) continue;
     if (!await gh.isAllowedActor(comment.login)) continue;
-    try {
-      const reactions = await gh.getCommentReactions(fullName, comment.id);
-      const hasReaction = reactions.some(
-        (r) => r.user.login === selfLogin && r.content === "+1",
-      );
-      if (!hasReaction) {
-        unreacted.push(comment);
-      }
-    } catch {
-      unreacted.push(comment);
-    }
+    candidates.push(comment);
   }
-  return unreacted;
+
+  // Phase B: independent reaction fetches in parallel; per-item catch
+  // defaults a failed fetch to "unreacted" (preserves old behavior).
+  const results = await Promise.all(
+    candidates.map(async (comment) => {
+      try {
+        const reactions = await gh.getCommentReactions(fullName, comment.id);
+        const hasReaction = reactions.some(
+          (r) => r.user.login === selfLogin && r.content === "+1",
+        );
+        return hasReaction ? null : comment;
+      } catch {
+        return comment;
+      }
+    }),
+  );
+  return results.filter((c): c is gh.IssueComment => c !== null);
 }
 
 export async function findUnreactedFeedbackAfterPlan(
   fullName: string,
   issueNumber: number,
   selfLogin: string,
-): Promise<{ hasPlan: boolean; unreacted: gh.IssueComment[] }> {
+): Promise<{ hasPlan: boolean; unreacted: gh.IssueComment[]; plannedOccurrences: number | null }> {
   const comments = await gh.getIssueComments(fullName, issueNumber);
   const lastPlanIdx = comments.findLastIndex(
     (c) => c.body.includes(PLAN_HEADER) && gh.isClawsComment(c.body),
   );
   if (lastPlanIdx === -1) {
-    return { hasPlan: false, unreacted: [] };
+    return { hasPlan: false, unreacted: [], plannedOccurrences: null };
   }
   const unreacted = await findUnreactedHumanComments(fullName, comments.slice(lastPlanIdx + 1), selfLogin);
-  return { hasPlan: true, unreacted };
+  return { hasPlan: true, unreacted, plannedOccurrences: parsePlannedOccurrences(comments[lastPlanIdx].body) };
 }
 

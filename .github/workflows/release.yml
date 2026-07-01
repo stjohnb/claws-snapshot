@@ -97,12 +97,21 @@ jobs:
       - name: Compute image repo (lowercase)
         id: repo
         run: echo "name=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+      # Do NOT add `cache-to: type=gha` / `cache-from: type=gha` here.
+      # The gha BuildKit cache leaked 6+ GB into the org-shared 2 GB Actions
+      # storage quota (issues #1698, #1717). Releases are infrequent; rebuilding
+      # layers from the registry each time is the intended trade-off.
+      # docker/build-push-action auto-uploads a `.dockerbuild` build record as a
+      # workflow artifact on every run (default 90-day retention). With a release
+      # per push to main these accumulated to 280 artifacts / 15+ MB against the
+      # org-shared 2 GB Actions-storage quota (issue #1750). We don't consume the
+      # build record, so disable the upload.
       - uses: docker/build-push-action@v6
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
         with:
           context: .
           push: true
           tags: |
             ghcr.io/${{ steps.repo.outputs.name }}:${{ needs.release.outputs.tag }}
             ghcr.io/${{ steps.repo.outputs.name }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max

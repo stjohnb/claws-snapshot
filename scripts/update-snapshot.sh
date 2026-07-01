@@ -4,6 +4,12 @@
 # Run manually from a clean checkout of `main` by a maintainer with push
 # access to stjohnb/claws-snapshot. Secrets (.mcp-claws.json, config.json,
 # *.env) are gitignored and excluded by construction via `git archive`.
+#
+# Before publishing, the export is scrubbed of maintainer PII (emails, personal
+# domains, server IPs, home paths, OS username) using the literal find/replace
+# rules in scripts/snapshot-scrub.map. That map is export-ignore'd so its PII
+# literals never reach the public mirror; add new rules there when new personal
+# strings appear in the codebase.
 set -euo pipefail
 
 SNAPSHOT_REPO="${SNAPSHOT_REPO:-https://github.com/stjohnb/claws-snapshot.git}"
@@ -24,7 +30,45 @@ EXPORT_DIR="$WORKDIR/export"
 mkdir -p "$EXPORT_DIR"
 
 # 2. Export ONLY tracked files — gitignored secrets are excluded.
+#    export-ignore'd files (e.g. scripts/snapshot-scrub.map) are also excluded.
 git archive HEAD | tar -x -C "$EXPORT_DIR"
+
+# 2b. Scrub maintainer PII (emails, personal domains, server IPs, home paths)
+#     from the export so it never reaches the public mirror. Rules live in
+#     scripts/snapshot-scrub.map, which is export-ignore'd so its literals stay
+#     private. Each rule is a literal (non-regex) find/replace.
+SCRUB_MAP="$REPO_ROOT/scripts/snapshot-scrub.map"
+if [[ ! -f "$SCRUB_MAP" ]]; then
+  echo "ERROR: scrub map missing at $SCRUB_MAP — refusing to publish unscrubbed." >&2
+  exit 1
+fi
+scrub_rules=0
+while IFS= read -r line || [[ -n "$line" ]]; do
+  [[ -z "$line" || "$line" == \#* ]] && continue
+  if [[ "$line" != *"|"* ]]; then
+    echo "ERROR: malformed scrub rule (no '|'): $line" >&2; exit 1
+  fi
+  find_str="${line%%|*}"
+  [[ -z "$find_str" ]] && { echo "ERROR: empty FIND string in rule: $line" >&2; exit 1; }
+  repl_str="${line#*|}"
+  # Replace in every text file that contains the literal (grep -I skips binaries).
+  while IFS= read -r -d '' f; do
+    FIND="$find_str" REPL="$repl_str" perl -i -pe 's/\Q$ENV{FIND}\E/$ENV{REPL}/g' "$f"
+  done < <(grep -rIlF -- "$find_str" "$EXPORT_DIR" 2>/dev/null | tr '\n' '\0')
+  scrub_rules=$((scrub_rules + 1))
+done < "$SCRUB_MAP"
+echo "Applied $scrub_rules PII scrub rule(s)."
+[[ $scrub_rules -gt 0 ]] || { echo "ERROR: scrub map has no active rules — refusing to publish." >&2; exit 1; }
+
+# 2c. Verify no scrub-map FIND string survived (fail-closed).
+while IFS= read -r line || [[ -n "$line" ]]; do
+  [[ -z "$line" || "$line" == \#* ]] && continue
+  find_str="${line%%|*}"
+  [[ -z "$find_str" ]] && { echo "ERROR: empty FIND string in rule: $line" >&2; exit 1; }
+  if grep -rIqF -- "$find_str" "$EXPORT_DIR"; then
+    echo "ERROR: PII '$find_str' survived scrub — aborting." >&2; exit 1
+  fi
+done < "$SCRUB_MAP"
 
 # 3. Defensive: assert no secret files slipped in.
 for f in .mcp-claws.json config.json; do

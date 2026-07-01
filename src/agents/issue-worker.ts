@@ -11,7 +11,7 @@ import { processTextForImages } from "../images.js";
 import * as planParser from "../plan-parser.js";
 import type { Provider } from "../plan-parser.js";
 import { PLAN_HEADER } from "./issue-refiner.js";
-import { KUBECTL_CONTEXT, NAMEY_DB_CONTEXT, FAST_CHECKS_GUIDANCE, RUNNER_POLICY_CONTEXT, homeAssistantContext } from "./agent-context.js";
+import { KUBECTL_CONTEXT, NAMEY_DB_CONTEXT, FAST_CHECKS_GUIDANCE, RUNNER_POLICY_CONTEXT, homeAssistantContext, formatIssueCommentsForPrompt } from "./agent-context.js";
 import { guardContent, makeGuardCtx } from "../prompt-guard.js";
 import { getModel, type ModelTier } from "../model-selector.js";
 
@@ -108,16 +108,7 @@ function buildPrompt(
       ``,
       guardContent(issue.body, guardCtx("issue-body")),
       ``,
-      ...comments.flatMap((c) => {
-        const isClaws = c.login === selfLogin && gh.isClawsComment(c.body);
-        const label = isClaws
-          ? `Comment by @${c.login} (automated by Claws):`
-          : `Comment by @${c.login}:`;
-        const stripped = gh.stripClawsMarker(c.body);
-        // Self-authored Claws comments are not an injection risk; guarding produces false positives.
-        const body = isClaws ? stripped : guardContent(stripped, guardCtx("issue-comment"));
-        return [`---`, label, body, ``];
-      }),
+      ...formatIssueCommentsForPrompt(comments, selfLogin, guardCtx),
       `If \`docs/OVERVIEW.md\` exists, read it first (and any linked documents that seem relevant to the issue) for context about the codebase.`,
       KUBECTL_CONTEXT,
       ...(NAMEY_DB_URL ? [NAMEY_DB_CONTEXT] : []),
@@ -328,8 +319,6 @@ export async function processIssue(repo: Repo, issue: gh.Issue): Promise<void> {
 
       // Track the actual provider used (may differ from recommended if fallback occurs)
       let actualProvider: Provider = provider;
-      let taskTokensUsed: number | undefined;
-      let taskCostUsd: number | undefined;
       await claude.runClaude(prompt, wtPath, {
         capability: "tool-use",
         mcpConfig: mcpConfigPath,
@@ -339,15 +328,12 @@ export async function processIssue(repo: Repo, issue: gh.Issue): Promise<void> {
         provider,
         appendSystemPrompt: agentDoc,
         onProviderUsed: (p) => { actualProvider = p; },
-        onTokensUsed: (tokens, cost) => { taskTokensUsed = tokens; taskCostUsd = cost; },
+        onTokensUsed: db.trackTaskTokens(taskId),
         agent: "build",
         envSanitization: "passthrough", // TODO: tighten — implementer legitimately needs HA token for ha-config tasks
       });
 
       db.updateTaskProvider(taskId, actualProvider);
-      if (taskTokensUsed !== undefined && taskCostUsd !== undefined) {
-        db.updateTaskTokenUsage(taskId, taskTokensUsed, taskCostUsd);
-      }
 
       let outcome: TaskOutcome = { commits: 0 };
 

@@ -7,6 +7,8 @@ import { reportError } from "../error-reporter.js";
 import { getModel } from "../model-selector.js";
 import { transcribe, isAvailable as transcribeAvailable, WhisperRateLimitError } from "../transcribe.js";
 import { sendMessage, type WhatsAppMessage, type MessageHandler } from "../whatsapp.js";
+import { parseFirstValidJson } from "../json-extract.js";
+import { guardContent, makeGuardCtx } from "../prompt-guard.js";
 
 const MAX_BODY_LENGTH = 10_000;
 
@@ -61,6 +63,7 @@ export function createHandler(
         .join("\n");
 
       // Ask Claude to interpret the message
+      const guardCtx = makeGuardCtx("whatsapp", 0);
       const prompt = [
         "You are processing a WhatsApp message from a user who wants to create a GitHub issue.",
         "",
@@ -68,7 +71,7 @@ export function createHandler(
         repoList,
         "",
         `User's message:`,
-        `"${text}"`,
+        `"${guardContent(text, guardCtx("whatsapp-message"))}"`,
         "",
         "Respond with ONLY a JSON object (no markdown fences, no explanation):",
         '{',
@@ -84,15 +87,10 @@ export function createHandler(
       const claudeResult = await claude.runClaude(prompt, process.cwd(), { capability: "text-only", tier: "sonnet", agent: "plan" });
 
       // Parse Claude's response
-      let parsed: { repo: string | null; title: string };
-      try {
-        // Strip markdown fences if Claude included them
-        const cleaned = claudeResult
-          .replace(/^```(?:json)?\s*/m, "")
-          .replace(/```\s*$/m, "")
-          .trim();
-        parsed = WhatsAppClaudeResponseSchema.parse(JSON.parse(cleaned));
-      } catch {
+      const parsed =
+        parseFirstValidJson(claudeResult, WhatsAppClaudeResponseSchema, "whatsapp-handler") ?? undefined;
+
+      if (!parsed) {
         log.warn(`[whatsapp-handler] Failed to parse Claude response: ${claudeResult.slice(0, 500)}`);
         await sendMessage(msg.from, "I had trouble understanding your message. Could you try rephrasing it?");
         return;
@@ -148,5 +146,3 @@ export function createHandler(
     }
   };
 }
-
-export type { WhatsAppMessage, MessageHandler };

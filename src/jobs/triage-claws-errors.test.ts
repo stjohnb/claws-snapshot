@@ -30,6 +30,7 @@ const { mockGh, mockClaude, mockDb } = vi.hoisted(() => ({
   mockGh: {
     listOpenIssues: vi.fn(),
     populateQueueCache: vi.fn(),
+    populateQueueCacheFor: vi.fn(),
     commentOnIssue: vi.fn(),
     closeIssue: vi.fn(),
     getIssueBody: vi.fn(),
@@ -52,6 +53,7 @@ const { mockGh, mockClaude, mockDb } = vi.hoisted(() => ({
     updateTaskWorktree: vi.fn(),
     updateTaskModel: vi.fn(),
     updateTaskTokenUsage: vi.fn(),
+    trackTaskTokens: vi.fn().mockReturnValue(vi.fn()),
     recordTaskComplete: vi.fn(),
     recordTaskFailed: vi.fn(),
     withTaskRecording: vi.fn(async (jobName: string, repo: string, itemNumber: number, triggerLabel: string | null, fn: (taskId: number) => Promise<unknown>) => {
@@ -218,6 +220,34 @@ describe("triage-claws-errors", () => {
       const result = await deduplicateByFingerprint("test-org/test-repo", [newIssue]);
       expect(result).toHaveLength(0);
       expect(mockGh.closeIssue).toHaveBeenCalledWith("test-org/test-repo", 10, "not_planned");
+    });
+
+    it("concurrent fetch preserves listOpenIssues order: first existing wins when both know the same fingerprint", async () => {
+      // issueA comes first in listOpenIssues order; issueB second.
+      // Both have `fp-x` in their Known Fingerprints comments.
+      // The incoming issue has title fingerprint `fp-x`.
+      // After concurrent fetch, map assembly must use issueA (first in order),
+      // so the incoming issue is closed as a duplicate of issueA, not issueB.
+      const issueA = mockIssue({ number: 1, title: "[claws-error] fp-a" });
+      const issueB = mockIssue({ number: 2, title: "[claws-error] fp-b" });
+      const incoming = mockIssue({ number: 20, title: "[claws-error] fp-x" });
+
+      mockGh.listOpenIssues.mockResolvedValue([issueA, issueB, incoming]);
+      mockGh.getIssueComments.mockImplementation(async (_repo: string, number: number) => {
+        if (number === 1) return [{ id: 10, body: "### Known Fingerprints\n- `fp-x`", login: "claws-bot" }];
+        if (number === 2) return [{ id: 11, body: "### Known Fingerprints\n- `fp-x`", login: "claws-bot" }];
+        return [];
+      });
+
+      const result = await deduplicateByFingerprint("test-org/test-repo", [incoming]);
+
+      // incoming should be closed as duplicate of issueA (#1), not issueB (#2)
+      expect(result).toHaveLength(0);
+      expect(mockGh.commentOnIssue).toHaveBeenCalledWith(
+        "test-org/test-repo", 20,
+        expect.stringContaining("#1"),
+      );
+      expect(mockGh.closeIssue).toHaveBeenCalledWith("test-org/test-repo", 20, "not_planned");
     });
   });
 
@@ -500,9 +530,10 @@ describe("triage-claws-errors", () => {
 
       await run([selfRepo]);
 
-      expect(mockGh.populateQueueCache).toHaveBeenCalledWith(
+      expect(mockGh.populateQueueCacheFor).toHaveBeenCalledWith(
         "needs-triage", "test-org/test-repo",
         expect.objectContaining({ number: 10 }),
+        "issue",
       );
     });
 
@@ -587,6 +618,44 @@ describe("triage-claws-errors", () => {
 
       expect(mockGh.isAllowedActor).toHaveBeenCalledWith("attacker");
       expect(mockClaude.withNewWorktree).not.toHaveBeenCalled();
+    });
+
+    it("fetches comments in parallel: only report-less issues are uninvestigated", async () => {
+      const issueWithReport = mockIssue({
+        number: 11,
+        title: "[claws-error] test:fp1",
+        body: ERROR_BODY,
+      });
+      const issueWithoutReport = mockIssue({
+        number: 12,
+        title: "[claws-error] test:fp2",
+        body: ERROR_BODY,
+      });
+      const issueWithoutReport2 = mockIssue({
+        number: 13,
+        title: "[claws-error] test:fp3",
+        body: ERROR_BODY,
+      });
+      mockGh.isAllowedActor.mockResolvedValue(true);
+      mockGh.listOpenIssues.mockResolvedValue([issueWithReport, issueWithoutReport, issueWithoutReport2]);
+      mockGh.getIssueComments.mockImplementation(async (_repo: string, number: number) => {
+        if (number === 11) return [{ id: 1, body_html: "", body: "## Claws Error Investigation Report\n\nExists", login: "claws-bot" }];
+        return [];
+      });
+
+      await run([selfRepo]);
+
+      expect(mockGh.populateQueueCacheFor).toHaveBeenCalledTimes(2);
+      expect(mockGh.populateQueueCacheFor).toHaveBeenCalledWith(
+        "needs-triage", "test-org/test-repo",
+        expect.objectContaining({ number: 12 }),
+        "issue",
+      );
+      expect(mockGh.populateQueueCacheFor).toHaveBeenCalledWith(
+        "needs-triage", "test-org/test-repo",
+        expect.objectContaining({ number: 13 }),
+        "issue",
+      );
     });
   });
 });

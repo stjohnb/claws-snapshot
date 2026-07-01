@@ -1,8 +1,7 @@
-import fs from "node:fs";
 import path from "node:path";
 import { LABELS, type Repo } from "../config.js";
-import { runRepoScanner, type ScannerSpec } from "./scanner-runner.js";
-import { listWorkflowFiles, parseWorkflow, type ParsedWorkflow } from "./workflow-parser.js";
+import { renderViolationTable, runRepoScanner, type ScannerSpec } from "./scanner-runner.js";
+import { listParsedWorkflows, type ParsedWorkflow } from "./workflow-parser.js";
 
 interface Violation {
   file: string;
@@ -122,49 +121,35 @@ function scanWorkflowFile(filePath: string, workflow: ParsedWorkflow): Violation
 }
 
 function formatIssueBody(violations: Violation[]): string {
-  const lines = [
-    "The following workflow concurrency issues were detected. Misconfigured concurrency groups can cause systemic CI cancellations across branches.\n",
-    "| File | Problem | Details |",
-    "|------|---------|---------|",
-  ];
-
   const problemLabels: Record<Violation["problem"], string> = {
     "missing-workflow-concurrency": "Missing concurrency group",
     "shared-global-group": "Shared global group",
     "deployment-status-github-ref": "deployment_status uses github.ref",
   };
 
-  for (const v of violations) {
-    lines.push(`| \`${v.file}\` | ${problemLabels[v.problem]} | ${v.details} |`);
-  }
-
-  lines.push(
-    "",
-    "**Why this matters:** Without per-branch concurrency groups, GitHub Actions creates a global mutex — only one job runs at a time across all branches. With multiple open PRs, jobs queue up and get cancelled by newer pushes, producing the \"higher priority waiting request\" error.",
-    "",
-    "**Recommended fix:** Add a top-level concurrency group scoped per-branch:",
-    "```yaml",
-    "concurrency:",
-    "  group: <workflow-name>-${{ github.ref }}",
-    "  cancel-in-progress: true",
-    "```",
-  );
-
-  return lines.join("\n");
+  return renderViolationTable({
+    intro:
+      "The following workflow concurrency issues were detected. Misconfigured concurrency groups can cause systemic CI cancellations across branches.\n",
+    columns: ["File", "Problem", "Details"],
+    rows: violations,
+    cells: (v) => [`\`${v.file}\``, problemLabels[v.problem], v.details],
+    footer: [
+      "**Why this matters:** Without per-branch concurrency groups, GitHub Actions creates a global mutex — only one job runs at a time across all branches. With multiple open PRs, jobs queue up and get cancelled by newer pushes, producing the \"higher priority waiting request\" error.",
+      "",
+      "**Recommended fix:** Add a top-level concurrency group scoped per-branch:",
+      "```yaml",
+      "concurrency:",
+      "  group: <workflow-name>-${{ github.ref }}",
+      "  cancel-in-progress: true",
+      "```",
+    ],
+  });
 }
 
 function scan(repoDir: string, repo: Repo): { body: string; summary?: string } | null {
-  const wf = listWorkflowFiles(repoDir);
-  if (!wf) return null;
-
   const allViolations: Violation[] = [];
-  for (const file of wf.files) {
-    const filePath = path.join(wf.dir, file);
-    const content = fs.readFileSync(filePath, "utf-8");
-    const workflow = parseWorkflow(content);
-
+  for (const { filePath, workflow } of listParsedWorkflows(repoDir) ?? []) {
     if (isWorkflowDispatchOnly(workflow)) continue;
-
     const violations = scanWorkflowFile(filePath, workflow);
     allViolations.push(...violations);
   }

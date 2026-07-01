@@ -11,6 +11,7 @@ import { reportError } from "../error-reporter.js";
 import { notify } from "../slack.js";
 import { findPlanComment, type Provider } from "../plan-parser.js";
 import { getModel } from "../model-selector.js";
+import { CLAWS_AUTOMATION_DOC, CLAWS_AUTOMATION_DOC_PATH } from "../resources/claws-info.js";
 
 function buildDocPrompt(fullName: string, planCount = 0): string {
   const lines = [
@@ -39,6 +40,16 @@ function buildDocPrompt(fullName: string, planCount = 0): string {
     `6. Keep OVERVIEW.md concise (200-500 lines). Dedicated docs can be longer`,
     `   as needed for thorough coverage.`,
     `7. Commit with message: "docs: update documentation [doc-maintainer]"`,
+    ``,
+    ``,
+    `A file \`${CLAWS_AUTOMATION_DOC_PATH}\` exists describing how the Claws`,
+    `automation service manages this repo's issues, PRs, and labels. It is`,
+    `maintained automatically — do NOT edit, rewrite, move, or delete it.`,
+    `Ensure \`docs/OVERVIEW.md\` links to it (add a link if missing). Also ensure`,
+    `the repo's root \`CLAUDE.md\` exists and points readers to the \`docs/\` folder`,
+    `for context. If \`CLAUDE.md\` is absent, create it with: a 2-3 sentence`,
+    `description of what the repo does, a "Where to read first" section pointing to`,
+    `\`docs/OVERVIEW.md\`, and any key conventions or gotchas a developer needs to know.`,
     ``,
     `Do NOT make any code changes. Only update documentation.`,
   ];
@@ -109,7 +120,13 @@ async function processRepoInner(repo: Repo): Promise<ProcessResult> {
       const headSha = await claude.getHeadSha(wtPath);
       const lastDocSha = await claude.getLastDocMaintainerSha(wtPath);
 
-      if (lastDocSha && lastDocSha === headSha) {
+      const clawsDocFsPath = path.join(wtPath, CLAWS_AUTOMATION_DOC_PATH);
+      const existingClawsDoc = fs.existsSync(clawsDocFsPath)
+        ? fs.readFileSync(clawsDocFsPath, "utf8")
+        : null;
+      const clawsDocStale = existingClawsDoc !== CLAWS_AUTOMATION_DOC;
+
+      if (lastDocSha && lastDocSha === headSha && !clawsDocStale) {
         log.info(`[doc-maintainer] Skipping ${fullName} — no changes since last doc update`);
         db.recordTaskComplete(taskId, { commits: 0 });
         return { repo: fullName, status: "skipped-no-changes" };
@@ -157,12 +174,7 @@ async function processRepoInner(repo: Repo): Promise<ProcessResult> {
       const model = getModel("sonnet", "tool-use", "claude");
       db.updateTaskModel(taskId, model);
       let actualProvider: Provider = "claude";
-      let taskTokensUsed: number | undefined;
-      let taskCostUsd: number | undefined;
-      await claude.runClaude(prompt, wtPath, { capability: "tool-use", tier: "sonnet", model, onProviderUsed: (p) => { actualProvider = p; }, onTokensUsed: (t, c) => { taskTokensUsed = t; taskCostUsd = c; } });
-      if (taskTokensUsed !== undefined && taskCostUsd !== undefined) {
-        db.updateTaskTokenUsage(taskId, taskTokensUsed, taskCostUsd);
-      }
+      await claude.runClaude(prompt, wtPath, { capability: "tool-use", tier: "sonnet", model, onProviderUsed: (p) => { actualProvider = p; }, onTokensUsed: db.trackTaskTokens(taskId) });
 
       // Clean up temporary plans directory (must not be committed)
       const plansDir = path.join(wtPath, ".plans");
@@ -173,6 +185,15 @@ async function processRepoInner(repo: Repo): Promise<ProcessResult> {
         } catch {
           // Not staged, that's fine
         }
+      }
+
+      // Sync the canonical Claws automation doc deterministically (Claude must not own its content).
+      fs.mkdirSync(path.dirname(clawsDocFsPath), { recursive: true });
+      fs.writeFileSync(clawsDocFsPath, CLAWS_AUTOMATION_DOC);
+      await claude.git(["add", CLAWS_AUTOMATION_DOC_PATH], wtPath);
+      const stagedClawsDoc = await claude.git(["diff", "--cached", "--name-only", "--", CLAWS_AUTOMATION_DOC_PATH], wtPath);
+      if (stagedClawsDoc.trim()) {
+        await claude.git(["commit", "-m", "docs: sync Claws automation guide [doc-maintainer]"], wtPath);
       }
 
       // Step 5: Push and create PR
