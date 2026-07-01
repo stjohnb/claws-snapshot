@@ -3,9 +3,9 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 const { mockConfig } = vi.hoisted(() => ({
   mockConfig: {
     EMAIL_ENABLED: true,
-    EMAIL_USER: "brendanserver@gmail.com",
+    EMAIL_USER: "user@example.com",
     EMAIL_APP_PASSWORD: "test-password",
-    EMAIL_RECIPIENT: "brendan@bstjohn.net",
+    EMAIL_RECIPIENT: "recipient@example.com",
   },
 }));
 
@@ -89,9 +89,9 @@ describe("email-monitor", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockConfig.EMAIL_ENABLED = true;
-    mockConfig.EMAIL_USER = "brendanserver@gmail.com";
+    mockConfig.EMAIL_USER = "user@example.com";
     mockConfig.EMAIL_APP_PASSWORD = "test-password";
-    mockConfig.EMAIL_RECIPIENT = "brendan@bstjohn.net";
+    mockConfig.EMAIL_RECIPIENT = "recipient@example.com";
     mockSearch.mockResolvedValue([]);
   });
 
@@ -149,6 +149,8 @@ describe("email-monitor", () => {
 
     // First Claude call: extract veg list
     expect(mockClaude.runClaude).toHaveBeenCalledTimes(2);
+    expect(mockClaude.runClaude.mock.calls[0][2]).toMatchObject({ provider: "claude" });
+    expect(mockClaude.runClaude.mock.calls[1][2]).toMatchObject({ provider: "claude" });
     const extractPrompt = mockClaude.runClaude.mock.calls[0][0] as string;
     expect(extractPrompt).toContain("vegetable");
 
@@ -161,7 +163,7 @@ describe("email-monitor", () => {
     expect(mockSendMail).toHaveBeenCalledOnce();
     expect(mockSendMail).toHaveBeenCalledWith(
       expect.objectContaining({
-        to: "brendan@bstjohn.net",
+        to: "recipient@example.com",
         subject: expect.stringContaining("Veg Box Recipes"),
       }),
     );

@@ -120,8 +120,7 @@ async function processPendingFile(filePath: string, repos: Repo[]): Promise<void
   for (const idea of accepted) {
     try {
       // Dedup: skip if an open issue with the same title already exists
-      const existing = await gh.searchIssues(pending.repo, idea.title);
-      const exactMatch = existing.find((e) => e.title === idea.title);
+      const exactMatch = await gh.findIssueByExactTitle(pending.repo, idea.title);
       if (exactMatch) {
         log.info(`[idea-collector] Skipping issue creation for "${idea.title}" — already exists as #${exactMatch.number}`);
         idea.issueNumber = exactMatch.number;

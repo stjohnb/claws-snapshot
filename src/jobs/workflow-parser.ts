@@ -166,3 +166,23 @@ export function listWorkflowFiles(repoDir: string): { dir: string; files: string
   }
   return { dir, files: entries.filter((f) => f.endsWith(".yml") || f.endsWith(".yaml")) };
 }
+
+export interface ParsedWorkflowFile {
+  file: string;
+  filePath: string;
+  content: string;
+  workflow: ParsedWorkflow;
+}
+
+export function listParsedWorkflows(repoDir: string): ParsedWorkflowFile[] | null {
+  const wf = listWorkflowFiles(repoDir);
+  if (!wf) return null;
+
+  const result: ParsedWorkflowFile[] = [];
+  for (const file of wf.files) {
+    const filePath = path.join(wf.dir, file);
+    const content = fs.readFileSync(filePath, "utf-8");
+    result.push({ file, filePath, content, workflow: parseWorkflow(content) });
+  }
+  return result;
+}

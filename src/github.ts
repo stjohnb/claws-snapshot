@@ -12,7 +12,7 @@ import { sleep } from "./util.js";
 import { retryWithBackoff } from "./retry.js";
 
 const RATE_LIMIT_RE = /rate limit/i;
-const TRANSIENT_RE = /\b(400|401|500|502|503|504|ETIMEDOUT|ECONNRESET|ECONNREFUSED|connection reset)\b|Could not resolve to a|TLS handshake timeout|Something went wrong|i\/o timeout|invalid character/i;
+const TRANSIENT_RE = /\b(400|401|500|502|503|504|ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAGAIN|connection reset)\b|Could not resolve to a|TLS handshake timeout|Something went wrong|i\/o timeout|invalid character|failed to create new OS thread|resource temporarily unavailable|unexpected EOF/i;
 const MAX_RETRIES = 3;
 
 // ── Circuit breaker (rate limit protection) ──
@@ -229,56 +229,17 @@ export async function isAllowedActor(login: string): Promise<boolean> {
 const CI_FAILURE_ALERT_BOT_LOGINS = ["github-actions[bot]", "app/github-actions"];
 
 /**
- * Title conventions used by repos' notify-on-failure CI workflows. Adding a new
- * convention is a one-line edit here. Each entry is tested case-sensitively
- * against the issue title; `prefix` matches the start, `exact` matches the whole
- * title. The legacy `[main] <workflow> failed on main` shape is handled
- * separately below because it constrains both ends of the title.
- */
-const CI_ALERT_TITLE_MATCHERS: Array<{ prefix?: string; exact?: string }> = [
-  { prefix: "Build failure:" },
-  { prefix: "Cypress:" },
-  { prefix: "Lighthouse regression" },
-  { prefix: "Database backup:" },
-  { exact: "Docker publish failure" },
-];
-
-/**
- * True for CI-failure alert issues auto-filed by a repo's notify-on-failure CI
- * workflow. Authored by the GitHub Actions bot (not an allowed actor), but the
- * refine-and-fix flow is meant to pick them up, so the dispatcher's actor gate
- * grants them an exception. Requires BOTH a github-actions bot author AND a
- * recognised CI-alert title convention — so a human-titled issue can't slip past
- * the actor gate. Recognised conventions:
- *   - `[main] <workflow> failed on main` (legacy notify-failures.yml)
- *   - `Build failure: …`
- *   - `Cypress: …`
- *   - `Lighthouse regression …`
- *   - `Database backup: …` (namey database-backup failure alert)
- *   - `Docker publish failure` (GHCR docker-publish failure alert)
- */
-export function isCiFailureAlertIssue(issue: { title: string; author: { login: string } }): boolean {
-  if (!CI_FAILURE_ALERT_BOT_LOGINS.includes(issue.author.login)) return false;
-  const title = issue.title;
-  // Legacy notify-failures convention: `[main] <workflow> failed on main`.
-  if (title.startsWith("[main] ") && title.endsWith(" failed on main")) return true;
-  return CI_ALERT_TITLE_MATCHERS.some((m) =>
-    (m.prefix !== undefined && title.startsWith(m.prefix)) ||
-    (m.exact !== undefined && title === m.exact),
-  );
-}
-
-/**
- * True if the issue's author is the GitHub Actions bot — in either the
+ * True if the issue's author is the GitHub Actions runner bot — in either the
  * gh-CLI `app/github-actions` form or the REST `github-actions[bot]` form.
- * CI-alert bots are never treated as disallowed human actors: their issues
- * (build failures, Lighthouse/Cypress regressions, etc.) are bot
- * notifications, not human work items, so the dispatcher skips them silently
- * rather than flagging an untrusted actor. Distinct from
- * `isCiFailureAlertIssue`, which additionally opts `[main] … failed on main`
- * issues INTO the refine-and-fix flow.
+ * Issues filed by this bot are CI/automation alerts (build failures, migration
+ * failures, Lighthouse/Cypress regressions, etc.), not human work items, so the
+ * issue-dispatcher's actor gate dispatches them into the refine-and-fix pipeline
+ * even though the bot is not in `allowedActors`. This replaces the former
+ * title-allowlist approach: any runner-authored issue is opted in, regardless of
+ * title. Other bots (dependabot, etc.) are NOT covered — only the github-actions
+ * runner logins in `CI_FAILURE_ALERT_BOT_LOGINS`.
  */
-export function isCiAlertBotAuthor(issue: { author: { login: string } }): boolean {
+export function isCiAlertBotAuthor(issue: { author: { login: string }; title?: string }): boolean {
   return CI_FAILURE_ALERT_BOT_LOGINS.includes(issue.author.login);
 }
 
@@ -383,6 +344,22 @@ export function populateQueueCache(category: QueueCategory, repo: string, item: 
       labels: item.labels,
     },
     fetchedAt: Date.now(),
+  });
+}
+
+export function populateQueueCacheFor(
+  category: QueueCategory,
+  repo: string,
+  item: { number: number; title: string; updatedAt?: string; labels: { name: string }[] },
+  type: "issue" | "pr",
+): void {
+  populateQueueCache(category, repo, {
+    number: item.number,
+    title: item.title,
+    type,
+    updatedAt: item.updatedAt,
+    priority: hasPriorityLabel(item.labels),
+    labels: item.labels.map((l) => l.name),
   });
 }
 
@@ -662,6 +639,44 @@ async function fetchRepos(): Promise<Repo[]> {
   return repos;
 }
 
+/** A public repo discovered for scanning. Carries archived state so callers can
+ * route alerts appropriately (archived repos reject issue creation). */
+export interface PublicRepoEntry extends Repo {
+  isArchived: boolean;
+}
+
+/**
+ * Enumerate every PUBLIC repo (archived and active) across all configured
+ * owners. Unlike {@link listRepos}/`fetchRepos`, this does NOT filter out
+ * archived repos — covering archived repos is the whole point of this path.
+ *
+ * Limitation: enumeration uses the installation-repositories endpoint, so it
+ * only returns repos the GitHub App is actually installed on. Public repos
+ * where the App is not installed cannot be discovered or scanned here. This is
+ * the same reach as `fetchRepos()`.
+ */
+export async function listPublicReposIncludingArchived(): Promise<PublicRepoEntry[]> {
+  const out: PublicRepoEntry[] = [];
+  for (const owner of GITHUB_OWNERS) {
+    try {
+      const entries = await listInstallationRepositories(owner);
+      for (const e of entries) {
+        if (e.isPrivate) continue; // public repos only
+        out.push({
+          owner: e.owner,
+          name: e.name,
+          fullName: e.fullName,
+          defaultBranch: e.defaultBranch,
+          isArchived: e.isArchived,
+        });
+      }
+    } catch (err) {
+      reportError("github:list-public-repos", owner, err);
+    }
+  }
+  return out;
+}
+
 // ── Issue search & creation ──
 
 export async function searchIssues(
@@ -683,6 +698,15 @@ export async function searchIssues(
     titleQuery,
   ]);
   return safeJsonParse(z.array(SearchResultSchema), raw, "search issues");
+}
+
+// GitHub issue search is substring-based; narrow to an exact title match to avoid acting on a partially-matching issue.
+export async function findIssueByExactTitle(
+  repo: string,
+  title: string,
+): Promise<{ number: number; title: string } | null> {
+  const results = await searchIssues(repo, title);
+  return results.find((r) => r.title === title) ?? null;
 }
 
 export async function searchPRs(
@@ -2077,5 +2101,200 @@ export async function fetchWorkflowRunById(repo: string, runId: number): Promise
     log.warn(`[github] Failed to fetch workflow run ${runId} for ${repo}: ${err}`);
     return null;
   }
+}
+
+// ── Actions storage usage (caches + artifacts) ──
+
+const CacheUsageSchema = z.object({
+  active_caches_count: z.number(),
+  active_caches_size_in_bytes: z.number(),
+});
+
+export interface RepoStorageUsage {
+  repo: string;
+  cacheBytes: number;
+  cacheCount: number;
+  artifactBytes: number;
+  artifactCount: number;
+  oldestArtifactAt: string | null;
+}
+
+function isNotFoundError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /\b404\b/.test(msg) || /HTTP 404/i.test(msg) || /not found/i.test(msg);
+}
+
+// GET /repos/{repo}/actions/cache/usage — repos with Actions disabled 404; treat as zero.
+export async function fetchRepoCacheUsage(repo: string): Promise<{ bytes: number; count: number }> {
+  try {
+    const raw = await gh(["api", `repos/${repo}/actions/cache/usage`]);
+    const parsed = safeJsonParse(CacheUsageSchema, raw, `cache usage for ${repo}`);
+    return { bytes: parsed.active_caches_size_in_bytes, count: parsed.active_caches_count };
+  } catch (err) {
+    if (isNotFoundError(err)) {
+      log.warn(`[github] Actions cache usage unavailable for ${repo} (treating as zero): ${err}`);
+      return { bytes: 0, count: 0 };
+    }
+    throw err;
+  }
+}
+
+// `gh api --paginate --jq` emits one JSON object per line (NOT a single array).
+export function parseArtifactLines(raw: string): { bytes: number; count: number; oldestAt: string | null } {
+  const lines = raw.trim().split("\n").filter(Boolean);
+  let bytes = 0;
+  let count = 0;
+  let oldestAt: string | null = null;
+  for (const line of lines) {
+    const obj = JSON.parse(line) as { size: number; created: string; expired: boolean };
+    if (obj.expired === true) continue;
+    bytes += obj.size;
+    count++;
+    // ISO-8601 timestamps sort correctly as strings.
+    if (oldestAt === null || obj.created < oldestAt) oldestAt = obj.created;
+  }
+  return { bytes, count, oldestAt };
+}
+
+// GET /repos/{repo}/actions/artifacts — paginated; repos with Actions disabled 404.
+export async function fetchRepoArtifactUsage(
+  repo: string,
+): Promise<{ bytes: number; count: number; oldestAt: string | null }> {
+  try {
+    const raw = await gh([
+      "api",
+      `repos/${repo}/actions/artifacts`,
+      "--paginate",
+      "--jq",
+      ".artifacts[] | {size: .size_in_bytes, created: .created_at, expired: .expired}",
+    ]);
+    return parseArtifactLines(raw);
+  } catch (err) {
+    if (isNotFoundError(err)) {
+      log.warn(`[github] Actions artifacts unavailable for ${repo} (treating as zero): ${err}`);
+      return { bytes: 0, count: 0, oldestAt: null };
+    }
+    throw err;
+  }
+}
+
+// ── Dependabot alerts ──
+
+export class DependabotAlertsPermissionError extends Error {
+  constructor(public readonly repo: string, message: string) {
+    super(message);
+    this.name = "DependabotAlertsPermissionError";
+  }
+}
+
+export interface DependabotAlert {
+  number: number;
+  severity: string;
+  packageName: string;
+  ecosystem: string;
+  summary: string;
+  ghsaId: string;
+  htmlUrl: string;
+  manifestPath?: string;
+  patchedVersion?: string;
+}
+
+export async function listOpenDependabotAlerts(repo: string): Promise<DependabotAlert[]> {
+  let raw: string;
+  try {
+    raw = await gh(["api", `repos/${repo}/dependabot/alerts?state=open&per_page=100`]);
+  } catch (err) {
+    const msg = String((err as Error)?.message ?? err);
+    if (/resource not accessible by integration/i.test(msg)) {
+      throw new DependabotAlertsPermissionError(repo, msg);
+    }
+    // 404 / "disabled" / other 403 → Dependabot alerts not enabled on this repo
+    if (/\b40[34]\b/.test(msg) || /HTTP 40[34]/i.test(msg) || /not found/i.test(msg) || /disabled/i.test(msg)) {
+      return [];
+    }
+    throw err;
+  }
+  const arr = JSON.parse(raw) as any[];
+  return arr.map((a) => ({
+    number: a.number,
+    severity: a.security_advisory?.severity ?? a.security_vulnerability?.severity ?? "unknown",
+    packageName: a.dependency?.package?.name ?? "unknown",
+    ecosystem: a.dependency?.package?.ecosystem ?? "",
+    summary: a.security_advisory?.summary ?? "",
+    ghsaId: a.security_advisory?.ghsa_id ?? "",
+    htmlUrl: a.html_url ?? "",
+    manifestPath: a.dependency?.manifest_path,
+    patchedVersion: a.security_vulnerability?.first_patched_version?.identifier,
+  }));
+}
+
+export async function dismissDependabotAlert(
+  repo: string,
+  number: number,
+  reason: string,
+  comment: string,
+): Promise<void> {
+  await gh([
+    "api",
+    "--method", "PATCH",
+    `repos/${repo}/dependabot/alerts/${number}`,
+    "-f", "state=dismissed",
+    "-f", `dismissed_reason=${reason}`,
+    "-f", `dismissed_comment=${comment}`,
+  ]);
+}
+
+export interface SbomPackage { name: string; version: string }
+
+export async function fetchRepoSbomPackages(repo: string): Promise<SbomPackage[]> {
+  let raw: string;
+  try {
+    raw = await gh(["api", `repos/${repo}/dependency-graph/sbom`]);
+  } catch (err) {
+    const msg = String((err as Error)?.message ?? err);
+    if (/\b40[34]\b/.test(msg) || /HTTP 40[34]/i.test(msg) || /not found/i.test(msg) || /disabled/i.test(msg)) {
+      return [];
+    }
+    throw err;
+  }
+  const parsed = JSON.parse(raw) as { sbom?: { packages?: Array<{ name?: string; versionInfo?: string }> } };
+  const pkgs = parsed.sbom?.packages ?? [];
+  return pkgs
+    .filter((p) => p.name && p.versionInfo)
+    .map((p) => {
+      const colon = p.name!.indexOf(":");
+      const name = (colon >= 0 ? p.name!.slice(colon + 1) : p.name!).toLowerCase();
+      return { name, version: p.versionInfo! };
+    });
+}
+
+export async function fetchRepoFileContent(repo: string, path: string): Promise<string | null> {
+  let raw: string;
+  try {
+    raw = await gh(["api", `repos/${repo}/contents/${path}`, "--jq", ".content"]);
+  } catch (err) {
+    const msg = String((err as Error)?.message ?? err);
+    if (/\b40[34]\b/.test(msg) || /HTTP 40[34]/i.test(msg) || /not found/i.test(msg)) return null;
+    throw err;
+  }
+  const b64 = raw.trim();
+  if (!b64) return null;
+  return Buffer.from(b64, "base64").toString("utf8");
+}
+
+// Combine cache + artifact usage. Each sub-call is fault-tolerant for 404s.
+export async function fetchRepoStorageUsage(repo: string): Promise<RepoStorageUsage> {
+  const [cache, artifacts] = await Promise.all([
+    fetchRepoCacheUsage(repo),
+    fetchRepoArtifactUsage(repo),
+  ]);
+  return {
+    repo,
+    cacheBytes: cache.bytes,
+    cacheCount: cache.count,
+    artifactBytes: artifacts.bytes,
+    artifactCount: artifacts.count,
+    oldestArtifactAt: artifacts.oldestAt,
+  };
 }
 

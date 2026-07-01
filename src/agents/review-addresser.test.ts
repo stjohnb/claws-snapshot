@@ -38,6 +38,8 @@ const { mockGh, mockClaude, mockDb } = vi.hoisted(() => ({
     editIssueComment: vi.fn(),
     hasPriorityLabel: vi.fn().mockReturnValue(false),
     stripClawsMarker: vi.fn((body: string) => body),
+    getPRCheckStatus: vi.fn().mockResolvedValue("passing"),
+    getPRMergeableState: vi.fn().mockResolvedValue("MERGEABLE"),
   },
   mockClaude: {
     withExistingWorktree: vi.fn(),
@@ -56,6 +58,7 @@ const { mockGh, mockClaude, mockDb } = vi.hoisted(() => ({
     updateTaskWorktree: vi.fn(),
     updateTaskModel: vi.fn(),
     updateTaskTokenUsage: vi.fn(),
+    trackTaskTokens: vi.fn().mockReturnValue(vi.fn()),
     recordTaskComplete: vi.fn(),
     recordTaskFailed: vi.fn(),
     withTaskRecording: vi.fn(async (jobName: string, repo: string, itemNumber: number, triggerLabel: string | null, fn: (taskId: number) => Promise<unknown>) => {
@@ -82,7 +85,7 @@ vi.mock("../images.js", () => ({
   processTextForImages: mockProcessTextForImages,
 }));
 
-import { processPR } from "./review-addresser.js";
+import { processPR, isBenignNoChangeOutput } from "./review-addresser.js";
 import { AgentCliError } from "../claude.js";
 
 describe("review-addresser", () => {
@@ -397,5 +400,96 @@ describe("review-addresser", () => {
       pr.number,
       "## Summary\nUpdated\n\nPart of #5",
     );
+  });
+
+  it("benign no-change output with CI passing — adds Ready label", async () => {
+    const pr = mockPR({ headRefName: "claws/fix-123" });
+    mockClaude.hasNewCommits.mockResolvedValue(false);
+    mockClaude.runClaude.mockResolvedValue("The nit was already addressed in an earlier commit; no further changes needed.");
+    mockGh.getPRCheckStatus.mockResolvedValue("passing");
+    mockGh.getPRMergeableState.mockResolvedValue("MERGEABLE");
+
+    await processPR(repo, pr, reviewData);
+
+    expect(mockGh.addLabel).toHaveBeenCalledWith(repo.fullName, pr.number, "Ready");
+    expect(mockDb.recordTaskComplete).toHaveBeenCalledWith(1, expect.any(Object));
+  });
+
+  it("benign no-change output with CI failing — does NOT add Ready label", async () => {
+    const pr = mockPR({ headRefName: "claws/fix-123" });
+    mockClaude.hasNewCommits.mockResolvedValue(false);
+    mockClaude.runClaude.mockResolvedValue("This was already addressed. No changes needed.");
+    mockGh.getPRCheckStatus.mockResolvedValue("failing");
+    mockGh.getPRMergeableState.mockResolvedValue("MERGEABLE");
+
+    await processPR(repo, pr, reviewData);
+
+    expect(mockGh.addLabel).not.toHaveBeenCalledWith(repo.fullName, pr.number, "Ready");
+  });
+
+  it("benign no-change output with merge conflict — does NOT add Ready label", async () => {
+    const pr = mockPR({ headRefName: "claws/fix-123" });
+    mockClaude.hasNewCommits.mockResolvedValue(false);
+    mockClaude.runClaude.mockResolvedValue("This was already addressed. No changes needed.");
+    mockGh.getPRCheckStatus.mockResolvedValue("passing");
+    mockGh.getPRMergeableState.mockResolvedValue("CONFLICTING");
+
+    await processPR(repo, pr, reviewData);
+
+    expect(mockGh.addLabel).not.toHaveBeenCalledWith(repo.fullName, pr.number, "Ready");
+  });
+
+  it("non-benign output — does NOT add Ready label even with CI passing", async () => {
+    const pr = mockPR({ headRefName: "claws/fix-123" });
+    mockClaude.hasNewCommits.mockResolvedValue(false);
+    mockClaude.runClaude.mockResolvedValue("I was unable to apply this change because the file no longer exists.");
+    mockGh.getPRCheckStatus.mockResolvedValue("passing");
+    mockGh.getPRMergeableState.mockResolvedValue("MERGEABLE");
+
+    await processPR(repo, pr, reviewData);
+
+    expect(mockGh.addLabel).not.toHaveBeenCalledWith(repo.fullName, pr.number, "Ready");
+  });
+});
+
+describe("isBenignNoChangeOutput", () => {
+  it("returns true for already-addressed nit message", () => {
+    expect(isBenignNoChangeOutput("The dead-code spread was already removed in commit 2222c3d. No further changes are needed.")).toBe(true);
+  });
+
+  it("returns true for short already-addressed confirmation", () => {
+    expect(isBenignNoChangeOutput("This was already addressed.")).toBe(true);
+  });
+
+  it("returns true for not-applicable confirmation", () => {
+    expect(isBenignNoChangeOutput("No changes needed — the suggestion is not applicable.")).toBe(true);
+  });
+
+  it("returns true for false-positive confirmation", () => {
+    expect(isBenignNoChangeOutput("False positive; the code is already correct.")).toBe(true);
+  });
+
+  it("returns false for empty string", () => {
+    expect(isBenignNoChangeOutput("")).toBe(false);
+  });
+
+  it("returns false for whitespace-only string", () => {
+    expect(isBenignNoChangeOutput("   ")).toBe(false);
+  });
+
+  it("returns false when implementation was blocked", () => {
+    expect(isBenignNoChangeOutput("I could not implement this because the API does not expose that field.")).toBe(false);
+  });
+
+  it("returns false when output contains left-unchanged signal", () => {
+    expect(isBenignNoChangeOutput("Why did you choose X? Because Y, but I left it unchanged for now.")).toBe(false);
+  });
+
+  it("returns false for error output", () => {
+    expect(isBenignNoChangeOutput("Encountered an error running the build.")).toBe(false);
+  });
+
+  it("returns false when manual review is required", () => {
+    expect(isBenignNoChangeOutput("This requires manual review.")).toBe(false);
   });
 });

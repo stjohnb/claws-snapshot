@@ -13,6 +13,26 @@ import { getModel } from "../model-selector.js";
 import { extractRecommendedModel } from "./pr-reviewer.js";
 import type { Provider } from "../plan-parser.js";
 
+/**
+ * Detect Review-Addresser text output that merely confirms there was nothing to
+ * change (e.g. a reviewer nit that was already addressed, or a false-positive
+ * finding) rather than flagging a real blocker, question-answer-with-caveats, or
+ * error. Such output should NOT withhold the Ready label. See #1730.
+ * Conservative: returns false if ANY blocker/error/uncertainty signal is present.
+ */
+export function isBenignNoChangeOutput(output: string): boolean {
+  const text = output.trim();
+  if (!text) return false; // empty is handled separately
+
+  // Blocker / error / uncertainty signals → NOT benign.
+  if (/\b(error|errors|failed|failure|exception|could ?n[o']?t|cannot|can['']t|unable to|blocked|requires? (a )?manual|needs? (a )?manual|human (intervention|attention|review)|please (review|advise|clarify|confirm)|i (was|am) unable|did not implement|didn['']t implement|left (un)?(addressed|changed)|out of scope|TODO|FIXME)\b/i.test(text)) {
+    return false;
+  }
+
+  // Positive "no change needed" confirmation required.
+  return /\b(already (addressed|removed|fixed|resolved|done|present|correct|handled|in place)|no (changes?|action|modifications?|edits?|fixes?)\s+(needed|required|necessary)|nothing to (address|change|fix|do)|no further (changes?|action)\s+(needed|required|necessary)?|not applicable|false positive|(was|were|is|are) already (addressed|fixed|removed|resolved|correct|present|handled))\b/i.test(text);
+}
+
 export async function processPR(repo: Repo, pr: gh.PR, reviewData: gh.PRReviewData): Promise<void> {
   const fullName = repo.fullName;
   log.info(`[review-addresser] Processing PR #${pr.number} in ${fullName}`);
@@ -63,12 +83,7 @@ export async function processPR(repo: Repo, pr: gh.PR, reviewData: gh.PRReviewDa
         const model = getModel(recommendedTier, "tool-use", "claude");
         db.updateTaskModel(taskId, model);
         let actualProvider: Provider = "claude";
-        let taskTokensUsed: number | undefined;
-        let taskCostUsd: number | undefined;
-        const claudeOutput = await claude.runClaude(prompt, wtPath, { capability: "tool-use", mcpConfig: mcpConfigPath, timeoutMs, tier: recommendedTier, model, appendSystemPrompt: agentDoc, onProviderUsed: (p) => { actualProvider = p; }, onTokensUsed: (t, c) => { taskTokensUsed = t; taskCostUsd = c; }, agent: "build", envSanitization: "passthrough" });
-        if (taskTokensUsed !== undefined && taskCostUsd !== undefined) {
-          db.updateTaskTokenUsage(taskId, taskTokensUsed, taskCostUsd);
-        }
+        const claudeOutput = await claude.runClaude(prompt, wtPath, { capability: "tool-use", mcpConfig: mcpConfigPath, timeoutMs, tier: recommendedTier, model, appendSystemPrompt: agentDoc, onProviderUsed: (p) => { actualProvider = p; }, onTokensUsed: db.trackTaskTokens(taskId), agent: "build", envSanitization: "passthrough" });
 
         let outcome: TaskOutcome = { commits: 0 };
 
@@ -127,10 +142,28 @@ export async function processPR(repo: Repo, pr: gh.PR, reviewData: gh.PRReviewDa
         // When no commits were pushed and no issues reported, restore Ready label.
         // Since HEAD is unchanged, pr-reviewer's hasNewCommitsSinceLastReview()
         // will return false and it will never re-fire — so we must restore Ready here.
-        // When there IS output (an issue), don't add Ready — human attention needed.
+        // When there IS a genuine issue, don't add Ready — human attention needed.
         // When commits were pushed, pr-reviewer will detect the new HEAD next cycle.
         if (!hasNewCommits && !claudeOutput.trim()) {
           await gh.addLabel(fullName, pr.number, LABELS.ready);
+        } else if (!hasNewCommits && isBenignNoChangeOutput(claudeOutput)) {
+          // The addresser produced text, but it only confirms there was nothing to
+          // change (e.g. a reviewer nit already addressed, or a false-positive
+          // finding). This is not a blocker, so the PR is still ready — apply Ready
+          // if CI passes and there are no merge conflicts. See #1730.
+          try {
+            const [ciStatus, mergeState] = await Promise.all([
+              gh.getPRCheckStatus(fullName, pr.number),
+              gh.getPRMergeableState(fullName, pr.number),
+            ]);
+            if (ciStatus === "passing" && mergeState !== "CONFLICTING") {
+              await gh.addLabel(fullName, pr.number, LABELS.ready);
+            } else {
+              log.info(`[review-addresser] Benign no-change output for ${fullName}#${pr.number} but CI=${ciStatus}/merge=${mergeState} — not applying Ready`);
+            }
+          } catch (err) {
+            log.warn(`[review-addresser] Could not check CI/merge state for benign no-change output on ${fullName}#${pr.number} — skipping ready label: ${err}`);
+          }
         }
         db.recordTaskComplete(taskId, outcome);
       },

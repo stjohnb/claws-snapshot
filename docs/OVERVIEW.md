@@ -8,7 +8,7 @@ Linux systemd service.
 
 ## Architecture
 
-> **See also:** [ARCHITECTURE.md](ARCHITECTURE.md) for visual Mermaid diagrams of the same architecture (system overview, module layering, dispatcher fan-out, issue/PR lifecycles, Claude invocation path).
+> **See also:** [ARCHITECTURE.md](ARCHITECTURE.md) for visual Mermaid diagrams of the same architecture (system overview, module layering, dispatcher fan-out, issue/PR lifecycles, Claude invocation path). [claws-automation.md](claws-automation.md) describes how Claws automates this repository's issue/PR lifecycle (maintained automatically — do not edit).
 
 ```
 src/
@@ -21,7 +21,8 @@ src/
 ├── claude.ts            CLI runner (Claude/Codex/OpenCode backends), provider circuit breaker + fallback, bounded concurrent queue, git worktree helpers
 ├── db.ts                SQLite task tracking (better-sqlite3)
 ├── server.ts            HTTP server — dashboard, health, status, manual triggers
-├── sessions.ts          Interactive PTY session manager — node-pty processes, scrollback buffer, WebSocket bridge
+├── capabilities.ts      Session capability registry — defines four gated capability bundles (home-assistant, namey-db, prod-infra, fleet-infra); exports `buildCapabilityEnvArgs` (strips ungranterd env keys via `env -u`, injects granted ones as argv elements) and `buildCapabilityPrompt` (generates `--append-system-prompt` text listing only granted capabilities — returns "" when nothing granted so callers omit the flag entirely); `CAPABILITIES` registry reads live config bindings at call time to reflect reloads
+├── sessions.ts          Interactive PTY session manager — node-pty processes, scrollback buffer, WebSocket bridge; multi-repo sessions via `createMultiWorktreeSession`; session resume via `resumeSession`
 ├── log.ts               Timestamped logging + Slack error escalation
 ├── slack.ts             Slack incoming-webhook + Bot API (ideas, notifications)
 ├── model-selector.ts    Provider-aware model selection (Claude/Codex/OpenCode, cheap/sonnet/opus tiers, config override)
@@ -29,14 +30,14 @@ src/
 ├── ollama-rate-limit-classifier.ts  Ollama-based rate-limit error classification with regex fallback and circuit breaker
 ├── error-reporter.ts    Deduplicating GitHub issue-based error reporter (filters ShutdownError, RateLimitError, transient API 5xx)
 ├── images.ts            Image/attachment extraction + download for issue/PR context
-├── whatsapp.ts          WhatsApp Web client (Baileys) — QR pairing, message routing, Slack pairing alerts
+├── whatsapp.ts          WhatsApp Web client (Baileys) — QR pairing, message routing, Slack pairing alerts; `downloadAudio` enforces the 25 MB cap while streaming (not after buffering) so oversized/malformed media cannot drive memory up before the check
 ├── transcribe.ts        Voice-note transcription — tries local Whisper (`whisperBaseUrl`) first with a circuit-breaker (disabled for 5 min after 3 consecutive failures), falls back to OpenAI Whisper API; `isAvailable()` returns true if either backend is configured
 ├── format.ts            Duration formatting (formatMs: milliseconds → human-readable)
 ├── version.ts           Build-time injected version string
 ├── plan-parser.ts       Parses multi-PR implementation plans into phases
 ├── timeout-handler.ts   Per-item Claude timeout escalation and auto-skip
 ├── outcome.ts           Task outcome builders (success/failure metadata, failure categorization)
-├── occurrence-tracking.ts  Shared occurrence-tracking helpers for recurring alert issues — `appendOccurrenceTracking`, `updateOccurrenceTracking`, `applyOccurrenceTracking`, plus the higher-level `ensureAlertIssue({ repo, title, body, labels?, timestamp?, logPrefix })` that does the search → update-or-create + warn-on-regex-miss flow; used by error-reporter, k3s-monitor, and runner-monitor to edit issue bodies on recurrence instead of posting new comments
+├── occurrence-tracking.ts  Shared occurrence-tracking helpers for recurring alert issues — `appendOccurrenceTracking`, `updateOccurrenceTracking`, `applyOccurrenceTracking`, plus the higher-level `ensureAlertIssue({ repo, title, body, labels?, timestamp?, logPrefix })` that does the search → update-or-create + warn-on-regex-miss flow; used by error-reporter, main.ts (unknown-config-key reporting), k3s-monitor, and runner-monitor to edit issue bodies on recurrence instead of posting new comments
 ├── prompt-guard.ts      Prompt injection detection and content redaction
 ├── mcp-server.ts        MCP server — exposes Claws state to Claude sessions
 ├── namey-query.ts       Handler logic for namey_query MCP tool (read-only SQL against namey PostgreSQL)
@@ -45,12 +46,14 @@ src/
 ├── worker.ts            SQLite-backed work queue — `N` worker fibers (default 2, `MAX_WORK_WORKERS`) claim rows from `work_queue`, execute registered handlers, handle `ShutdownError`/`RateLimitError`/timeout escalation, and recover stuck `running` rows on startup via `recoverWorkOnStartup()`; exports `AGENT_KINDS` constants, `enqueue()`, `registerHandler()`, `workerStatus()`, and `start()`
 ├── work-handlers.ts     Registers all per-kind work handlers with `worker.ts` via `registerAll()` — one handler per `AGENT_KINDS` constant; each handler re-fetches the live issue/PR state before invoking the agent, ensuring stale queue entries are handled gracefully; also wires the auto-merger sweep chain (every agent handler that mutates a PR enqueues an `AUTO_MERGER_SWEEP` in its `finally` block)
 ├── retry.ts             `retryWithBackoff(fn, maxRetries, isTransient, label)` — generic exponential-backoff retry helper (1s/2s/4s delays) extracted from `gh()` and `git()`; callers supply their own `isTransient` predicate
-├── json-extract.ts      `extractJsonCandidates(output)` — multi-strategy JSON extraction for LLM outputs; tries greedy fence match, non-greedy fence match, and brace-balanced extraction; used by `improvement-identifier`, `idea-suggester`, and other jobs that parse structured JSON from Claude
-├── util.ts              `sleep(ms)` — shared async sleep helper; `resolveIdentityFile(path)` — expands leading `~/` to the user's home directory. Imported by `worker.ts`, `github.ts`, `agents/problematic-pr-diagnoser.ts`, `jobs/datasette-export.ts`, and `jobs/runner-monitor.ts`
-├── mcp-result.ts        Shared MCP tool-result helpers (`ToolResult` interface, `textResult`, `errorResult`) — pure, no config/runtime dependencies; imported by `namey-query.ts` and `ha-mcp.ts` (extracted from those modules to avoid duplication; `ha-mcp.ts` requires the wider `obj: unknown` signature rather than `Record<string, unknown>`)
+├── json-extract.ts      `extractJsonCandidates(output)` — multi-strategy JSON extraction for LLM outputs; tries greedy fence match, non-greedy fence match, and brace-balanced extraction. `parseFirstValidJson(output, schema, logPrefix, onFailure?)` — generic helper that iterates candidates from `extractJsonCandidates`, validates each against a Zod schema via `safeParse`, and returns the first valid result or `null`; logs on failure; used by `improvement-identifier` (`parseReviewOutput`), `public-repo-scanner` (`parseFindings`), `idea-suggester`, `whatsapp-handler`, `ci-fixer` (`classifyCIFailure`), and other jobs that parse structured JSON from Claude. `repairJsonEscapes(input)` — exported helper that repairs invalid JSON string escapes (e.g. `\(`, `\.`, `\s` from Markdown-escaped chars or regex snippets embedded in LLM string values) by dropping the backslash from any `\X` where `X` is not a legal JSON escape char; used internally by `parseFirstValidJson` as a single-retry fallback when a candidate fails `JSON.parse` — the repaired form is tried once before discarding the candidate
+├── util.ts              `sleep(ms)` — shared async sleep helper; `resolveIdentityFile(path)` — expands a leading `~/` in a path to the user's home directory (via `os.homedir()`; bare `~` without a slash is passed through unmodified for `ssh` to interpret). Imported by `worker.ts`, `github.ts`, `agents/problematic-pr-diagnoser.ts`, `jobs/datasette-export.ts`, `jobs/runner-monitor.ts`, and `jobs/connectivity-verifier.ts`
+├── home-assistant.ts    Home Assistant REST API client — `listStates()`, `callService()`, `listUpdateEntities()`, `installUpdate()`, addon log fetching; `isConfigured()` checks `HOME_ASSISTANT_BASE_URL`/`HOME_ASSISTANT_TOKEN`; `isHaTransient()` matches HA 429/5xx for `retryWithBackoff`; used by `ha-upgrader`, `ha-deploy-watcher`, and `bin-day-monitor`
+├── mcp-result.ts        Shared MCP tool-result helpers (`ToolResult` interface, `textResult`, `errorResult`) — pure, no config/runtime dependencies; imported by `namey-query.ts`, `ha-mcp.ts`, and `mcp-server.ts` (extracted from those modules to avoid duplication; `ha-mcp.ts` requires the wider `obj: unknown` signature rather than `Record<string, unknown>`)
 ├── shutdown.ts          Graceful shutdown flag + ShutdownError class (shared across modules)
 ├── test-helpers.ts      Test factories (mockRepo, mockIssue, mockPR)
 ├── resources/
+│   ├── claws-info.ts                 Exports `CLAWS_AUTOMATION_DOC` (the canonical `docs/claws-automation.md` markdown) and `CLAWS_AUTOMATION_DOC_PATH` (`"docs/claws-automation.md"`); `doc-maintainer` compares the committed file against this constant and rewrites it when stale — the content is owned here, not by Claude
 │   ├── marketing.ts                  Marketing knowledge resource for idea-suggester prompts
 │   ├── alpinejs.ts                   Exports `ALPINE_JS_SOURCE` — Alpine.js bundle served at `/static/alpine.js`
 │   ├── tailwind-css.generated.ts     Exports `TAILWIND_STYLESHEET` — generated Tailwind CSS link tag
@@ -62,7 +65,7 @@ src/
 │   ├── error-handler.ts    Client-side window.onerror + unhandledrejection handler; POSTs deduplicated fingerprints to `/api/client-error`
 │   ├── queue.ts            Client-side queue page interactions — skip/prioritize/unmark-problematic buttons and "Refresh from GitHub" button (POSTs to `/queue/refresh`, reloads page after 4 s on success; `already-running` treated as success); `markRefined` keeps the row in place on success (sets button text to "Refined ✓", disables it, adds `refined-done` class for stable green styling) — the row self-reconciles on the 60 s page auto-refresh once the server stops rendering the Refined button for that item
 │   ├── sessions-list.ts    Client-side sessions list page interactions
-│   └── session-terminal.ts xterm.js terminal — WebSocket PTY bridge, ResizeObserver-based fit (replaces RAF), Paste button, Enter key (`"\r"` in `KEY_MAP`) and other mobile keys
+│   └── session-terminal.ts xterm.js terminal — WebSocket PTY bridge, ResizeObserver-based fit (replaces RAF), Paste button, Copy button (snapshot overlay), Enter key (`"\r"` in `KEY_MAP`) and other mobile keys
 ├── pages/
 │   ├── dashboard.ts     Main status page HTML builder
 │   ├── queue.ts         Work queue page HTML builder
@@ -70,28 +73,39 @@ src/
 │   ├── config.ts        Config editor page HTML builder
 │   ├── topology.ts      Pipeline topology visualization page (SVG diagram, live status)
 │   ├── whatsapp.ts      WhatsApp status/pairing page HTML builder
-│   ├── sessions.ts      Session list + terminal page HTML builders; session list form uses `display:flex; flex-wrap:wrap` so label+select pairs stack on mobile; terminal page injects `ERROR_HANDLER_SCRIPT` (from `error-handler.generated.ts`), adds `ws.onerror` handler that writes a red reconnect message to xterm.js, and uses `SESSION_TERMINAL_SCRIPT` (from `session-terminal.generated.ts`) for the xterm.js terminal — ResizeObserver-based fit (replaces RAF; fixes 1-row canvas on mobile), Paste button (`navigator.clipboard.readText()` → WebSocket `{type:'input',data}`), and mobile keybar with Esc, Tab, Enter, font-size controls (A−/A+), ^D, ^D×2 (sends Ctrl+D twice ~50ms apart for Claude Code exit), arrow keys, Ctrl, Home/End/PgUp/PgDn, ^C/^Z/^L
+│   ├── sessions.ts      Session list + terminal page HTML builders; session list form uses `display:flex; flex-wrap:wrap` so label+select pairs stack on mobile; terminal page injects `ERROR_HANDLER_SCRIPT` (from `error-handler.generated.ts`), adds `ws.onerror` handler that writes a red reconnect message to xterm.js, and uses `SESSION_TERMINAL_SCRIPT` (from `session-terminal.generated.ts`) for the xterm.js terminal — ResizeObserver-based fit (replaces RAF; fixes 1-row canvas on mobile), Paste button (`navigator.clipboard.readText()` → WebSocket `{type:'input',data}`), Copy button (dumps terminal buffer via `term.buffer.active` into a read-only `<textarea>` overlay — supports native long-press selection and OS copy on mobile where shift-click is unavailable; includes a "Copy all" convenience button with clipboard API + `execCommand` fallback; closes on backdrop click), and mobile keybar with Esc, Tab, Enter, font-size controls (A−/A+), ^D, ^D×2 (sends Ctrl+D twice ~50ms apart for Claude Code exit), arrow keys, Ctrl, Home/End/PgUp/PgDn, ^C/^Z/^L
 │   ├── jobs-matrix.ts   Per-repo job enable/disable matrix page HTML builder
 │   ├── ha-upgrader.ts   Home Assistant update state page HTML builder — shows pending/applied/failing/blocked HA updates from the DB
 │   ├── k8s.ts           Kubernetes integrations page HTML builder — shows monitor status, recent monitor runs, and a link to open alert issues for k3s and prod-k8s clusters
 │   └── layout.ts        Shared layout (header, theme support, formatters, `timestampHtml()` / `LOCAL_TIME_SCRIPT` for client-side timestamp localisation, `ALPINE_SCRIPT` for defer-loading Alpine.js on all pages, `TAILWIND_STYLESHEET` link tag for pages using the generated Tailwind CSS alongside `PAGE_CSS`, `buildPageHeader()` for consistent `<h1>claws</h1>` + nav + optional `<h2>` across all pages; `ERROR_HANDLER_SCRIPT` from `error-handler.generated.ts` is prepended so the error handler runs before any other script on every page that calls `buildPageHeader()`)
 ├── agents/
-│   ├── issue-refiner.ts        Per-item planning functions (fresh plan, refinement, follow-up); planner runs with the full main-agent toolset — per-repo behaviour is shaped by the repo's `.claude/agents/issue-refiner.md` document, which is read via `readRepoAgentDoc()` and injected into every `runClaude` call via `--append-system-prompt`; and the prompt builders. All three prompt builders inject `LINKED_REFERENCES_INSTRUCTION` (planner **must** fetch linked GitHub issues/PRs via `gh` before writing the plan and is explicitly **forbidden** from deferring the lookup to the implementer — the implementer runs on a smaller model and will produce wrong code without the facts embedded in the plan; applies to cross-repo links, with a fallback to proceed-with-what's-in-the-issue when both `gh issue view` and `gh pr view` return 404), `EXTERNAL_REFERENCES_INSTRUCTION` (use WebFetch for external URLs, WebSearch for library/concept research), `DIAGNOSTIC_REFERENCES_INSTRUCTION` (fetch and inspect GitHub Actions logs/artifacts before writing the plan — uses `gh run view --log-failed` / `gh run view --log` and `gh run download`; requires commitment to ONE diagnosed root cause, not speculative branches), and `homeAssistantContext()` when `HOME_ASSISTANT_BASE_URL` and `HOME_ASSISTANT_TOKEN` are configured — giving the planner access to `ha_list_entities` and `ha_api_request` MCP tools for HA-repo issues. MCP config is written with `{ includeNameyDb: false }` (Namey is out of scope for the planner but HA tools are enabled when configured). Plan generation and refinement run on the opus-tier Claude model by default; an issue labelled `Plan: Fable` is planned with `claude-fable-5` instead. Follow-up Q&A does not honour the label.
+│   ├── issue-refiner.ts        Per-item planning functions (fresh plan, refinement, follow-up); planners run in fresh git worktrees (created via `createWorktree()` in `src/claude.ts`) containing only tracked files — dependencies are NOT installed (`node_modules` is `.gitignore`d and omitted); agents that need them must run `npm install`/`npm ci` themselves, but planners typically read lockfiles directly for dependency/version analysis rather than incurring the cost of a full install. Planner runs with the full main-agent toolset — per-repo behaviour is shaped by the repo's `.claude/agents/issue-refiner.md` document, which is read via `readRepoAgentDoc()` and injected into every `runClaude` call via `--append-system-prompt`; and the prompt builders. All three prompt builders inject `LINKED_REFERENCES_INSTRUCTION` (planner **must** fetch linked GitHub issues/PRs via `gh` before writing the plan and is explicitly **forbidden** from deferring the lookup to the implementer — the implementer runs on a smaller model and will produce wrong code without the facts embedded in the plan; applies to cross-repo links, with a fallback to proceed-with-what's-in-the-issue when both `gh issue view` and `gh pr view` return 404), `EXTERNAL_REFERENCES_INSTRUCTION` (use WebFetch for external URLs, WebSearch for library/concept research), `DIAGNOSTIC_REFERENCES_INSTRUCTION` (fetch and inspect GitHub Actions logs/artifacts before writing the plan — uses `gh run view --log-failed` / `gh run view --log` and `gh run download`; requires commitment to ONE diagnosed root cause, not speculative branches), and `homeAssistantContext()` when `HOME_ASSISTANT_BASE_URL` and `HOME_ASSISTANT_TOKEN` are configured — giving the planner access to `ha_list_entities` and `ha_api_request` MCP tools for HA-repo issues. MCP config is written with `{ includeNameyDb: false }` (Namey is out of scope for the planner but HA tools are enabled when configured). Plan generation and refinement run on the opus-tier Claude model by default; an issue labelled `Plan: Fable` is planned with `claude-fable-5` instead. Follow-up Q&A does not honour the label. When Fable routing applies, `FABLE_PLANNING_CONTEXT` is injected into the prompt instructing the model to invest the extra capability in deeper investigation — reading more of the codebase, tracing actual code paths, verifying assumptions against real files — rather than writing a longer plan, and emphasising that the implementer is unchanged so the planner–implementer capability gap is wider than usual. After generating any plan output, `stripLeadingPlanHeader()` strips a leading `## Implementation Plan` header from the model output before posting — instruction-faithful models like Fable reliably produce this since `CONCISENESS_INSTRUCTIONS` tells the planner to start with that header and the posting code also prepends it, resulting in duplication.
+Every plan comment (fresh plan, refinement, and in-place replan edits) appends a plain-text
+`CLAWS_PLAN_OCCURRENCES: N` marker recording the occurrence count of the issue body at planning
+time. `parsePlannedOccurrences(planBody)` extracts this integer from a plan comment; `findUnreactedFeedbackAfterPlan`
+returns it as `plannedOccurrences` alongside the existing `hasPlan`/`unreacted` fields. The
+`issue-dispatcher` uses this to trigger `ISSUE_REFINER_REPLAN` when the current issue occurrence
+count is ≥ `plannedOccurrences * 2` (and > `plannedOccurrences`) — handled by calling
+`processRefinement` with no unreacted feedback, which edits the plan in place with updated context.
+Legacy plans without the marker default to `plannedOccurrences = 1`, ensuring existing alert issues
+receive one backfill re-plan.
 │   ├── issue-worker.ts         Per-item implementation functions (create PR, continue phases). Injects repo agent doc (`issue-implementer`) via `appendSystemPrompt`.
 │   ├── ci-fixer.ts             Per-item CI fix functions (identify, fix, conflicts, unrelated). Injects repo agent doc (`issue-implementer`) via `appendSystemPrompt`.
 │   ├── review-addresser.ts     Per-item review addressing functions. Injects repo agent doc (`issue-implementer`) via `appendSystemPrompt`.
 │   ├── pr-reviewer.ts          Per-item PR review functions. Injects repo agent doc (`pr-reviewer`) via `appendSystemPrompt`.
-│   ├── auto-merger.ts          Per-item merge function (tryMerge); LGTM-exempt categories: dependabot, claws docs, idea-collection, and prod-infra auto-bump PRs (branch automation/bump-*, label auto-bump) — bump PRs still require passing CI and may only touch apps/<app>/deployment.yaml or apps/<app>/base/deployment.yaml.
-│   └── agent-context.ts        Shared tool-context strings (kubectl, namey_query, home-assistant including ha_list_entities/ha_api_request tool hints, fast-checks guidance, runner policy) injected into agent prompts
+│   ├── auto-merger.ts          Per-item merge function (tryMerge); LGTM-exempt categories: dependabot, claws docs, idea-collection, and prod-infra auto-bump PRs (branch automation/bump-*, label auto-bump) — bump PRs still require passing CI and may only touch the image-pin manifests the bump-app-version workflow rewrites: `deployment.yaml`, `migrate-job.yaml`, and `cleanup-test-data-cronjob.yaml` under `apps/<app>/` or its `base/`/`prod/` overlay.
+│   └── agent-context.ts        Shared tool-context strings (kubectl, namey_query, home-assistant including ha_list_entities/ha_api_request tool hints, fast-checks guidance, runner policy) injected into agent prompts; also exports `formatIssueCommentsForPrompt(comments, selfLogin, guardCtx)` — shared helper that formats `IssueComment[]` into flat prompt lines (`---` / label / body / `""` per comment); strips the Claws marker from self-authored comments without guarding them (no injection risk), and runs `guardContent()` on all human-authored comments; used by issue-refiner (three prompt builders) and issue-worker
 └── jobs/
     ├── issue-dispatcher.ts     Unified issue dispatcher — orchestrates planner + implementer agents; gates dispatch on issue author via `isAllowedActor()` in both Phase 1 (refined → implementer) and Phase 2 (fresh plan/refine → planner)
     ├── pr-dispatcher.ts        Unified PR dispatcher — orchestrates CI fixer + review addresser + reviewer + merger agents
-    ├── scanner-runner.ts       Shared sequential scanner runner utility used by scanner-dispatcher
-    ├── triage-kwyjibo-errors.ts     Investigates prod bug reports (game-ID issues)
+    ├── scanner-runner.ts       Shared sequential scanner runner utility used by scanner-dispatcher; exports `RECURRENCE_TRACKING_SNIPPET_LINES` (a `readonly string[]` canonical bash occurrence-tracking snippet for CI failure notification workflows — single source of truth shared by `main-build-monitor-scanner` and `issue-comment-spam-scanner` so both scanners recommend the identical pattern); also exports `renderViolationTable<T>(opts: ViolationTableOptions<T>)` and the `ViolationTableOptions<T>` interface — used by concurrency-scanner, runner-os-scanner, cache-on-self-hosted-scanner, migration-scanner, and ubuntu-latest-scanner to generate GitHub Markdown violation tables consistently (header row, separator, data rows, footer prose) without duplicating table-formatting logic
+    ├── workflow-parser.ts      YAML workflow parser utility — `parseWorkflow()` returns a typed `ParsedWorkflow` with `getTriggers()`, `getJobs()` (typed `JobInfo` with `runsOn`, `concurrency`, `steps`), `getPushConfig()`, and `getWorkflowRunTargets()`; `listParsedWorkflows(repoDir)` iterates a repo's `.github/workflows/` directory and returns `ParsedWorkflowFile[]` (each entry: `{ file, filePath, content, workflow }`) or `null` when the directory is absent — used by concurrency-scanner, cache-on-self-hosted-scanner, runner-os-scanner, and main-build-monitor-scanner to eliminate repeated boilerplate; `listWorkflowFiles(repoDir)` is the lower-level file enumeration used by ubuntu-latest-scanner; tolerates malformed YAML (returns an empty-job object rather than throwing)
+    ├── connectivity-verifier.ts  On-demand connectivity checker used by `verify-only` mode — `runConnectivityVerification()` runs every configured integration (DB, GitHub App, CLIs, Slack, IMAP, SSH, Ollama, namey PG, WhatsApp) with a 30 s per-check timeout and writes results to `verification_reports`; `getLatestVerificationReport()` is read by `GET /verify` and `GET /api/activation`
     ├── triage-claws-errors.ts       Investigates internal Claws errors ([claws-error] issues)
-    ├── doc-maintainer.ts       Nightly documentation generation/update
+    ├── doc-maintainer.ts       Nightly documentation generation/update; also deterministically syncs `docs/claws-automation.md` (from `src/resources/claws-info.ts`) into every repo after each Claude pass — the skip gate requires both an unchanged HEAD and a current `claws-automation.md` to skip processing, so the first rollout touches every repo even without code changes; links it from OVERVIEW.md
     ├── repo-standards.ts       Syncs labels and cleans legacy labels for each managed repo; removes stale local clones
-    ├── improvement-identifier.ts  Reviews codebases for security issues and improvements via Claude; files issues for both (no longer opens PRs)
+    ├── improvement-identifier.ts  Reviews codebases for security issues and improvements via Claude; files issues for both (no longer opens PRs); conditionally emits Web/SEO and JSON-LD structured-data suggestions for repos that serve user-facing HTML (detected by presence of `*.html` files, static-site generator configs, or `public/`/`static/`/`dist/` output dirs — skipped for backend, library, CLI, and infra repos); truncated Claude output in the analysis phase (not ending with a closing code fence) is detected in the `parseReviewOutput` `onFailure` callback and downgraded to a warning rather than an error issue — the job retries on the next tick
+    ├── public-repo-scanner.ts  Daily scan of all public repos (including archived) for accidentally-committed sensitive data (secrets, private keys, credentials, PII); manages its own 7-day per-repo throttle via `processed_repos_daily`; does NOT call `writeClawsMcpConfig()` (capability: text-only, no MCP needed); files alert issues via `ensureAlertIssue()`
     ├── idea-suggester.ts       Suggests new ideas per repo, posts to Slack for reaction-based review
     ├── idea-collector.ts       Collects Slack reactions on ideas, creates GH issues and collection PRs
     ├── issue-auditor.ts        Daily audit ensuring no issues fall between the cracks
@@ -112,15 +126,20 @@ src/
     ├── qa-phase.ts             Exploratory QA on deployed PRs via Playwright browser automation
     ├── email-monitor.ts        Polls Gmail for veg box emails, generates recipes via Claude
     ├── k3s-monitor.ts          Monitors k3s cluster pod/node health and Flux Kustomization/HelmRelease reconciliation failures; raises alerts with occurrence tracking (updates issue body instead of posting comments)
-    ├── prod-k8s-monitor.ts     Same detection logic as k3s-monitor but targets the prod cluster via configurable kubeconfig and files alerts to `PROD_K8S_REPO` (default: `St-John-Software/production-infra`); enabled via `prodK8sMonitorEnabled`
+    ├── kubeconfig-refresh.ts   Kubeconfig auto-refresh via SSH — `refreshKubeconfig()` SSHes to a remote host (supports Tailscale hostname resolution via `resolveTailscaleHost()`), fetches the remote kubeconfig, rewrites its `server:` URL if needed, and atomically writes it locally; `isStaleKubeconfigError()` classifies kubectl errors that indicate a stale/rebuilt cluster vs. Claws-side defects a refresh cannot fix; used by k3s-monitor and prod-k8s-monitor as a best-effort recovery step before failing
+    ├── prod-k8s-monitor.ts     Same detection logic as k3s-monitor but targets the prod cluster via configurable kubeconfig and files alerts to `PROD_K8S_REPO` (default: `St-John-Software/production-infra`); enabled via `prodK8sMonitorEnabled`; supports `prodK8sKubeconfigRefresh` for automatic kubeconfig rotation when the cluster endpoint changes
     ├── runner-metrics-sync.ts  Adaptive sync of GitHub Actions workflow runs to SQLite for runner utilization analytics
     ├── ha-upgrader.ts          Home Assistant update manager — polls HA entities, installs updates within dwell windows, raises GitHub issues on failures
     ├── ha-deploy-watcher.ts    Home Assistant deploy notifications — polls git-pull addon logs for Updating events, posts Slack notification with commit list (via `listCompareCommits`), compare link, and diffstat when `Updating <old>..<new>` is detected; commit-list fetch failures fall back to compare link only; first run baselines silently
     ├── datasette-export.ts     Exports the SQLite database to a remote host via scp (for Datasette exploration)
-    └── worktree-cleaner.ts     Daily prune of stale ~/.claws/worktrees/ directories
+    ├── worktree-cleaner.ts     Daily prune of stale ~/.claws/worktrees/ directories
+    ├── bin-day-monitor.ts      Polls Home Assistant every 15 minutes for `sensor.bin_scraper_*` entities (configurable prefix); maintains a single long-lived GitHub issue as a running availability log — issue is created on first MISSING event and never closed; body is rebuilt on every run to keep "Last checked" fresh; status transitions (HEALTHY ↔ MISSING) are appended as rows to an embedded history table; does NOT use `ensureAlertIssue` (that helper cannot record recoveries); enabled via `homeAssistantBinDayMonitorEnabled`; disabled by default
+    ├── ha-battery-monitor.ts   Polls Home Assistant for battery sensors (`device_class=battery`, `unit_of_measurement=%`) below `homeAssistantBatteryThresholdPercent` (default 10%); creates a Priority issue in `homeAssistantConfigRepo` (falls back to `FLEET_INFRA_REPO`) listing all low devices; auto-closes the issue when all devices recover; body rebuilt in-place on each tick (never posts comments — compliant with issue-comment-spam rule); disabled by default (`homeAssistantBatteryMonitorEnabled`)
+    ├── dependabot-alert-monitor.ts  Polls the GitHub Dependabot Alerts API per repo; auto-dismisses stale alerts in two passes: (1) SBOM-based pass via `fetchRepoSbomPackages` (gated by `dependabotAutoDismissStale`); (2) manifest-pin pass via `dismissAlreadyPinnedAlerts()` which reads the committed manifest file (`fetchRepoFileContent` in `github.ts`) for pip `==`-pinned packages using `parsePinnedRequirement()` + `manifestSatisfiesPatch()` — handles the common case where the SBOM lags behind a committed version bump. `manifestSatisfiesPatch` uses `versionCore()` to strip pre-release suffixes before comparison. Files an occurrence-tracked Priority alert issue listing the remaining open alerts; the issue body includes a `REMEDIATION_GUIDANCE` block with ordered steps (prefer removing unnecessary deps, classify dev vs runtime, bump direct deps before adding overrides, use `>=` ranges not exact pins in overrides). Auto-closes the issue once all alerts clear. Leaves repos with scanning disabled as-is. If the App lacks the Dependabot alerts read permission, files a remediation issue on SELF_REPO. Before filing, alerts are suppressed via two sources merged together: (1) the central `dependabotIgnoredAdvisories` config (keyed by repo full name or `"*"` for a global list, matched case-insensitively), and (2) a repo-local deferral manifest at `.claws/dependabot-deferrals.json` — a PR-reviewable committed file that lets teams consciously defer unfixable alerts (e.g. a major-version bump that breaks the build). The manifest is read via `fetchRepoFileContent` and parsed by the exported `parseDeferredAdvisories(content)` helper, which accepts either a flat `["GHSA-..."]` array or a `{ deferrals: [{ ghsa, reason, reviewAfter }] }` object; `reason`/`reviewAfter` fields are documentation-only and never enforced. When all alerts are suppressed via either source, the alert issue is closed — giving agent deferral PRs a durable effect instead of no-op churn.
+    └── actions-storage-monitor.ts  Daily scan of GitHub Actions cache + artifact storage usage across all repos. Fetches per-repo stats via `fetchRepoCacheUsage` and `fetchRepoArtifactUsage` in `github.ts` (fault-tolerant: 404 returns zero). Files a per-repo `ensureAlertIssue` when a repo uses ≥ 50 MB of Actions **cache** or has artifacts older than 7 days (high retention); files an org-level roll-up alert in `SELF_REPO` when total usage nears 80% of the 2 GB account quota. Runs at 5 AM (`actionsStorageMonitorHour`)
 
 deploy/
-├── claws.service           systemd service unit (KillMode=process preserves tmux sessions across restarts; cgroup limits: MemoryHigh=2.5G, MemoryMax=3G, TasksMax=400, CPUWeight=80, OOMScoreAdjust=200)
+├── claws.service           systemd service unit (KillMode=process preserves tmux sessions across restarts; cgroup limits: MemoryHigh=2.5G, MemoryMax=3G, TasksMax=800, CPUWeight=80, OOMScoreAdjust=200)
 ├── claws-updater.service   systemd updater service
 ├── claws-updater.timer     systemd timer (every 60s)
 ├── install.sh              One-shot bootstrap installer
@@ -140,7 +159,7 @@ rows stuck in `running` state from a previous crash back to `queued` (so they
 are retried after restart), prunes old logs. When `ACTIVATION_STATE === "verify-only"`,
 no jobs are registered, WhatsApp is not started, and `runConnectivityVerification()`
 runs once at startup to populate `verification_reports`. When `"active"`,
-registers all 22 jobs with the scheduler
+registers all 24 jobs with the scheduler
 (interval jobs staggered by 2 seconds to prevent thundering herd), calls
 `registerWorkHandlers()` (from `work-handlers.ts`) to register agent callbacks
 with the work queue, starts `worker.ts` fibers, starts the HTTP server, sets up
@@ -172,7 +191,7 @@ Provider fallback is controlled per-capability via `toolUseProviderFallbackOrder
 `providerRateLimitCooldownMs` for rate-limit circuit breaker timing.
 Ollama integration is configured via `ollamaBaseUrl`, `ollamaTimeoutMs`, and
 `ollamaConsecutiveFailuresBeforeDisable`. Local Whisper transcription is configured via
-`whisperBaseUrl` (env: `CLAWS_WHISPER_BASE_URL`; default `https://whisper.home.bstjohn.net` — empty string disables local Whisper, leaving OpenAI as the only backend). GitHub App authentication is
+`whisperBaseUrl` (env: `CLAWS_WHISPER_BASE_URL`; default `https://whisper.home.example.invalid` — empty string disables local Whisper, leaving OpenAI as the only backend). GitHub App authentication is
 configured via `githubAppId`, `githubAppPrivateKeyPath`, and
 `githubAppInstallationIds`. OIDC/SSO is configured via `oidcClientId`,
 `oidcClientSecret`, `oidcBaseUrl`, `oidcApplicationSlug`, and
@@ -218,9 +237,9 @@ triggered run produces no tasks. Existing polling is preserved as fallback.
 
 **`github.ts`** — All GitHub interaction via the `gh` CLI (never the HTTP API
 directly). Wraps `execFile("gh", ...)` with exponential-backoff retry on
-transient errors (400, 401, 500, 502, 503, 504, ETIMEDOUT, ECONNRESET, ECONNREFUSED,
+transient errors (400, 401, 500, 502, 503, 504, ETIMEDOUT, ECONNRESET, ECONNREFUSED, EAGAIN,
 connection reset, "Could not resolve to a", "TLS handshake timeout",
-"Something went wrong", "i/o timeout" — up to 3 attempts with 1s/2s/4s delays). The 401
+"Something went wrong", "i/o timeout", "failed to create new OS thread", "resource temporarily unavailable", "unexpected EOF" — up to 3 attempts with 1s/2s/4s delays). The EAGAIN variants handle OS-thread exhaustion from Go-binary (`gh`, `git`) spawn failures under `TasksMax` cgroup pressure. The 401
 retry handles transient GitHub OAuth token rotation — if the token is truly
 revoked, all 3 retries fail and the error surfaces normally. Rate limit
 errors are not retried — they trip a **circuit breaker** that blocks all API
@@ -235,7 +254,7 @@ optional `labels?: string[]` field — issue-dispatcher, pr-dispatcher, and all 
 callers pass `issue.labels.map((l) => l.name)` so labels are stored in the cache
 entry and rendered on the queue page. `enrichQueueItemsWithPRStatus()` only
 overwrites `item.labels` for `type === "pr"` — issue labels are preserved from
-the cache. The queue cache has three correctness
+the cache. The queue cache has four correctness
 invariants: (1) `populateQueueCache()` evicts any existing entry for the same
 `(repo, number)` under a different category before writing the new one — preventing
 stale categories from lingering after a state transition (e.g. `needs-refinement` →
@@ -243,31 +262,35 @@ stale categories from lingering after a state transition (e.g. `needs-refinement
 older than `QUEUE_ENTRY_TTL_MS` (20 minutes — longer than the slowest dispatcher
 interval so a single transient scan failure does not wipe the cache); (3) when the
 same `(repo, number)` appears under multiple categories, deduplication keeps the
-freshest entry (by `fetchedAt`), not the oldest. `oldestFetchAt` (the "last scanned"
+freshest entry (by `fetchedAt`), not the oldest; (4) after each dispatcher completes
+a full repo scan, `reconcileQueueCache(repo, categories, populated, type)` evicts
+entries in the categories that dispatcher owns whose item number was not populated
+this cycle — removing items that closed, merged, or changed state on GitHub without
+a tracked Claws transition (the `type` parameter keeps `issue-dispatcher` and
+`pr-dispatcher` from clobbering each other's entries in the shared `"ready"` category;
+reconciliation is skipped if the rate-limit circuit breaker fired mid-scan, since
+`populated` would be incomplete). `oldestFetchAt` (the "last scanned"
 banner on the queue page) is computed only over returned entries, not evicted ones.
 The `listRepos()` function falls back to a
 stale cache when the fresh fetch returns empty (transient failure protection).
 Provides `isItemSkipped()` and `isItemPrioritized()` helpers that check
 items against the `skippedItems` and `prioritizedItems` config lists,
 used by jobs to exclude or fast-track specific issues/PRs.
-`isCiFailureAlertIssue(issue)` identifies CI failure alert issues auto-filed by a
-repo's notify-failures workflows — requires both a github-actions bot author
-(`github-actions[bot]` or `app/github-actions`) AND a recognized title pattern. The
-legacy pattern `[main] <workflow> failed on main` is matched explicitly; additional
-patterns (`Build failure:`, `Cypress:`, `Lighthouse regression`, `Database backup:`, `Docker publish failure`) are matched via the
-module-level `CI_ALERT_TITLE_MATCHERS` constant (prefix or exact match). Issues passing
-this check are dispatched into the refine-and-fix pipeline even though their author is
-not in `ALLOWED_ACTORS`. Adding a new CI alert title convention is a one-line edit to
-`CI_ALERT_TITLE_MATCHERS`. `isCiAlertBotAuthor(issue)` is a narrower companion helper
-that checks only whether the author is a known CI bot login (reusing
-`CI_FAILURE_ALERT_BOT_LOGINS`) — used by issue-dispatcher to silently skip CI bot
-issues whose titles don't match a recognized pattern, without filing an untrusted-actor
-alert. The two helpers together give a two-tier CI bot treatment: recognized alert
-titles dispatch into the fix pipeline; unrecognized bot-authored titles are skipped
-silently rather than triggering the disallowed-actor notification flow.
+`findIssueByExactTitle(repo, title)` — exported helper that wraps `searchIssues` with an exact-title narrowing step (GitHub's search is substring-based; the helper returns `{ number, title } | null`). Replaces the duplicated `searchIssues(...).find(r => r.title === title)` pattern at four call sites (`ensureAlertIssue`, `ha-upgrader`, `bin-day-monitor`, `idea-collector`). Returns the narrowed result type `{ number: number; title: string } | null` — callers that previously used the raw search type are unchanged since `existing.number` and `existing.title` still type-check.
+`isCiAlertBotAuthor(issue)` returns `true` for any issue authored by the GitHub
+Actions runner bot (`github-actions[bot]` or `app/github-actions`, via
+`CI_FAILURE_ALERT_BOT_LOGINS`). The issue-dispatcher uses this as its single bot gate:
+any runner-authored issue is dispatched into the refine-and-fix pipeline regardless of
+title — no title allowlist is needed. Other bots (dependabot, etc.) are not in
+`CI_FAILURE_ALERT_BOT_LOGINS` and remain subject to the untrusted-actor notify/skip
+path.
 `isRepoPrivate(repo)` fetches repo visibility via `gh api repos/{repo} --jq .private`;
 on non-rate-limit errors it defaults to `false` (safer for public-repo findings) — used
-by `improvement-identifier` to suppress fork-PR hardening findings on private repos. Provides
+by `improvement-identifier` to suppress fork-PR hardening findings on private repos.
+`listPublicReposIncludingArchived()` iterates `GITHUB_OWNERS`, calls `listInstallationRepositories(owner)` from
+`github-app.ts`, filters to non-private entries, and returns `PublicRepoEntry[]` (includes `isArchived: boolean`);
+archived repos are intentionally kept — this is the only enumeration path that covers them since `fetchRepos()`
+skips archived repos; used exclusively by `public-repo-scanner`. Provides
 `hasIgnoreLabel()` for the `Claws Ignore` label check, `skipItem()` for
 programmatic auto-skipping, and `getDeploymentUrl()` for discovering preview
 deployment URLs for QA. `listCompareCommits(repo, base, head)` calls the GitHub
@@ -330,6 +353,14 @@ GitHub sets while computing the merge commit; the auto-merger skips the PR if
 issues closed without implementation. `editIssue()` edits an issue's body
 in place (used by k3s-monitor to update occurrence tracking without posting
 new comments).
+`fetchRepoCacheUsage(repo)` fetches cache usage via `GET /repos/{repo}/actions/cache/usage`
+(returns `{ bytes, count }`; tolerates 404 as zero). `fetchRepoArtifactUsage(repo)` paginates
+`GET /repos/{repo}/actions/artifacts` using `--paginate --jq` (one JSON object per line) and
+sums non-expired artifact sizes. `fetchRepoStorageUsage(repo)` combines both into a
+`RepoStorageUsage` object (`{ repo, cacheBytes, cacheCount, artifactBytes, artifactCount,
+oldestArtifactAt }`). Used exclusively by `actions-storage-monitor`.
+`fetchRepoFileContent(repo, path)` fetches a file's contents via `GET /repos/{repo}/contents/{path}` and base64-decodes the response; returns `null` on 404/403/missing file. Used by `dependabot-alert-monitor`'s manifest-pin staleness pass.
+`DependabotAlertsPermissionError` — named error class thrown by `listOpenDependabotAlerts` when the GitHub App lacks the `dependabot_alerts: read` permission (HTTP 403 "Resource not accessible by integration"); distinct from the 404 / "disabled" case (which returns `[]` silently, per-maintainer guidance to leave repos with scanning disabled as-is). The permission-check must come before the 404 swallow in the catch block to avoid misclassifying permission failures as "no alerts". `listOpenDependabotAlerts(repo)` returns up to 100 open alerts (no pagination; caller warns on exact-100 result) as typed `DependabotAlert[]`. `dismissDependabotAlert(repo, number, reason, comment)` sends `PATCH /repos/{repo}/dependabot/alerts/{number}` with `state=dismissed` and the provided `dismissed_reason` (required by GitHub — defaults to `"inaccurate"` for stale-version dismissals). `fetchRepoSbomPackages(repo)` fetches the SPDX 2.3 dependency graph via `GET /repos/{repo}/dependency-graph/sbom`, strips the `<manager>:` prefix from each package name, and lowercases the remainder; tolerates 403/404/disabled by returning `[]`. Used by `dependabot-alert-monitor` to compare patched versions against the SBOM and dismiss alerts whose fixed version is already present in the graph.
 
 **`github-app.ts`** — GitHub App authentication (required). Supports two
 credential modes: **global** (`githubAppId` + `githubAppPrivateKeyPath`) and
@@ -356,6 +387,9 @@ transient network failures (DNS, ECONNRESET, ETIMEDOUT) via the module-level
 `isRetryableFetchError()` helper — which inspects `err.message` and `err.cause`
 since raw `fetch()` wraps the underlying cause. The token is re-fetched inside
 each retry body (safe because `getInstallationTokenForOwner` caches tokens).
+`InstallationRepoEntry` includes an `isPrivate: boolean` field (from `r.private` in
+the raw GitHub API response) — used by `listPublicReposIncludingArchived()` to filter
+to public repos only; `fetchRepos()` ignores this field and existing behavior is unchanged.
 PRs and comments posted by
 Claws appear under the App bot identity. `extractOwnerFromGhArgs()`
 parses a `gh` argv array to determine which owner's token should be injected,
@@ -376,10 +410,31 @@ seeded from `tmux capture-pane`). After reconciling, it also sweeps for stray
 `claws-*` tmux sessions: any on the `claws` socket with no DB row is killed
 (crash between tmux-create and DB-insert leaves such leaks), and any on the
 default tmux socket is killed (claws never creates on the default socket, so
-any match is a leak from an older build or manual session). `createSession(repo, mode)` supports four modes (exported as `SESSION_MODES`):
+any match is a leak from an older build or manual session). **Capability-based env gating** (via `capabilities.ts`): sessions are default-deny for gated secrets. `createSession` and `createMultiWorktreeSession` accept a `capabilities: string[]` parameter (selected IDs from the `CAPABILITIES` registry). Granted capabilities inject their resolved env vars; all other gated keys (`HOME_ASSISTANT_BASE_URL/TOKEN`, `NAMEY_DB_URL`, `KUBECONFIG`) are stripped with `env -u` before the claude process is spawned. When at least one capability is granted, `--append-system-prompt` is appended with a brief description of each granted capability (via `buildCapabilityPrompt`); when nothing is granted, the flag is omitted. The `capabilities` column in the `sessions` DB table (JSON array of selected IDs) persists the selection so `resumeSession` can re-apply the same env grant and system-prompt injection. The session-create UI exposes checkboxes for all currently-available capabilities (those whose backing config is non-empty). `prod-infra` and `fleet-infra` grant `KUBECONFIG` — when both are selected, the two kubeconfig paths are colon-joined so kubectl can address both clusters.
+`createSession(repo, mode)` supports five modes (exported as `SESSION_MODES`):
 `repo-zsh` (zsh in the repo's main clone), `repo-claude` (claude in the repo's
-main clone), `worktree-claude` (claude in a fresh worktree), and `home-claude`
-(claude in `$HOME`, no repo required). Before opening any repo-backed session
+main clone), `worktree-claude` (claude in a fresh worktree), `home-claude`
+(claude in `$HOME`, no repo required), and `multi-worktree-claude` (multi-repo —
+must be created via `createMultiWorktreeSession`, not `createSession`).
+`createMultiWorktreeSession(repos: string[])` (requires ≥ 2 repos) creates a
+fresh worktree for each repo, runs Claude in the first repo's worktree, and
+passes additional worktree paths via `--add-dir <path>` so Claude can
+read/write across all of them in one session. The primary worktree/repo is
+stored in the existing `repo`/`worktreePath`/`cwd` DB columns; additional ones
+are stored as JSON in a new `extra_worktrees` column and surfaced via
+`session.extraWorktrees: Array<{ repo: string; worktreePath: string }>`.
+Initiated via `POST /sessions/create-multi`.
+**Session resume**: When a tmux session exits normally (process finishes), the
+session row and in-memory entry are kept rather than deleted, and `session.resumable`
+is set to `true`. `resumeSession(id)` recreates worktrees at the same deterministic
+path (`claws-wt/<id>`) so `claude --continue` finds the path-keyed conversation
+history preserved in `~/.claude/projects/`. For `repo-claude`/`home-claude`/`repo-zsh`
+modes the cwd is a stable main clone / `$HOME` and is never deleted, so resume just
+relaunches tmux there. `session.resumeRepos: string[]` stores the repo list needed to
+reconstruct worktrees (set before cleanup in the bridge-exit handler). Sessions that fail
+their bridge (respawn) or are killed manually are not marked resumable and are reaped by
+the 60-second reaper normally. Accessible via `POST /sessions/:id/resume`.
+Before opening any repo-backed session
 (`repo-zsh`, `repo-claude`, `worktree-claude`), `ensureClone()` is called to
 fetch the latest remote state; failures surface as `"fetch-failed"` (a
 `CreateSessionError` variant). Path traversal is guarded by verifying the
@@ -396,11 +451,7 @@ to set mouse mode are logged at warn level and do not abort session creation.
 `listSessions()`, `killSession(id)`, and `disconnectAllSessions()` manage
 lifecycle; `disconnectAllSessions()` is called from `server.ts` on server close
 and only tears down PTY bridges (tmux sessions keep running). Sessions are
-accessible via WebSocket at `/sessions/:id/ws`. Sessions are periodically
-summarized via `summarizeSession()` on a 90-second interval: uses the `sonnet`
-tier with 12,000 chars of recent scrollback (ANSI-stripped); skips when the
-session is idle (`session.lastActivity <= session.summaryUpdatedAt`) to avoid
-repeated API calls for sessions sitting at a shell prompt.
+accessible via WebSocket at `/sessions/:id/ws`. Each session is summarized **once**, shortly after it accumulates ≥80 chars of scrollback, via `summarizeSession()` (a 30-second poll retries un-summarized sessions until they have enough output). The summary is then kept for the session's lifetime — there is no periodic re-summarization. The call pins `provider: "claude"` (text-only, `sonnet` tier) for reliability, mirroring `classify-complexity.ts`.
 
 **`claude.ts`** — Git worktree helpers and Claude/Codex/OpenCode CLI runner. Key exports: `ensureClone`, `createWorktree`,
 `createWorktreeFromBranch`, `createWorktreeFromBranchIfExists`, `removeWorktree`,
@@ -506,7 +557,8 @@ analytics — indexed by repo, status, and created_at), `whatsapp_events`
 `connection-replaced`, `logged-out`, `auth-cleared`, `message-received`,
 `pairing-required`; readable via `GET /whatsapp/events`), `sessions`
 (persisted PTY session records — `id`, `tmux_name`, `mode`, `repo`, `cwd`,
-`worktree_path`, `created_at`; reconciled with live tmux sessions on startup),
+`worktree_path`, `extra_worktrees` (JSON array of additional worktrees for
+`multi-worktree-claude` sessions), `capabilities` (JSON array of selected capability IDs — persisted so `resumeSession` re-applies env gating and system-prompt injection), `created_at`; reconciled with live tmux sessions on startup),
 `verification_reports` (connectivity check results written by
 `runConnectivityVerification()` — stores a JSON `payload` with per-check
 pass/fail results indexed by `ts`; latest row retrieved by `GET /api/activation`
@@ -534,7 +586,7 @@ untrusted-actor Slack notifications — primary key `(repo, issue_number)`;
 `true` on the first notification for a given issue, `false` on subsequent calls;
 survives process restarts, preventing re-notification on the same blocked item after
 a Claws restart).
-`updateTaskTokenUsage(taskId, tokensUsed, costUsd)` writes token and cost data into `tasks.tokens_used` / `tasks.cost_usd` — called by agents after `runClaude()` resolves when `onTokensUsed` fires. `getUsageStats(days)` and `getTotalUsage(days)` aggregate token/cost data over a configurable time window, returning `UsageStats` (breakdowns by repo, job, and provider+model, all sorted by cost descending) and `UsageTotals` (overall counts). Job names are normalised with the same colon-prefix-stripping pattern as `getAllAverageTaskDurations` so `ci-fixer:revert` rolls up with `ci-fixer`. See [Database Schema](database-schema.md).
+`updateTaskTokenUsage(taskId, tokensUsed, costUsd)` writes token and cost data into `tasks.tokens_used` / `tasks.cost_usd`. `trackTaskTokens(taskId)` returns an accumulating `onTokensUsed` callback bound to `taskId` — reusable across multiple `runClaude` calls for one task (e.g. triage-claws-errors and pr-reviewer each call `runClaude` 2–3 times per item); accumulates totals and writes the running sum on every invocation via `updateTaskTokenUsage`, so partial accounting is preserved if a later call throws. Used by all agent call sites: review-addresser, issue-worker, ci-fixer, issue-refiner, problematic-pr-diagnoser, idea-suggester, improvement-identifier, doc-maintainer, qa-phase, and public-repo-scanner. `getUsageStats(days)` and `getTotalUsage(days)` aggregate token/cost data over a configurable time window, returning `UsageStats` (breakdowns by repo, job, and provider+model, all sorted by cost descending) and `UsageTotals` (overall counts). Job names are normalised with the same colon-prefix-stripping pattern as `getAllAverageTaskDurations` so `ci-fixer:revert` rolls up with `ci-fixer`. See [Database Schema](database-schema.md).
 `completeJobRun(runId, status)` accepts `"completed" | "failed" | "cancelled"`
 and includes `AND status != 'cancelled'` in its SQL — this prevents the
 scheduler's error handler from overwriting a `"cancelled"` status with `"failed"`
@@ -555,7 +607,7 @@ effect.
 - `POST /trigger/:job` — Manual job trigger (returns 200/409/404)
 - `POST /pause/:job` — Toggle pause/resume for a job
 - `POST /cancel` — Cancel current Claude task
-- `GET /queue` — Work queue page (PRs first, CI status, squash & merge, queue position + ETA estimates); includes a "Refresh from GitHub" button
+- `GET /queue` — Work queue page; within each section items are sorted flat: all open PRs first (by `updatedAt` desc), then all open issues (by `updatedAt` desc); each item shows an inline per-item category badge (reusing `CATEGORY_DISPLAY` colors) in place of the old category-group headers; also shows CI status, squash & merge, queue position + ETA estimates; includes a "Refresh from GitHub" button
 - `POST /queue/refresh` — Triggers `issue-dispatcher` and `pr-dispatcher` to rescan GitHub immediately; returns `{ results: Record<string, string> }` (values: `"started"`, `"already-running"`, `"draining"`, `"unknown"`); always 200 — `"already-running"` is benign (scan already in flight)
 - `POST /queue/merge` — Squash-merge a PR from the queue page
 - `POST /queue/skip` — Skip an issue/PR (excluded from all job processing)
@@ -574,7 +626,7 @@ effect.
 - `GET /api/activation` — Returns `{ state, lastVerification }` (activation state + latest connectivity check)
 - `POST /api/activation` — Sets activation state (`{ state: "active"|"verify-only", confirm: true }`); requires restart to register jobs when flipping to `"active"`
 - `POST /api/client-error` — Receives client-side JS error reports (fingerprint, message, stack, context) from `ERROR_HANDLER_SCRIPT`; deduplicates via `reportError()` and creates `[claws-error]` issues for novel errors; responds 204, ignores malformed payloads
-- `GET /verify` — Connectivity verification page; shows latest `verification_reports` result (database, GitHub App, CLIs, Slack, IMAP, SSH, Ollama, namey PG, Kwyjibo, WhatsApp)
+- `GET /verify` — Connectivity verification page; shows latest `verification_reports` result (database, GitHub App, CLIs, Slack, IMAP, SSH, Ollama, namey PG, WhatsApp)
 - `POST /api/verify/run` — Triggers an on-demand connectivity verification and redirects to `/verify`
 - `GET /topology` — Pipeline topology visualization (SVG diagram with live job status)
 - `GET /repos` — Repo list page sorted by most-recent Claws activity (`getLastTaskTimePerRepo()`)
@@ -587,8 +639,10 @@ effect.
 - `POST /runners/cancel` — Cancel a queued GitHub Actions workflow run (only `queued` status, not `in_progress`)
 - `GET /sessions` — Interactive session list page
 - `POST /sessions/create` — Create a new PTY session; redirects to `/sessions/:id`
+- `POST /sessions/create-multi` — Create a multi-repo session (≥2 repos required); calls `createMultiWorktreeSession`; redirects to `/sessions/:id`
 - `GET /sessions/:id` — Terminal page (xterm.js over WebSocket)
 - `POST /sessions/:id/kill` — Kill a session
+- `POST /sessions/:id/resume` — Resume an exited session: recreates worktrees at the original path and relaunches `claude --continue`; calls `resumeSession(id)`
 - `GET /sessions/:id/ws` — WebSocket endpoint for PTY I/O
 - `GET /jobs` — Per-repo job enable/disable matrix page
 - `POST /jobs` — Save `disabledJobsByRepo` config changes from matrix UI
@@ -607,7 +661,19 @@ runs open:**
   `GET /login` is validated: it must start with `/`, must not start with `//`,
   and must not contain a backslash — any path that fails these checks falls
   back to `"/"` to prevent open-redirect attacks (e.g. `/\evil.example` being
-  interpreted as a host by some browsers).
+  interpreted as a host by some browsers). There is deliberately **no in-app
+  identity allowlist** in `/auth/callback` — any `sub`/`email` that reaches the
+  callback is treated as authorized. This is not an oversight: dashboard
+  authorization is enforced upstream by version-controlled Authentik group
+  policy bindings (`fleet-infra` repo, `apps/authentik/configmap-blueprints.yaml`)
+  restricting completion of OIDC authorization for the claws-app application to
+  members of specific groups (`policy_engine_mode: any`). A user who can
+  authenticate to the IdP but isn't in an allowed group is rejected at the
+  application-authorization step and never reaches the callback with a valid
+  code. Adding a second allowlist here would duplicate that authorization
+  across two systems (drift hazard) for what is a single-tenant deployment. See
+  the comment at the top of the session-minting code in `/auth/callback` in
+  `server.ts`.
 - **OIDC not configured**: every authenticated route returns **503**
   ("configure OIDC"). The dashboard and API never serve content without a
   session, so the `OIDC_*` variables must be set in `~/.claws/env` before first
@@ -734,7 +800,10 @@ search → update-or-create flow: searches for an open issue with the given exac
 `applyOccurrenceTracking` + `editIssue` on a hit (warning on regex-miss), or `createIssue` with
 `appendOccurrenceTracking(body, timestamp)` on a miss. Returns `{ outcome: "created" | "updated"
 | "tracking-not-updated", issueNumber }`. Used by `error-reporter.ts` (both `reportError` and
-`reportFailedAttachments`) and `k3s-monitor.ts` / `runner-monitor.ts`.
+`reportFailedAttachments`), `main.ts` (unknown-config-key reporting), and `k3s-monitor.ts` / `runner-monitor.ts`.
+`parseOccurrenceCount(body)` — pure parser that extracts the `**Occurrences:** N` integer from
+an issue body; returns `null` when absent. Used by `issue-dispatcher` to detect when an alert
+issue has recurred enough since its plan was written to warrant a re-plan.
 
 **`prompt-guard.ts`** — Prompt injection detection for user-submitted content.
 `scanContent()` checks text against four pattern categories: instruction
@@ -742,8 +811,16 @@ overrides, zero-width characters, HTML comment injections, and base64-encoded
 payloads. `guardContent()` wraps scanning with automatic redaction of
 suspicious sections and Slack audit notifications. Claws-authored content
 (identified via `isClawsComment()`) is never passed through `guardContent()`
-— only human-authored comments, issue bodies, and PR review text are guarded,
-preventing false positives from Claws' own structured output.
+— only human-authored comments, issue bodies, PR review text, and WhatsApp
+inbound messages are guarded, preventing false positives from Claws' own
+structured output. The `whatsapp-handler` guards the message text inline in
+the prompt (via `makeGuardCtx("whatsapp", 0)` / `guardContent(text, guardCtx("whatsapp-message"))`)
+while leaving the issue body raw — the body is plain data posted to GitHub,
+not an instruction context, so redaction markers there would degrade the issue.
+`formatGuardedTitleList(titles, guardCtx, source)` — shared helper used by
+`improvement-identifier` and `idea-suggester` to build an indented Markdown
+bullet list of GitHub-supplied issue/PR titles, passing each through
+`guardContent()`. Returns `"  (none)"` for empty lists.
 
 **`mcp-server.ts`** — Standalone stdio-based MCP (Model Context Protocol)
 server that exposes Claws operational state to Claude sessions. Spawned by
@@ -817,18 +894,18 @@ review-addresser to give Claude visual and file context.
 
 ## Jobs
 
-Twenty-two registered jobs run on timers or schedules, plus one event-driven handler.
+Twenty-eight registered jobs run on timers or schedules, plus one event-driven handler.
 See [Jobs](jobs/README.md) for detailed behavior of each.
 
 | Job | Trigger | Interval | Summary |
 |-----|---------|----------|---------|
 | `issue-dispatcher` | All open issues per repo | 5 min | Unified dispatcher — classifies issues and delegates to planner (issue-refiner) and implementer (issue-worker) agents |
 | `pr-dispatcher` | All open PRs per repo | 5 min | Unified dispatcher — classifies PRs and delegates to CI fixer, review addresser, reviewer (pr-reviewer), and merger (auto-merger) agents |
-| `triage-kwyjibo-errors` | Open issues with game-ID in body | 10 min | Fetches debug data from Kwyjibo API (authenticated), posts investigation report |
 | `triage-claws-errors` | `[claws-error]` issues in `SELF_REPO` | 10 min | Investigates internal Claws errors, deduplicates by fingerprint, posts report |
 | `doc-maintainer` | Hourly; selects repos stalest-first (age ≥ 24h); skips when Claws busy unless SLO (48h) breached; max 4 concurrent repos | Smart-scheduled | Updates `docs/` to reflect current codebase; posts a Slack summary after all repos are processed (PRs opened with plan titles, skipped repos, errors); silent on fully-quiet runs |
 | `repo-standards` | Daily at 2 AM (+ on startup) | Scheduled | Syncs labels and cleans legacy labels for each managed repo; removes stale local clones |
-| `improvement-identifier` | Hourly; selects repos stalest-first (age ≥ 24h); skips when Claws busy unless SLO (48h) breached; max 4 concurrent repos | Smart-scheduled | Reviews codebase via Claude for security issues and improvements; files improvement issues when no security work is queued; no longer opens PRs; skips fork-PR hardening findings on private repos (uses `isRepoPrivate()`) |
+| `improvement-identifier` | Hourly; selects repos stalest-first (age ≥ 24h); skips when Claws busy unless SLO (48h) breached; max 4 concurrent repos | Smart-scheduled | Reviews codebase via Claude for security issues and improvements; files improvement issues when no security work is queued; no longer opens PRs; skips fork-PR hardening findings on private repos (uses `isRepoPrivate()`); conditionally adds Web/SEO and JSON-LD guidance for repos that serve user-facing HTML |
+| `public-repo-scanner` | Daily at 4 AM (`publicRepoScannerHour`); 7-day per-repo throttle | Scheduled | Enumerates all public repos for all owners (including archived, via `listPublicReposIncludingArchived()`); asks Claude to scan each for live secrets, private keys, and credentials; files alert issues via `ensureAlertIssue()`; does NOT write MCP config (text-only, no tool use needed) |
 | `idea-suggester` | Hourly (weekdays only); selects repos stalest-first (age ≥ 24h); skips when Claws busy unless SLO (48h) breached; max 4 concurrent repos | Smart-scheduled | Suggests new ideas per repo, posts to Slack thread for reaction-based review |
 | `idea-collector` | Pending ideas with reactions | 30 min | Polls Slack reactions, creates GH issues for accepted ideas, batches results into collection PR |
 | `issue-auditor` | Hourly; selects repos stalest-first (age ≥ 24h); skips when Claws busy unless SLO (48h) breached; max 4 concurrent repos | Smart-scheduled | Reconciles issue states, manages Ready and In Review labels |
@@ -846,6 +923,10 @@ See [Jobs](jobs/README.md) for detailed behavior of each.
 | `ha-upgrader` | Home Assistant `update.*` entities | 24 h | Polls Home Assistant for pending updates, applies device and HA core/supervisor/OS updates within configurable dwell windows (24 h device, 48 h high-risk), raises alert issues for failures; Slack notified only on actual installs, user-excluded alerts, or install failures (not on routine dwell-deferred waits) |
 | `ha-deploy-watcher` | git-pull addon logs | 5 min | Polls git-pull addon logs via HA Supervisor API; posts Slack notification with commit list (`listCompareCommits`), compare link, and diffstat when `Updating <old>..<new>` is detected; commit-list fetch failures fall back to compare link only; first run baselines silently |
 | `worktree-cleaner` | All `~/.claws/worktrees/` directories | 24 h | Removes worktrees >7 days old that aren't in any running task or persisted session; uses `git worktree remove --force` with `rm -rf` + `git worktree prune` fallback; logs removed count and freed bytes |
+| `bin-day-monitor` | Home Assistant bin-day sensors | 15 min | Polls `sensor.bin_scraper_*` entities; maintains a single persistent GitHub issue as a running availability log; records status transitions (HEALTHY ↔ MISSING) in an embedded history table; never closes the issue on recovery; disabled by default (`homeAssistantBinDayMonitorEnabled`) |
+| `ha-battery-monitor` | Home Assistant battery sensors | 1 h | Polls HA entities with `device_class=battery` and `unit_of_measurement=%`; creates a `Priority` issue listing all devices at or below `homeAssistantBatteryThresholdPercent` (default 10%); auto-closes the issue when all devices recover; body is rebuilt in-place each tick without posting comments; disabled by default (`homeAssistantBatteryMonitorEnabled`) |
+| `actions-storage-monitor` | All repos | Daily at 5 AM (`actionsStorageMonitorHour`) | Scans GitHub Actions cache + artifact storage per repo; files per-repo alert when a repo uses ≥ 50 MB of Actions **cache** or has artifacts older than 7 days (high retention); org-level roll-up alert when total usage ≥ 80% of 2 GB account quota |
+| `dependabot-alert-monitor` | All repos | Smart-scheduled | Polls `GET /repos/{owner}/{repo}/dependabot/alerts?state=open` per repo; auto-dismisses stale alerts in two passes — SBOM-based (gated by `dependabotAutoDismissStale`, default on) then manifest-pin-based for pip packages with `==` pins (handles SBOM lag); files a Priority `ensureAlertIssue` listing the remaining open alerts sorted by severity, with an embedded `REMEDIATION_GUIDANCE` block ordering remediation steps (remove unneeded deps, classify dev vs runtime, bump direct deps, use `>=` ranges in overrides); auto-closes the issue once alerts clear; leaves repos with scanning disabled as-is; if the App lacks `dependabot_alerts: read`, files a remediation issue on `SELF_REPO` (throttled hourly) |
 
 ### Naming Convention
 
@@ -876,8 +957,9 @@ Issues (issue-dispatcher):
   Unreacted feedback     →  (planner refines plan)       →  Ready label re-added, response comment posted
   Open PR + follow-up Q  →  (planner posts response)     →  👍 reactions added (no label changes)
   Refined label          →  (implementer creates PR)     →  Refined removed, Ready removed, In Review added
-  Game-ID in body        →  (triage-kwyjibo-errors)      →  investigation report posted
   [claws-error] title    →  (triage-claws-errors)        →  investigation report posted
+  Plan occurrences stale →  (planner re-plans in-place)  →  CLAWS_PLAN_OCCURRENCES marker updated (fires when currentOcc ≥ plannedOcc×2)
+  No code change needed  →  (planner posts explanation + CLAWS_NO_CODE_CHANGES)  →  Claws Ignore label applied; pipeline short-circuits, issue stays open
 
 PRs (pr-dispatcher):
   All open PRs               →  (reviewer)           →  review comment posted, Ready added if clean
@@ -890,7 +972,7 @@ PRs (pr-dispatcher):
   Dependabot (`dependabot[bot]` or `app/dependabot`) or LGTM'd Claws PR + passing CI  →  (merger)  →  merged, In Review removed
   Doc PR (claws/docs-*) + doc-only files + CI passing/skipped  →  (merger)  →  merged (no LGTM required)
   Idea-collection PR (claws/ideas-collect-*) + ideas-only files + CI passing/skipped  →  (merger)  →  merged (no LGTM required)
-  Auto-bump PR (automation/bump-*, label auto-bump, no major-update) + apps/*/deployment.yaml only + CI passing  →  (merger)  →  merged (no LGTM required)
+  Auto-bump PR (automation/bump-*, label auto-bump, no major-update) + image-pin manifests only (deployment.yaml, migrate-job.yaml, cleanup-test-data-cronjob.yaml under apps/<app>/ or base/|prod/ overlay) + CI passing  →  (merger)  →  merged (no LGTM required)
 ```
 
 **Plan length warning**: After posting any plan comment (fresh plan,
@@ -944,12 +1026,30 @@ asked), no comment is posted and `Ready` is not added — the reviewer
 re-reviews in the same dispatcher cycle. This prevents `Ready` from
 flickering on/off between cycles.
 
+**Benign no-change output** (`isBenignNoChangeOutput`, exported from `review-addresser.ts`): when the addresser made no commits but produced text output, the guard distinguishes benign "already addressed / not applicable" confirmations from real blockers. A positive "no change needed" phrase is required AND no blocker/error/uncertainty signal may be present. When the guard returns `true`, `Ready` is applied (with a CI/merge-state re-check mirroring the pr-reviewer path) rather than withheld — fixing the case where a false-positive reviewer nit produces confirmation text that previously caused PRs to stall permanently (the `review-addressed: <SHA>` marker prevents the addresser from re-firing, and without a push there are no new commits for the reviewer to detect).
+
 **Human-over-automated authority**: When human and Claws reviewer comments conflict
 (e.g. a human directs "use self-hosted runner" but the automated review says "use
 ubuntu-latest"), the review-addresser's prompt explicitly instructs it to follow the
 human and ignore the conflicting automated comment. The authority hierarchy — established
 by the `getPRReviewComments()` section headers — means human directives cannot be
 silently overridden by the next automated review cycle.
+
+**Refined plan is authoritative over the original issue**: `buildIssueContext()`
+in `src/agents/pr-reviewer.ts` fetches both the originating issue body and the
+Claws refined-plan comment (if one exists, via `planParser.findPlanComment()`).
+When a plan comment exists, the reviewer is told the **refined plan**, not the
+original issue text, is the authoritative spec — the planner may have
+deliberately narrowed, expanded, or changed the original request after
+investigation, and the reviewer must not flag that intentional divergence as a
+"missing requirement" or "scope drift". The original issue body is still
+included, but only as background on the user's initial intent. When no plan
+comment exists, the issue body remains the sole source of truth (unchanged
+behavior). This prevents the reviewer from forcing a PR back toward a
+requirement the plan explicitly rejected (e.g. issue #1792 asked for an in-app
+OIDC allowlist; the refined plan concluded it was unnecessary because
+authorization is already enforced upstream in Authentik — see the auth
+discussion above — and the reviewer must accept that narrower scope).
 
 **`review-result: clean` marker**: When the pr-reviewer posts a "no issues found"
 review, the review body includes a plain-text `review-result: clean` marker (in addition
@@ -1035,21 +1135,22 @@ into two groups:
 
 - **Pinned to Claude** (explicit `provider: "claude"` on the `runClaude` call):
   issue-refiner plan generation/refinement/follow-up, pr-reviewer,
-  improvement-identifier analysis phase, and the PR description/diagnosis
-  utilities in `claude.ts` (`generatePRDescription`, `generateDocsPRDescription`,
-  `regeneratePRDescription`, `diagnoseNoCommits`). These are pinned for output
-  quality or structured-JSON correctness — Qwen via OpenCode/OpenRouter
-  consistently produces malformed JSON for analysis tasks, blocking all
-  downstream work.
+  improvement-identifier analysis phase, email-monitor (both veg-list extraction
+  and recipe generation, pinned to avoid OpenRouter 402 credit errors), and the
+  PR description/diagnosis utilities in `claude.ts` (`generatePRDescription`,
+  `generateDocsPRDescription`, `regeneratePRDescription`, `diagnoseNoCommits`).
+  These are pinned for output quality, structured-JSON correctness, or reliable
+  auth — Qwen via OpenCode/OpenRouter consistently produces malformed JSON for
+  analysis tasks, blocking all downstream work.
 - **Default to OpenCode+Qwen on OpenRouter** (no explicit provider pin, walks
-  `TEXT_ONLY_PROVIDER_FALLBACK_ORDER`): triage-kwyjibo-errors, idea-suggester,
+  `TEXT_ONLY_PROVIDER_FALLBACK_ORDER`): idea-suggester,
   qa-phase — preserving Claude quota for workflows that actually need tool
   calling or where output quality is critical.
 
 Pinning with `provider: "claude"` bypasses the fallback chain entirely and fails
 visibly on a Claude outage rather than silently routing to a provider that may
 produce unusable output.
-The planner itself defaults to the `opus` tier (no classification step) because issue descriptions are frequently too sparse to classify reliably, and a wrong downgrade — especially to `haiku` via the `cheap` tier — produces low-quality plans that propagate through every downstream implementation. When an issue carries the `Plan: Fable` label, `planModelForIssue()` in `issue-refiner.ts` overrides the model to `claude-fable-5` (`FABLE_MODEL`) instead. Follow-up Q&A (`processFollowUp`) always uses the `sonnet` tier regardless of the label.
+The planner itself defaults to the `opus` tier (no classification step) because issue descriptions are frequently too sparse to classify reliably, and a wrong downgrade — especially to `haiku` via the `cheap` tier — produces low-quality plans that propagate through every downstream implementation. When an issue carries the `Plan: Fable` label, `planModelForIssue()` in `issue-refiner.ts` overrides the model to `claude-fable-5` (`FABLE_MODEL`) instead, and `FABLE_PLANNING_CONTEXT` is injected into the prompt to direct extra capability toward deeper investigation rather than longer plans (the implementer model is unchanged, so the planner–implementer capability gap is wider than usual). Follow-up Q&A (`processFollowUp`) always uses the `sonnet` tier regardless of the label.
 The planner prompt emphasizes that implementation will run on a smaller model and
 instructs the planner to produce a detailed, specification-grade plan (exact file
 paths, concrete edits, named invariants and gotchas) to keep the implementer on
@@ -1157,15 +1258,18 @@ Both the `gh` CLI wrapper (in `github.ts`) and the `git()` helper (in
 `claude.ts`) retry up to 3 times with exponential backoff (1s, 2s, 4s) on
 transient network errors. The `gh` wrapper matches HTTP status codes (400, 401,
 500, 502, 503, 504), timeouts, connection resets, "Could not resolve to a",
-"TLS handshake timeout", "Something went wrong", Go TCP dial "i/o timeout", and
+"TLS handshake timeout", "Something went wrong", Go TCP dial "i/o timeout",
 `"invalid character"` (Go `encoding/json` errors from `gh` when GitHub's Checks
-API returns a transitional response during an in-progress check). `getPRCheckStatus`
-and `getPRChecksSummary` additionally catch `"invalid character"` in their own
-`catch` blocks and degrade gracefully to `"none"` rather than crashing the
-`processPR` task — the pr-dispatcher re-runs every 5 minutes, so missing one
-cycle is invisible to the operator.
+API returns a transitional response during an in-progress check), EAGAIN /
+"failed to create new OS thread" / "resource temporarily unavailable" (OS-thread
+exhaustion when `TasksMax` cgroup pressure prevents Go binaries from spawning
+threads), `"unexpected EOF"` (TCP connection dropped before HTTP response arrived). `getPRCheckStatus` and `getPRChecksSummary` additionally catch
+`"invalid character"` in their own `catch` blocks and degrade gracefully to
+`"none"` rather than crashing the `processPR` task — the pr-dispatcher re-runs
+every 5 minutes, so missing one cycle is invisible to the operator.
 The `git()` helper matches HTTP 5xx, ETIMEDOUT, ECONNRESET, ECONNREFUSED,
-TLS handshake timeout, DNS failures, and "i/o timeout". The `gitRaw()` helper does not retry — callers
+EAGAIN, TLS handshake timeout, DNS failures, "i/o timeout", "failed to create
+new OS thread", and "resource temporarily unavailable". The `gitRaw()` helper does not retry — callers
 manage their own error handling.
 Rate limit errors are handled separately: they trip a circuit breaker that
 blocks all GitHub API calls for 60 seconds, throwing `RateLimitError`
@@ -1254,7 +1358,22 @@ is applied to flagged PRs.
 
 After the label is applied, `pr-dispatcher` enqueues a one-shot
 **problematic-PR diagnosis pass** (`ci-fixer:problematic` kind →
-`src/agents/problematic-pr-diagnoser.ts`). The diagnoser runs up to
+`src/agents/problematic-pr-diagnoser.ts`). The diagnoser first checks whether
+CI has already recovered before running any rounds: if `getFailedRunLog()`
+returns empty, it calls `getFailingCheck()` and — if no check is failing —
+calls `getPRCheckStatus()`; when the status is `"passing"` or `"none"`, it
+immediately resolves as `success` and removes the label (CI recovered between
+the label being applied and the diagnosis pass running — e.g. a flaky check
+passed on retry, a transient infra failure cleared, or a manual fix landed).
+The dedup guard that prevents re-running the diagnoser once a final report comment
+exists (`DIAGNOSIS_COMMENT_MARKER`) now also clears the `Claws Problematic` label
+before short-circuiting, via `clearStaleProblematicLabelIfGreen()` — this handles
+the case where CI recovered on its own (flaky check passed on retry, transient infra
+cleared, manual fix landed) after the diagnosis report was posted. Without this,
+a PR that goes green post-diagnosis keeps the stale label forever because the marker
+blocks every future diagnosis pass.
+
+Only when CI is genuinely still failing does the diagnoser run up to
 `MAX_ROUNDS` (3) deeper-diagnosis rounds: each round invokes Claude with the
 full failure-log + recent-error history and an explicit instruction to take a
 more thorough approach (consider reverting earlier ci-fixer commits, merging
@@ -1470,7 +1589,11 @@ The `runner-monitor` job runs independently. The remaining nine scanners
 - **k3s-monitor**: Runs every 15 minutes. Uses `kubectl get pods/nodes` to detect
   failing pods and unhealthy nodes in the k3s cluster, and additionally fetches
   Flux `Kustomization` and `HelmRelease` resources (best-effort — Flux may not
-  be installed) to detect reconciliation failures. Both Flux resource kinds share
+  be installed) to detect reconciliation failures. When a `kubectl` call fails
+  with a stale-kubeconfig error (unreachable endpoint, expired cert, etc.) and
+  `kubeconfigRefresh` is configured, the monitor calls `refreshKubeconfig()` from
+  `kubeconfig-refresh.ts` to fetch a fresh kubeconfig from the remote host via
+  SSH before retrying — this handles cluster rebuilds that change the endpoint or CA. Both Flux resource kinds share
   the same detection logic: a `Ready=False` condition triggers an alert after a
   2-minute grace period (to avoid noise from transient reconciliation hiccups).
   Resources whose `Ready` reason is `DependencyNotReady` are suppressed entirely
@@ -1610,7 +1733,6 @@ constant to avoid runtime file I/O and build-path issues.
 | planner (issue-refiner) | `claws/plan-<N>-<hex4>` |
 | implementer (issue-worker) | `claws/issue-<N>-<hex4>` |
 | ci-fixer / review-addresser | Uses existing PR branch |
-| triage-kwyjibo-errors | `claws/investigate-<N>-<hex4>` |
 | triage-claws-errors | `claws/investigate-error-<N>-<hex4>` |
 | doc-maintainer | `claws/docs-<YYYYMMDD>-<hex4>` |
 | improvement-identifier | `claws/improve-<hex4>` (analysis worktree only; no PR is opened) |
@@ -1670,6 +1792,13 @@ repoFullName)` is called in each job's `run()` function to filter out disabled
 repos before processing. For example, `ci-fixer` can be disabled per-repo this
 way to suppress automated CI fix attempts on repos where manual intervention is
 preferred.
+
+**Opt-in jobs** (`OPT_IN_JOB_NAMES`): some jobs are disabled by default for all
+repos and require explicit opt-in via `enabledJobsByRepo` in `config.json`. Currently
+`main-build-monitor-scanner` is the only opt-in job — it is suppressed unless a repo
+explicitly lists it in `enabledJobsByRepo[repoFullName]`. `isJobDisabledForRepo()`
+handles both lists: a job is disabled if it appears in `disabledJobsByRepo` for the
+repo, or if it is in `OPT_IN_JOB_NAMES` and the repo is not in `enabledJobsByRepo`.
 
 ### Job Pause/Resume
 
@@ -1751,6 +1880,8 @@ All structured markers in GitHub comments and PR bodies are plain text:
 - `review-provider: openrouter` / `review-provider: claude` — legacy marker from a previous OpenRouter routing experiment; no longer written but still parsed for backward compatibility (strips the marker from displayed comment text)
 - `plan-updated-after-phase:N` — plan-parser deduplication marker
 - `no-commit:<phase>` — dedup marker in issue-worker no-commit feedback (one per phase; `no-commits-warning` global marker removed in #851)
+- `CLAWS_PLAN_OCCURRENCES: N` — appended to every plan comment by issue-refiner, recording the `**Occurrences:**` count from the issue body at planning time; parsed by `parsePlannedOccurrences()` and used by issue-dispatcher to trigger re-planning when recurrence count doubles
+- `CLAWS_NO_CODE_CHANGES` — planner verdict emitted when the issue requires no file changes (purely operational task, fix already shipped, not actionable as code). `issue-refiner` posts the planner's explanation paragraph, then applies the `Claws Ignore` label to stop all further planner + implementer dispatch. The issue stays open so `ensureAlertIssue` can still find it by title on recurrence. Must appear on its own line; rejected if combined with a plan body or a `DUPLICATE_OF` verdict.
 
 Agent prompts include explicit instructions not to use HTML comments in output.
 
@@ -1800,8 +1931,9 @@ cache. PRs and comments appear under the App bot identity.
 ### Security Model
 
 Because Claude runs with `--dangerously-skip-permissions`, all user-supplied
-input paths must be guarded upstream. Two primary defenses:
+input paths must be guarded upstream. Three primary defenses:
 
+- **Query param escaping**: The `/logs/issue` page escapes the `repo` query param through both `encodeURI()` and `escapeHtml()` (in that order) before interpolating it into an `href` attribute — preventing reflected XSS via a crafted `repo` value containing a double-quote. A repo-membership check (`listRepos()`) also gates the handler: unknown repos return 404 rather than rendering an empty page with the attacker-controlled value.
 - **Fork PR filtering**: All PR-processing jobs (pr-reviewer, ci-fixer,
   qa-phase, auto-merger, review-addresser) skip fork PRs via `isForkPR()`
   (checks the `isCrossRepository` field). This prevents untrusted external
@@ -1810,7 +1942,7 @@ input paths must be guarded upstream. Two primary defenses:
 - **Allowed actor gating**: `isAllowedActor()` in `github.ts` checks whether
   a user is in the `ALLOWED_ACTORS` list or is the authenticated `gh` user.
   Applied at multiple layers:
-  - **issue-dispatcher** gates on issue *author* in both Phase 1 (refined → implementer) and Phase 2 (fresh plan/refine → planner) — issues from non-allowed actors are logged and skipped; the dispatcher also Slack-notifies and files a tracked `[disallowed-actor] @<login> is blocked from Claws automation` issue in `SELF_REPO` (via `ensureAlertIssue`, one issue per actor with occurrence tracking; individual item dedup via `markUntrustedActorNotified` in `notified_untrusted_actors` DB table) so the operator can grant an `allowedActors` exception. Two CI bot exceptions exist: (1) `isCiFailureAlertIssue()` grants a full pass-through for recognized CI alert issues authored by the GitHub Actions bot — these are dispatched into the refine-and-fix pipeline (recognized patterns: `[main] <workflow> failed on main`, `Build failure:`, `Cypress:`, `Lighthouse regression`, `Database backup:`); (2) `isCiAlertBotAuthor()` handles all other GitHub Actions bot issues — they are silently skipped (no dispatch, no untrusted-actor notification, no dedup row) because they are bot notifications rather than human work items. This two-tier treatment means non-CI bot issues from real users still trigger the disallowed-actor alert, while CI bots never do.
+  - **issue-dispatcher** gates on issue *author* in both Phase 1 (refined → implementer) and Phase 2 (fresh plan/refine → planner) — issues from non-allowed actors are logged and skipped; the dispatcher also Slack-notifies and files a tracked `[disallowed-actor] @<login> is blocked from Claws automation` issue in `SELF_REPO` (via `ensureAlertIssue`, one issue per actor with occurrence tracking; individual item dedup via `markUntrustedActorNotified` in `notified_untrusted_actors` DB table) so the operator can grant an `allowedActors` exception. One CI bot exception exists: `isCiAlertBotAuthor()` grants a full pass-through for any issue authored by the GitHub Actions runner bot (`github-actions[bot]` / `app/github-actions`) — any such issue is dispatched into the refine-and-fix pipeline regardless of title. Other bots (dependabot, etc.) are not covered and remain subject to the untrusted-actor path.
   - **issue-refiner** gates the auto-`Refined` label application for `[ci-unrelated]` issues on the issue author (defense-in-depth against escalation from untrusted actors).
   - **issue-refiner** also filters comments by actor — only comments from allowed actors trigger plan refinement or follow-up.
   - **triage jobs** check issue authors.
@@ -1906,11 +2038,8 @@ defaults.
 | `githubOwners` | `CLAWS_GITHUB_OWNERS` | `["stjohnb","St-John-Software"]` |
 | `selfRepo` | `CLAWS_SELF_REPO` | `St-John-Software/claws` |
 | `port` | `PORT` | `3000` |
-| `kwyjiboBaseUrl` | `KWYJIBO_BASE_URL` | `https://kwyjibo.vercel.app` |
-| `kwyjiboApiKey` | `KWYJIBO_AUTOMATION_API_KEY` | *(empty)* |
 | `intervals.issueDispatcherMs` | — | `300000` (5 min) |
 | `intervals.prDispatcherMs` | — | `300000` (5 min) |
-| `intervals.triageKwyjiboErrorsMs` | — | `600000` (10 min) |
 | `intervals.triageClawsErrorsMs` | — | `600000` (10 min) |
 | `intervals.ideaCollectorMs` | — | `1800000` (30 min) |
 | `intervals.runnerMonitorMs` | — | `600000` (10 min) |
@@ -1919,6 +2048,8 @@ defaults.
 | `intervals.k3sMonitorMs` | — | `900000` (15 min) |
 | `intervals.runnerMetricsSyncMs` | — | `120000` (2 min) |
 | `schedules.repoStandardsHour` | — | `2` (2 AM local time) |
+| `schedules.publicRepoScannerHour` | — | `4` (4 AM local time) |
+| `schedules.actionsStorageMonitorHour` | — | `5` (5 AM local time) |
 | `smartScheduling.enabled` | — | `true` |
 | `smartScheduling.quietHourStart` | — | `19` (accepted but unused — off-hours gating was removed) |
 | `smartScheduling.quietHourEnd` | — | `7` (accepted but unused — off-hours gating was removed) |
@@ -1932,9 +2063,9 @@ defaults.
 | `logRetentionDays` | — | `14` |
 | `logRetentionPerJob` | — | `20` |
 | `emailEnabled` | `CLAWS_EMAIL_ENABLED` | `true` |
-| `emailUser` | `CLAWS_EMAIL_USER` | `brendanserver@gmail.com` |
+| `emailUser` | `CLAWS_EMAIL_USER` | `""` (empty — must be set in env or config) |
 | `emailAppPassword` | `BRENDAN_SERVER_GMAIL_APP_PASSWORD` | *(empty)* |
-| `emailRecipient` | `CLAWS_EMAIL_RECIPIENT` | `brendan@bstjohn.net` |
+| `emailRecipient` | `CLAWS_EMAIL_RECIPIENT` | `""` (empty — must be set in env or config) |
 | `whatsappEnabled` | `WHATSAPP_ENABLED` | `false` |
 | `whatsappAllowedNumbers` | `WHATSAPP_ALLOWED_NUMBERS` | `[]` |
 | `openaiApiKey` | `OPENAI_API_KEY` | *(empty)* |
@@ -1942,6 +2073,10 @@ defaults.
 | `claudeTimeoutMs` | `CLAWS_CLAUDE_TIMEOUT_MS` | `21600000` (6 hours, minimum 60s) |
 | `claudeLivenessTimeoutMs` | `CLAWS_CLAUDE_LIVENESS_TIMEOUT_MS` | `21600000` (6 hours, minimum 60s) |
 | `claudeWorkerMemoryMaxBytes` | `CLAWS_CLAUDE_WORKER_MEMORY_MAX_BYTES` | `2147483648` (2 GiB; 0 disables) |
+| `worktreeStaleMs` | — | `604800000` (7 days — worktrees older than this are pruned by worktree-cleaner) |
+| `reviewModelTier` | `CLAWS_REVIEW_MODEL_TIER` | `"sonnet"` (global default model tier for PR reviews; `"opus"` raises all reviews to the opus tier) |
+| `openrouterApiKey` | `CLAWS_OPENROUTER_API_KEY` | *(empty — required for OpenCode/OpenRouter text-only backend)* |
+| `openrouterBestModel` | `CLAWS_OPENROUTER_BEST_MODEL` | `"qwen/qwen-2.5-coder-32b-instruct"` (best-tier model for OpenRouter text-only workflows) |
 | `oidcClientId` | `CLAWS_OIDC_CLIENT_ID` | *(empty)* |
 | `oidcClientSecret` | `CLAWS_OIDC_CLIENT_SECRET` | *(empty)* |
 | `oidcBaseUrl` | `CLAWS_OIDC_BASE_URL` | *(empty — e.g. `https://auth.example.com`)* |
@@ -1954,6 +2089,7 @@ defaults.
 | `nameyDbUrl` | `NAMEY_DB_URL` | *(empty — namey DB access disabled)* |
 | `pausedJobs` | — | `[]` (job names to pause on startup) |
 | `disabledJobsByRepo` | — | `{}` (map of repo full name → array of job names to disable for that repo) |
+| `enabledJobsByRepo` | — | `{}` (map of repo full name → array of opt-in job names to enable for that repo; currently `main-build-monitor-scanner` is the only opt-in job, disabled by default for all repos) |
 | `disabledAgents` | — | `[]` (agent names to disable: `planner`, `implementer`, `ci-fixer`, `review-addresser`, `reviewer`, `merger`) |
 | `skippedItems` | — | `[]` (array of `{repo, number}` excluded from processing) |
 | `prioritizedItems` | — | `[]` (array of `{repo, number}` processed first) |
@@ -1962,17 +2098,26 @@ defaults.
 | `homeAssistantToken` | `CLAWS_HOME_ASSISTANT_TOKEN` | *(empty — required when homeAssistantBaseUrl is set)* |
 | `homeAssistantConfigRepo` | — | *(empty — e.g. `St-John-Software/home-assistant-config`)* |
 | `notifyDashboardActions` | — | `true` (send Slack notifications for all dashboard mutations) |
+| `dependabotAutoDismissStale` | — | `true` (auto-dismiss Dependabot alerts whose patched version is already present in the dependency-graph SBOM; set to `false` to disable) |
 | `k3sMonitorEnabled` | — | `true` (set to `false` to disable the k3s-monitor job) |
 | `k3sIgnoredNodes` | — | `["k3s-nas", "ryzen"]` (nodes to suppress alerts for — applies to both node and pod alerts) |
 | `fleetInfraRepo` | `CLAWS_FLEET_INFRA_REPO` | `St-John-Software/fleet-infra` (repo where k3s-monitor files alert issues) |
 | `prodK8sMonitorEnabled` | `CLAWS_PROD_K8S_MONITOR_ENABLED` | `false` (enable prod cluster monitoring) |
 | `prodK8sKubeconfigPath` | `CLAWS_PROD_K8S_KUBECONFIG_PATH` | *(empty — uses default kubeconfig when empty)* |
+| `fleetKubeconfigPath` | `CLAWS_FLEET_KUBECONFIG_PATH` | `"~/.kube/config"` (kubeconfig path for fleet/k3s cluster; `~` is expanded to an absolute path via `resolveIdentityFile` at session-create time; granted to sessions with the `fleet-infra` capability; set to `""` to hide the capability from the sessions UI) |
+| `prodK8sKubeconfigRefresh` | — | *(empty — when set, enables automatic kubeconfig refresh for the prod cluster; object with fields: `tailscaleHostname`, `host`, `user`, `port`, `identityFile`, `remotePath`, `serverPort`, `serverOverride`)* |
 | `prodK8sIgnoredNodes` | — | `[]` (nodes to suppress alerts for in the prod cluster) |
 | `prodK8sRepo` | `CLAWS_PROD_K8S_REPO` | `St-John-Software/production-infra` (repo where prod-k8s-monitor files alert issues) |
 | `intervals.prodK8sMonitorMs` | — | `900000` (15 min) |
 | `ciFixerCircuitBreaker.maxAttempts` | — | `5` (max CI fix attempts per PR within window) |
 | `ciFixerCircuitBreaker.windowMs` | — | `86400000` (24h window for attempt counting) |
 | `ciFixerCircuitBreaker.maxConsecutiveFailures` | — | `3` (consecutive failures before tripping) |
+| `homeAssistantBinDayMonitorEnabled` | `CLAWS_HOME_ASSISTANT_BIN_DAY_MONITOR_ENABLED` | `false` (enable bin-day sensor monitoring) |
+| `homeAssistantBinDaySensorPrefix` | `CLAWS_HOME_ASSISTANT_BIN_DAY_SENSOR_PREFIX` | `"sensor.bin_scraper_"` (HA entity ID prefix to monitor) |
+| `intervals.binDayMonitorMs` | — | `900000` (15 min) |
+| `homeAssistantBatteryMonitorEnabled` | `CLAWS_HOME_ASSISTANT_BATTERY_MONITOR_ENABLED` | `false` (enable battery-level sensor monitoring) |
+| `homeAssistantBatteryThresholdPercent` | `CLAWS_HOME_ASSISTANT_BATTERY_THRESHOLD_PERCENT` | `10` (alert threshold — devices at or below this percent are reported; `<=` comparison so exactly-10% devices are included) |
+| `intervals.batteryMonitorMs` | — | `3600000` (1 hour) |
 
 Config changes made via the web UI (`POST /config`) take effect immediately
 at runtime — no restart required. The config module uses ESM live bindings
@@ -2068,7 +2213,7 @@ the 300 s scheduler drain in `src/main.ts`, and liveness/readiness probes on
 A `/verify` page renders the latest report — database, GitHub App, every
 CLI (`gh`, `claude`, `codex`, `opencode`), OpenRouter, Slack webhook (DNS
 only — no POST), IMAP login/logout, per-runner SSH, datasette SSH, Ollama,
-namey PG, Kwyjibo, WhatsApp auth. Each check is wrapped in a 30 s timeout.
+namey PG, WhatsApp auth. Each check is wrapped in a 30 s timeout.
 A red verify-only banner appears on every page of the dashboard.
 
 Flipping to `active` is explicit: either click **Activate** on the Config

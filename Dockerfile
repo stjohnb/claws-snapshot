@@ -11,7 +11,18 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 COPY package.json package-lock.json ./
-RUN npm ci
+# esbuild's postinstall writes its native binary then immediately execs it to
+# verify; under BuildKit/overlayfs this intermittently fails with ETXTBSY
+# ("text file busy"). Retry to absorb that race (#1745).
+RUN for i in 1 2 3; do \
+      echo "npm ci attempt $i"; \
+      npm ci && exit 0; \
+      echo "attempt $i failed, cleaning node_modules and retrying after 3s..."; \
+      rm -rf node_modules; \
+      sleep 3; \
+    done; \
+    echo "npm ci failed after 3 attempts" >&2; \
+    exit 1
 
 COPY tsconfig.json tsconfig.client.json ./
 COPY scripts ./scripts

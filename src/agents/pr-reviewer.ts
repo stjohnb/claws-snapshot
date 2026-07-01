@@ -306,6 +306,36 @@ export async function buildIssueContext(
 
   if (!truncatedBody && truncatedPlan === null) return "";
 
+  if (truncatedPlan !== null) {
+    const parts: string[] = [
+      `## Originating Issue & Refined Plan`,
+      ``,
+      `This PR was created in response to **issue #${issueNumber}**, which was then REFINED into the`,
+      `implementation plan below. The **refined plan is the authoritative source of truth**`,
+      `for what this PR must deliver — after investigation the planner may have deliberately`,
+      `narrowed, expanded, or changed the original request. Where the refined plan and the`,
+      `original issue text conflict, the refined plan WINS. Do NOT flag the PR for failing to`,
+      `match the original issue when it matches the refined plan; in particular do not raise`,
+      `"missing requirement" or "scope drift" findings that are really just the plan`,
+      `intentionally diverging from the initial report.`,
+      ``,
+      `Evaluate whether the diff delivers what the **refined plan** describes. The original`,
+      `issue body follows only as background on the user's initial intent.`,
+      ``,
+      `Note: If the PR body indicates this is one of multiple PRs (e.g. "PR 2 of 3"), evaluate delivery only against the phase described in the PR body — items belonging to other phases are out of scope.`,
+      ``,
+      `### Refined plan (Claws implementation plan comment — AUTHORITATIVE)`,
+      ``,
+      truncatedPlan,
+      ``,
+      `### Issue #${issueNumber} body (original report — background only)`,
+      ``,
+      truncatedBody,
+    ];
+
+    return parts.join("\n");
+  }
+
   const parts: string[] = [
     `## Originating Issue`,
     ``,
@@ -317,15 +347,6 @@ export async function buildIssueContext(
     ``,
     truncatedBody,
   ];
-
-  if (truncatedPlan !== null) {
-    parts.push(
-      ``,
-      `### Refined plan (Claws implementation plan comment)`,
-      ``,
-      truncatedPlan,
-    );
-  }
 
   return parts.join("\n");
 }
@@ -621,7 +642,7 @@ function buildStandardReviewPrompt(
     "```",
     ``,
     `Please review this PR for:`,
-    ...(issueContext ? [`- Whether the PR actually delivers what the originating issue (above) describes — missed requirements, unaddressed acceptance criteria, or scope drift`] : []),
+    ...(issueContext ? [`- Whether the PR delivers what the refined plan above describes (falling back to the originating issue only when no plan was posted) — treat the refined plan as authoritative and do NOT report intentional divergence from the original issue as a missing requirement or scope drift`] : []),
     `- Bugs and logic errors`,
     `- Security issues`,
     `- Performance problems`,
@@ -734,13 +755,8 @@ export async function processPR(repo: Repo, pr: gh.PR): Promise<void> {
     const issueContext = await buildIssueContext(fullName, pr);
 
     // Token usage is summed across multiple runClaude calls in the large-PR path
-    // (per-large-file passes + normal-files batch); written to the DB once after.
-    let taskTokensUsed: number | undefined;
-    let taskCostUsd: number | undefined;
-    const accumulateUsage = (t: number, c: number) => {
-      taskTokensUsed = (taskTokensUsed ?? 0) + t;
-      taskCostUsd = (taskCostUsd ?? 0) + c;
-    };
+    // (per-large-file passes + normal-files batch); shared callback accumulates and writes after each call.
+    const trackTokens = db.trackTaskTokens(taskId);
 
     let claudeOutput: string;
 
@@ -860,7 +876,7 @@ export async function processPR(repo: Repo, pr: gh.PR): Promise<void> {
             `- Missing required fields or unexpected additions`,
           ] : [
             `Review this file for:`,
-            ...(issueContext ? [`- Whether the PR actually delivers what the originating issue (above) describes — missed requirements, unaddressed acceptance criteria, or scope drift`] : []),
+            ...(issueContext ? [`- Whether the PR delivers what the refined plan above describes (falling back to the originating issue only when no plan was posted) — treat the refined plan as authoritative and do NOT report intentional divergence from the original issue as a missing requirement or scope drift`] : []),
             `- Bugs and logic errors`,
             `- Security issues`,
             `- Performance problems`,
@@ -881,7 +897,7 @@ export async function processPR(repo: Repo, pr: gh.PR): Promise<void> {
           `Choose opus for complex changes (architectural issues, security fixes, multi-file refactors, novel logic).`,
         ].join("\n");
 
-        const fileReview = await claude.runClaude(filePrompt, wtPath, { capability: "text-only", mcpConfig: mcpConfigPath, timeoutMs, tier: prTier ?? "sonnet", model, provider: "claude", appendSystemPrompt: agentDoc, onTokensUsed: accumulateUsage, envSanitization: "passthrough" });
+        const fileReview = await claude.runClaude(filePrompt, wtPath, { capability: "text-only", mcpConfig: mcpConfigPath, timeoutMs, tier: prTier ?? "sonnet", model, provider: "claude", appendSystemPrompt: agentDoc, onTokensUsed: trackTokens, envSanitization: "passthrough" });
 
         if (!isCleanReview(fileReview)) {
           reviewSegments.push(`### ${file}\n${fileReview.trim()}`);
@@ -904,7 +920,7 @@ export async function processPR(repo: Repo, pr: gh.PR): Promise<void> {
           fullName, pr, combinedNormalDiff, guardCtx, needsReassessment, history, normalContext, issueContext, humanComments,
         ) + (truncated ? "\n\n[Note: diff truncated due to combined diff size limit]" : "");
 
-        const normalReview = await claude.runClaude(normalPrompt, wtPath, { capability: "text-only", mcpConfig: mcpConfigPath, timeoutMs, tier: prTier ?? "sonnet", model, provider: "claude", appendSystemPrompt: agentDoc, onTokensUsed: accumulateUsage, envSanitization: "passthrough" });
+        const normalReview = await claude.runClaude(normalPrompt, wtPath, { capability: "text-only", mcpConfig: mcpConfigPath, timeoutMs, tier: prTier ?? "sonnet", model, provider: "claude", appendSystemPrompt: agentDoc, onTokensUsed: trackTokens, envSanitization: "passthrough" });
 
         if (!isCleanReview(normalReview)) {
           reviewSegments.push(normalReview.trim());
@@ -931,11 +947,7 @@ export async function processPR(repo: Repo, pr: gh.PR): Promise<void> {
         fullName, pr, truncatedDiff, guardCtx, needsReassessment, history, contextBlock, issueContext, humanComments,
       );
 
-      claudeOutput = await claude.runClaude(prompt, wtPath, { capability: "text-only", mcpConfig: mcpConfigPath, timeoutMs, tier: prTier ?? "sonnet", model, provider: "claude", appendSystemPrompt: agentDoc, onTokensUsed: accumulateUsage });
-    }
-
-    if (taskTokensUsed !== undefined && taskCostUsd !== undefined) {
-      db.updateTaskTokenUsage(taskId, taskTokensUsed, taskCostUsd);
+      claudeOutput = await claude.runClaude(prompt, wtPath, { capability: "text-only", mcpConfig: mcpConfigPath, timeoutMs, tier: prTier ?? "sonnet", model, provider: "claude", appendSystemPrompt: agentDoc, onTokensUsed: trackTokens });
     }
 
     // Suppress vague/incomplete reviews — treat them as "no issues found" rather

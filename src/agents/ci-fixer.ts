@@ -13,11 +13,34 @@ import { CI_FIXER_FAST_CHECKS_GUIDANCE, RUNNER_POLICY_CONTEXT, homeAssistantCont
 import { getModel } from "../model-selector.js";
 import { classifyComplexity } from "../classify-complexity.js";
 import type { Provider } from "../plan-parser.js";
+import { parseFirstValidJson } from "../json-extract.js";
 
 export type WorkItem =
   | { kind: "conflict"; repo: Repo; pr: gh.PR }
   | { kind: "rerun"; repo: Repo; pr: gh.PR; runId: string }
   | { kind: "fix"; repo: Repo; pr: gh.PR; failedCheck: gh.FailedCheck };
+
+async function pushAndUpdatePR(
+  wtPath: string,
+  repo: Repo,
+  pr: gh.PR,
+  model: string,
+  actualProvider: Provider,
+  attributionVerb: string,
+  successLog: string,
+): Promise<TaskOutcome> {
+  const fullName = repo.fullName;
+  await claude.pushBranch(wtPath, pr.headRefName, repo.owner);
+  try {
+    const attribution = `*— ${attributionVerb}: ${model} (provider: ${actualProvider}) —*`;
+    const description = await claude.regeneratePRDescription(wtPath, pr.baseRefName, pr, fullName, attribution);
+    await gh.updatePR(fullName, pr.number, description);
+  } catch (descErr) {
+    log.warn(`[ci-fixer] Failed to update PR description for ${fullName}#${pr.number}: ${descErr}`);
+  }
+  log.info(`[ci-fixer] ${successLog} for ${fullName}#${pr.number}`);
+  return await buildSuccessOutcome(wtPath, pr.baseRefName, pr.number, "updated");
+}
 
 export async function resolveConflicts(repo: Repo, pr: gh.PR): Promise<boolean> {
   const fullName = repo.fullName;
@@ -92,26 +115,12 @@ export async function resolveConflicts(repo: Repo, pr: gh.PR): Promise<boolean> 
           db.updateTaskModel(taskId, model);
           log.info(`[ci-fixer] Using model "${model}" for conflict resolution on ${fullName}#${pr.number}`);
           let actualProvider: Provider = "claude";
-          let taskTokensUsed: number | undefined;
-          let taskCostUsd: number | undefined;
-          await claude.runClaude(prompt, wtPath, { capability: "tool-use", mcpConfig: mcpConfigPath, timeoutMs, tier, model, appendSystemPrompt: agentDoc, onProviderUsed: (p) => { actualProvider = p; }, onTokensUsed: (t, c) => { taskTokensUsed = t; taskCostUsd = c; }, agent: "build", envSanitization: "passthrough" });
-          if (taskTokensUsed !== undefined && taskCostUsd !== undefined) {
-            db.updateTaskTokenUsage(taskId, taskTokensUsed, taskCostUsd);
-          }
+          await claude.runClaude(prompt, wtPath, { capability: "tool-use", mcpConfig: mcpConfigPath, timeoutMs, tier, model, appendSystemPrompt: agentDoc, onProviderUsed: (p) => { actualProvider = p; }, onTokensUsed: db.trackTaskTokens(taskId), agent: "build", envSanitization: "passthrough" });
 
           let outcome: TaskOutcome = { commits: 0 };
 
           if (await claude.hasNewCommits(wtPath, pr.headRefName)) {
-            await claude.pushBranch(wtPath, pr.headRefName, repo.owner);
-            try {
-              const attribution = `*— Conflict resolved with: ${model} (provider: ${actualProvider}) —*`;
-              const description = await claude.regeneratePRDescription(wtPath, pr.baseRefName, pr, fullName, attribution);
-              await gh.updatePR(fullName, pr.number, description);
-            } catch (descErr) {
-              log.warn(`[ci-fixer] Failed to update PR description for ${fullName}#${pr.number}: ${descErr}`);
-            }
-            log.info(`[ci-fixer] Conflict resolution pushed for ${fullName}#${pr.number}`);
-            outcome = await buildSuccessOutcome(wtPath, pr.baseRefName, pr.number, "updated");
+            outcome = await pushAndUpdatePR(wtPath, repo, pr, model, actualProvider, "Conflict resolved with", "Conflict resolution pushed");
           } else {
             log.warn(`[ci-fixer] No commits from conflict resolution for ${fullName}#${pr.number}`);
             await claude.abortMerge(wtPath);
@@ -201,17 +210,14 @@ export async function classifyCIFailure(
   try {
     const response = await claude.runClaude(prompt, process.cwd(), { capability: "text-only", tier: "sonnet", agent: "plan", provider: "claude" });
 
-    // Try to parse JSON from response
-    const jsonMatch = response.match(/\{[\s\S]*?"related"[\s\S]*?\}/);
-    if (jsonMatch) {
-      const result = ClassificationSchema.safeParse(JSON.parse(jsonMatch[0]));
-      if (result.success) {
-        return {
-          related: result.data.related,
-          fingerprint: String(result.data.fingerprint ?? ""),
-          reason: String(result.data.reason ?? ""),
-        };
-      }
+    // Multi-strategy JSON extraction (fenced blocks, brace-balanced) via shared helper
+    const result = parseFirstValidJson(response, ClassificationSchema, "ci-fixer");
+    if (result) {
+      return {
+        related: result.related,
+        fingerprint: String(result.fingerprint ?? ""),
+        reason: String(result.reason ?? ""),
+      };
     }
 
     // Regex fallback: look for "related": false
@@ -437,26 +443,12 @@ export async function fixCI(repo: Repo, pr: gh.PR, failLog: string): Promise<voi
         db.updateTaskModel(taskId, model);
         log.info(`[ci-fixer] Using model "${model}" for CI fix on ${fullName}#${pr.number}`);
         let actualProvider: Provider = "claude";
-        let taskTokensUsed: number | undefined;
-        let taskCostUsd: number | undefined;
-        await claude.runClaude(prompt, wtPath, { capability: "tool-use", mcpConfig: mcpConfigPath, timeoutMs, tier, model, appendSystemPrompt: agentDoc, onProviderUsed: (p) => { actualProvider = p; }, onTokensUsed: (t, c) => { taskTokensUsed = t; taskCostUsd = c; }, agent: "build", envSanitization: "passthrough" });
-        if (taskTokensUsed !== undefined && taskCostUsd !== undefined) {
-          db.updateTaskTokenUsage(taskId, taskTokensUsed, taskCostUsd);
-        }
+        await claude.runClaude(prompt, wtPath, { capability: "tool-use", mcpConfig: mcpConfigPath, timeoutMs, tier, model, appendSystemPrompt: agentDoc, onProviderUsed: (p) => { actualProvider = p; }, onTokensUsed: db.trackTaskTokens(taskId), agent: "build", envSanitization: "passthrough" });
 
         let outcome: TaskOutcome = { commits: 0 };
 
         if (await claude.hasNewCommits(wtPath, pr.headRefName)) {
-          await claude.pushBranch(wtPath, pr.headRefName, repo.owner);
-          try {
-            const attribution = `*— CI fixed with: ${model} (provider: ${actualProvider}) —*`;
-            const description = await claude.regeneratePRDescription(wtPath, pr.baseRefName, pr, fullName, attribution);
-            await gh.updatePR(fullName, pr.number, description);
-          } catch (descErr) {
-            log.warn(`[ci-fixer] Failed to update PR description for ${fullName}#${pr.number}: ${descErr}`);
-          }
-          log.info(`[ci-fixer] Pushed fix for ${fullName}#${pr.number}`);
-          outcome = await buildSuccessOutcome(wtPath, pr.baseRefName, pr.number, "updated");
+          outcome = await pushAndUpdatePR(wtPath, repo, pr, model, actualProvider, "CI fixed with", "Pushed fix");
         } else {
           log.warn(`[ci-fixer] No commits produced for ${fullName}#${pr.number}`);
         }
@@ -479,8 +471,7 @@ export async function fileUnrelatedIssue(
   const title = `[ci-unrelated] CI failures unrelated to PR changes`;
 
   try {
-    const results = await gh.searchIssues(repoName, title);
-    const existing = results.find((r) => r.title === title);
+    const existing = await gh.findIssueByExactTitle(repoName, title);
 
     let issueNumber: number;
     if (existing) {
@@ -580,12 +571,7 @@ export async function revertPreviousUnrelatedFixes(
         const model = getModel(tier, "tool-use", "claude");
         db.updateTaskModel(taskId, model);
         log.info(`[ci-fixer] Using model "${model}" for unrelated-fix revert on ${fullName}#${pr.number}`);
-        let taskTokensUsed: number | undefined;
-        let taskCostUsd: number | undefined;
-        await claude.runClaude(prompt, wtPath, { capability: "tool-use", mcpConfig: mcpConfigPath, timeoutMs, tier, model, appendSystemPrompt: agentDoc, onTokensUsed: (t, c) => { taskTokensUsed = t; taskCostUsd = c; }, agent: "build", envSanitization: "passthrough" });
-        if (taskTokensUsed !== undefined && taskCostUsd !== undefined) {
-          db.updateTaskTokenUsage(taskId, taskTokensUsed, taskCostUsd);
-        }
+        await claude.runClaude(prompt, wtPath, { capability: "tool-use", mcpConfig: mcpConfigPath, timeoutMs, tier, model, appendSystemPrompt: agentDoc, onTokensUsed: db.trackTaskTokens(taskId), agent: "build", envSanitization: "passthrough" });
 
         let outcome: TaskOutcome = { commits: 0 };
 

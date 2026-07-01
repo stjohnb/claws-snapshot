@@ -72,6 +72,7 @@ const { mockGh, mockClaude, mockDb } = vi.hoisted(() => ({
     updateTaskModel: vi.fn(),
     updateTaskProvider: vi.fn(),
     updateTaskTokenUsage: vi.fn(),
+    trackTaskTokens: vi.fn().mockReturnValue(vi.fn()),
     recordTaskComplete: vi.fn(),
     recordTaskFailed: vi.fn(),
     countRecentNoCommitCompletions: vi.fn().mockReturnValue(0),

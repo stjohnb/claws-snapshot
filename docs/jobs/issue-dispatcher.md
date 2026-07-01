@@ -58,8 +58,7 @@ flowchart TD
 
 Phase 3 runs as a separate pass over all issues, checking for multi-PR plans
 with remaining phases to continue. "Awaiting triage" means the issue is a
-`[claws-error]` or kwyjibo game-ID issue that hasn't received an investigation
-report yet.
+`[claws-error]` issue that hasn't received an investigation report yet.
 
 ## Planner (issue-refiner)
 

@@ -30,7 +30,7 @@ const { mockFs, mockGh, mockClaude, mockSlack } = vi.hoisted(() => ({
   mockGh: {
     createIssue: vi.fn(),
     createPR: vi.fn(),
-    searchIssues: vi.fn(),
+    findIssueByExactTitle: vi.fn(),
   },
   mockClaude: {
     withNewWorktree: vi.fn(),
@@ -139,7 +139,7 @@ describe("idea-collector", () => {
     mockFs.readFileSync.mockReturnValue(JSON.stringify(makePendingFile()));
     mockGh.createIssue.mockResolvedValue(42);
     mockGh.createPR.mockResolvedValue(99);
-    mockGh.searchIssues.mockResolvedValue([]);
+    mockGh.findIssueByExactTitle.mockResolvedValue(null);
     mockClaude.withNewWorktree.mockImplementation(async (_r: unknown, _b: unknown, _n: unknown, fn: (p: string) => Promise<unknown>) => fn("/tmp/collect-wt"));
     mockClaude.pushBranch.mockResolvedValue(undefined);
     mockClaude.git.mockResolvedValue("");
@@ -476,7 +476,7 @@ describe("idea-collector", () => {
     mockSlack.getReactions
       .mockResolvedValueOnce([{ name: "white_check_mark", count: 1, users: ["U1"] }])
       .mockResolvedValueOnce([{ name: "x", count: 1, users: ["U1"] }]);
-    mockGh.searchIssues.mockResolvedValue([{ number: 99, title: "Add dark mode" }]);
+    mockGh.findIssueByExactTitle.mockResolvedValue({ number: 99, title: "Add dark mode" });
     mockClaude.git.mockImplementation((args: string[]) => {
       if (args.includes("--porcelain")) return Promise.resolve("M ideas/");
       return Promise.resolve("");
@@ -646,12 +646,12 @@ describe("idea-collector", () => {
     expect(overviewWrite).toBeUndefined();
   });
 
-  it("creates issue when searchIssues returns no exact title match", async () => {
+  it("creates issue when findIssueByExactTitle returns null (no exact title match)", async () => {
     mockSlack.getReactions
       .mockResolvedValueOnce([{ name: "white_check_mark", count: 1, users: ["U1"] }])
       .mockResolvedValueOnce([{ name: "x", count: 1, users: ["U1"] }]);
-    // Substring match but not exact — should still create
-    mockGh.searchIssues.mockResolvedValue([{ number: 50, title: "Add dark mode toggle to settings" }]);
+    // Substring match but not exact — findIssueByExactTitle returns null, so issue should be created
+    mockGh.findIssueByExactTitle.mockResolvedValue(null);
     mockClaude.git.mockImplementation((args: string[]) => {
       if (args.includes("--porcelain")) return Promise.resolve("M ideas/");
       return Promise.resolve("");

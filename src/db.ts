@@ -158,6 +158,8 @@ export function initDb(): void {
   `);
   try { db.exec(`ALTER TABLE sessions ADD COLUMN summary TEXT`); } catch {}
   try { db.exec(`ALTER TABLE sessions ADD COLUMN summary_updated_at INTEGER`); } catch {}
+  try { db.exec(`ALTER TABLE sessions ADD COLUMN extra_worktrees TEXT`); } catch {}
+  try { db.exec(`ALTER TABLE sessions ADD COLUMN capabilities TEXT`); } catch {}
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS whatsapp_events (
@@ -318,6 +320,23 @@ export function updateTaskTokenUsage(taskId: number, tokensUsed: number, costUsd
   getDb()
     .prepare(`UPDATE tasks SET tokens_used = ?, cost_usd = ? WHERE id = ?`)
     .run(tokensUsed, costUsd, taskId);
+}
+
+/**
+ * Returns an onTokensUsed callback bound to taskId that persists cumulative
+ * token/cost via updateTaskTokenUsage. The same callback may be reused across
+ * multiple runClaude calls for one task — totals accumulate and the running
+ * sum is written on every invocation. Never fires for providers without usage
+ * data (e.g. Codex), so nothing is written in that case.
+ */
+export function trackTaskTokens(taskId: number): (tokensUsed: number, costUsd: number) => void {
+  let tokens = 0;
+  let cost = 0;
+  return (t, c) => {
+    tokens += t;
+    cost += c;
+    updateTaskTokenUsage(taskId, tokens, cost);
+  };
 }
 
 export function getLastUsedByProvider(): Record<string, string | null> {
@@ -1278,6 +1297,8 @@ export interface PersistedSession {
   repo: string | null;
   cwd: string;
   worktree_path: string | null;
+  extra_worktrees: string | null;
+  capabilities: string | null;
   created_at: number;
   summary: string | null;
   summary_updated_at: number | null;
@@ -1285,9 +1306,9 @@ export interface PersistedSession {
 
 export function insertSession(row: PersistedSession): void {
   getDb().prepare(`
-    INSERT INTO sessions (id, tmux_name, mode, repo, cwd, worktree_path, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(row.id, row.tmux_name, row.mode, row.repo, row.cwd, row.worktree_path, row.created_at);
+    INSERT INTO sessions (id, tmux_name, mode, repo, cwd, worktree_path, extra_worktrees, capabilities, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(row.id, row.tmux_name, row.mode, row.repo, row.cwd, row.worktree_path, row.extra_worktrees, row.capabilities, row.created_at);
 }
 
 export function getAllPersistedSessions(): PersistedSession[] {

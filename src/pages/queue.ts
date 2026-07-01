@@ -24,21 +24,10 @@ const CATEGORY_JOB_MAP: Record<QueueCategory, string[]> = {
   "refined": ["issue-dispatcher"],
   "needs-review-addressing": ["pr-dispatcher"],
   "auto-mergeable": ["pr-dispatcher"],
-  "needs-triage": ["triage-kwyjibo-errors", "triage-claws-errors"],
+  "needs-triage": ["triage-claws-errors"],
   "needs-qa": ["qa-phase"],
   "ready": [],
   "problematic": [],
-};
-
-const CATEGORY_PRIORITY: Record<QueueCategory, number> = {
-  "needs-review-addressing": 0,
-  "auto-mergeable": 1,
-  "refined": 2,
-  "needs-refinement": 3,
-  "needs-triage": 4,
-  "needs-qa": 5,
-  "ready": 0,
-  "problematic": 99,
 };
 
 /** Format a duration for HTML output. Returns HTML entities (e.g. `&lt;1m`) — not safe for plain text contexts. */
@@ -140,105 +129,94 @@ function buildQueueSection(
     return `<div class="queue-section"><h2>${escapeHtml(title)}</h2><p class="queue-empty">Nothing waiting</p></div>`;
   }
 
-  // Group items by category
-  const groups = new Map<QueueCategory, QueueItem[]>();
-  for (const item of snapshot.items) {
-    if (!groups.has(item.category)) groups.set(item.category, []);
-    groups.get(item.category)!.push(item);
-  }
-
-  const sortedGroups = [...groups.entries()].sort(([a], [b]) => {
-    const pa = CATEGORY_PRIORITY[a] ?? 99;
-    const pb = CATEGORY_PRIORITY[b] ?? 99;
-    return pa - pb;
+  const isPR = (i: QueueItem): boolean => i.prNumber != null || i.type === "pr";
+  const sortedItems = [...snapshot.items].sort((a, b) => {
+    const aPR = isPR(a), bPR = isPR(b);
+    if (aPR !== bPR) return aPR ? -1 : 1;
+    return (b.updatedAt || "").localeCompare(a.updatedAt || "");
   });
 
   let html = `<div class="queue-section"><h2>${escapeHtml(title)}</h2>`;
-  for (const [category, items] of sortedGroups) {
-    const display = CATEGORY_DISPLAY[category] ?? { label: category, color: "30363d" };
-    const bgColor = `#${display.color}`;
-    const textColor = parseInt(display.color, 16) > 0x7fffff ? "#000" : "#fff";
-    html += `<div class="queue-group">`;
-    html += `<div class="queue-group-header">`;
-    html += `<span class="queue-label" style="background:${bgColor};color:${textColor}">${escapeHtml(display.label)}</span>`;
-    html += `<span class="queue-count">${items.length}</span>`;
-    html += `</div>`;
-    for (const item of items) {
-      const displayNumber = item.prNumber ?? item.number;
-      const itemUrl = itemLogsUrl(item.repo, displayNumber);
-      const escapedRepo = escapeHtml(item.repo);
+  for (const item of sortedItems) {
+    const displayNumber = item.prNumber ?? item.number;
+    const itemUrl = itemLogsUrl(item.repo, displayNumber);
+    const escapedRepo = escapeHtml(item.repo);
 
-      html += `<div class="queue-item" id="item-${escapedRepo}-${item.number}">`;
+    html += `<div class="queue-item" id="item-${escapedRepo}-${item.number}">`;
 
-      // Priority indicator
-      if (item.prioritized) html += `<span class="priority-star" title="Prioritised">&#x2605;</span>`;
+    // Priority indicator
+    if (item.prioritized) html += `<span class="priority-star" title="Prioritised">&#x2605;</span>`;
 
-      // Type badge
-      const typeLabel = (item.prNumber != null || item.type === "pr") ? "PR" : "Issue";
-      html += `<span class="type-badge" title="${typeLabel}">${typeLabel}</span>`;
+    // Type badge
+    const typeLabel = (item.prNumber != null || item.type === "pr") ? "PR" : "Issue";
+    html += `<span class="type-badge" title="${typeLabel}">${typeLabel}</span>`;
 
-      // CI check status indicator
-      const checkCount = (item.checksPassed != null && item.checksTotal != null)
-        ? ` <span class="check-count">${item.checksPassed}/${item.checksTotal}</span>`
-        : "";
-      if (item.checkStatus === "passing")      html += `<span class="check check-pass" title="CI passing">&#x2714;${checkCount}</span>`;
-      else if (item.checkStatus === "failing") html += `<span class="check check-fail" title="CI failing">&#x2718;${checkCount}</span>`;
-      else if (item.checkStatus === "pending") html += `<span class="check check-pending" title="CI pending">&#x25CB;${checkCount}</span>`;
-      else html += `<span class="check check-none" title="No CI status"></span>`;
+    // Category badge
+    const catDisplay = CATEGORY_DISPLAY[item.category] ?? { label: item.category, color: "30363d" };
+    const catBg = `#${catDisplay.color}`;
+    const catFg = parseInt(catDisplay.color, 16) > 0x7fffff ? "#000" : "#fff";
+    html += `<span class="queue-label" style="background:${catBg};color:${catFg}">${escapeHtml(catDisplay.label)}</span>`;
 
-      const [repoOwner = "", repoName = ""] = item.repo.split("/");
-      html += `<a class="repo" href="/repos/${encodeURIComponent(repoOwner)}/${encodeURIComponent(repoName)}" title="${escapedRepo}">${escapeHtml(repoShortName(item.repo))}</a>`;
-      html += `<a class="number" href="${itemUrl}">#${displayNumber}</a>`;
-      html += `<span class="title">${escapeHtml(item.title)}</span>`;
-      html += `<span class="time">${formatRelativeTime(item.updatedAt)}</span>`;
+    // CI check status indicator
+    const checkCount = (item.checksPassed != null && item.checksTotal != null)
+      ? ` <span class="check-count">${item.checksPassed}/${item.checksTotal}</span>`
+      : "";
+    if (item.checkStatus === "passing")      html += `<span class="check check-pass" title="CI passing">&#x2714;${checkCount}</span>`;
+    else if (item.checkStatus === "failing") html += `<span class="check check-fail" title="CI failing">&#x2718;${checkCount}</span>`;
+    else if (item.checkStatus === "pending") html += `<span class="check check-pending" title="CI pending">&#x25CB;${checkCount}</span>`;
+    else html += `<span class="check check-none" title="No CI status"></span>`;
 
-      // Claws review status
-      if (item.reviewStatus === "clean") {
-        html += `<span class="review-status review-clean" title="Claws review">Reviewed — clean</span>`;
-      } else if (item.reviewStatus === "issues") {
-        const n = item.reviewIssueCount ?? 0;
-        const label = n > 0 ? `${n} issue${n === 1 ? "" : "s"} found` : `issues found`;
-        html += `<span class="review-status review-issues" title="Claws review">${label}</span>`;
-      }
+    const [repoOwner = "", repoName = ""] = item.repo.split("/");
+    html += `<a class="repo" href="/repos/${encodeURIComponent(repoOwner)}/${encodeURIComponent(repoName)}" title="${escapedRepo}">${escapeHtml(repoShortName(item.repo))}</a>`;
+    html += `<a class="number" href="${itemUrl}">#${displayNumber}</a>`;
+    html += `<span class="title">${escapeHtml(item.title)}</span>`;
+    html += `<span class="time">${formatRelativeTime(item.updatedAt)}</span>`;
 
-      // Labels
-      if (item.labels && item.labels.length > 0) {
-        for (const label of item.labels) {
-          html += `<span class="pr-label">${escapeHtml(label)}</span>`;
-        }
-      }
-
-      // Merge conflict indicator
-      if (item.mergeableState === "CONFLICTING") {
-        html += `<span class="merge-conflict" title="Has merge conflicts">&#x26A0; Conflicts</span>`;
-      }
-
-      // Pipeline status
-      const status = getItemStatus(item, pipeline);
-      if (status) html += status;
-
-      // Squash & merge button — show unless there are known conflicts
-      if (item.prNumber != null && item.mergeableState !== "CONFLICTING") {
-        html += `<button class="merge-btn" @click="mergePR('${escapedRepo}',${item.prNumber}, $event)">Squash &amp; Merge</button>`;
-      }
-
-      // Skip & prioritize buttons (only for Claws Attention section)
-      if (showActions) {
-        if (item.prioritized) {
-          html += `<button class="prio-btn deprio" data-mode="deprio" @click="togglePriority('${escapedRepo}',${item.number}, $event)">Deprioritise</button>`;
-        } else {
-          html += `<button class="prio-btn" data-mode="prio" @click="togglePriority('${escapedRepo}',${item.number}, $event)">Prioritise</button>`;
-        }
-        html += `<button class="skip-btn" @click="skipItem('${escapedRepo}',${item.number}, $event)">Skip</button>`;
-      }
-      if (item.type === "issue"
-          && (item.category === "ready" || item.category === "needs-refinement")
-          && !item.labels?.includes(LABELS.refined)) {
-        html += `<button class="refined-btn" @click="markRefined('${escapedRepo}',${item.number}, $event)">Refined</button>`;
-      }
-
-      html += `</div>`;
+    // Claws review status
+    if (item.reviewStatus === "clean") {
+      html += `<span class="review-status review-clean" title="Claws review">Reviewed — clean</span>`;
+    } else if (item.reviewStatus === "issues") {
+      const n = item.reviewIssueCount ?? 0;
+      const label = n > 0 ? `${n} issue${n === 1 ? "" : "s"} found` : `issues found`;
+      html += `<span class="review-status review-issues" title="Claws review">${label}</span>`;
     }
+
+    // Labels
+    if (item.labels && item.labels.length > 0) {
+      for (const label of item.labels) {
+        html += `<span class="pr-label">${escapeHtml(label)}</span>`;
+      }
+    }
+
+    // Merge conflict indicator
+    if (item.mergeableState === "CONFLICTING") {
+      html += `<span class="merge-conflict" title="Has merge conflicts">&#x26A0; Conflicts</span>`;
+    }
+
+    // Pipeline status
+    const status = getItemStatus(item, pipeline);
+    if (status) html += status;
+
+    // Squash & merge button — show unless there are known conflicts
+    if (item.prNumber != null && item.mergeableState !== "CONFLICTING") {
+      html += `<button class="merge-btn" @click="mergePR('${escapedRepo}',${item.prNumber}, $event)">Squash &amp; Merge</button>`;
+    }
+
+    // Skip & prioritize buttons (only for Claws Attention section)
+    if (showActions) {
+      if (item.prioritized) {
+        html += `<button class="prio-btn deprio" data-mode="deprio" @click="togglePriority('${escapedRepo}',${item.number}, $event)">Deprioritise</button>`;
+      } else {
+        html += `<button class="prio-btn" data-mode="prio" @click="togglePriority('${escapedRepo}',${item.number}, $event)">Prioritise</button>`;
+      }
+      html += `<button class="skip-btn" @click="skipItem('${escapedRepo}',${item.number}, $event)">Skip</button>`;
+    }
+    if (item.type === "issue"
+        && (item.category === "ready" || item.category === "needs-refinement")
+        && !item.labels?.includes(LABELS.refined)) {
+      html += `<button class="refined-btn" @click="markRefined('${escapedRepo}',${item.number}, $event)">Refined</button>`;
+    }
+
     html += `</div>`;
   }
   html += `</div>`;

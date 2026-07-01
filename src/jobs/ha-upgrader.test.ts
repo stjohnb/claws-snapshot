@@ -24,10 +24,10 @@ vi.mock("../home-assistant.js", () => ({
   UPDATE_BACKUP_FEATURE_BIT: 8,
 }));
 
-const mockSearchIssues = vi.hoisted(() => vi.fn());
+const mockFindIssueByExactTitle = vi.hoisted(() => vi.fn());
 const mockCreateIssue = vi.hoisted(() => vi.fn());
 vi.mock("../github.js", () => ({
-  searchIssues: mockSearchIssues,
+  findIssueByExactTitle: mockFindIssueByExactTitle,
   createIssue: mockCreateIssue,
 }));
 
@@ -129,7 +129,7 @@ describe("ha-upgrader", () => {
     mockIsConfigured.mockReturnValue(true);
     mockListUpdateEntities.mockResolvedValue([]);
     mockInstallUpdate.mockResolvedValue(undefined);
-    mockSearchIssues.mockResolvedValue([]);
+    mockFindIssueByExactTitle.mockResolvedValue(null);
     mockCreateIssue.mockResolvedValue(1);
     mockNotify.mockResolvedValue(undefined);
     mockReportError.mockResolvedValue(undefined);
@@ -275,7 +275,7 @@ describe("ha-upgrader", () => {
     mockListUpdateEntities.mockResolvedValue([update]);
 
     // First run: no existing issue
-    mockSearchIssues.mockResolvedValue([]);
+    mockFindIssueByExactTitle.mockResolvedValue(null);
     await run();
     expect(mockCreateIssue).toHaveBeenCalledTimes(1);
 
@@ -286,7 +286,7 @@ describe("ha-upgrader", () => {
 
     // Second run: existing issue found — dedup by title
     const existingTitle = `[HA] Upgrade available: Test Device → 1.1.0`;
-    mockSearchIssues.mockResolvedValue([{ number: 42, title: existingTitle }]);
+    mockFindIssueByExactTitle.mockResolvedValue({ number: 42, title: existingTitle });
     await run();
 
     expect(mockCreateIssue).not.toHaveBeenCalled();

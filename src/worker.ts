@@ -23,6 +23,7 @@ export const AGENT_KINDS = {
   ISSUE_REFINER_FOLLOWUP: "issue-refiner:followup",
   ISSUE_REFINER_PLAN: "issue-refiner:plan",
   ISSUE_REFINER_REFINE: "issue-refiner:refine",
+  ISSUE_REFINER_REPLAN: "issue-refiner:replan",
 } as const;
 
 export type WorkRow = db.WorkQueueRow;

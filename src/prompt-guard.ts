@@ -225,6 +225,15 @@ export function makeGuardCtx(repo: string, itemNumber: number): (source: string)
   return (source: string) => ({ repo, source, itemNumber });
 }
 
+export function formatGuardedTitleList(
+  titles: string[],
+  guardCtx: ReturnType<typeof makeGuardCtx>,
+  source: string,
+): string {
+  if (titles.length === 0) return "  (none)";
+  return titles.map((t) => `  - ${guardContent(t, guardCtx(source))}`).join("\n");
+}
+
 export function guardContent(text: string, context: { repo: string; source: string; itemNumber: number }): string;
 export function guardContent(text: string | null | undefined, context: { repo: string; source: string; itemNumber: number }): string | null | undefined;
 export function guardContent(

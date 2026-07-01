@@ -19,6 +19,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { handleNameyQuery, QUERY_TIMEOUT_MS } from "./namey-query.js";
 import { handleListEntities, handleApiRequest } from "./ha-mcp.js";
+import { textResult, errorResult } from "./mcp-result.js";
 
 const PrListSchema = z.array(z.object({
   number: z.number(),
@@ -109,7 +110,7 @@ server.tool(
       }
     }
 
-    return { content: [{ type: "text" as const, text: JSON.stringify(parts, null, 2) }] };
+    return textResult(parts);
   },
 );
 
@@ -124,7 +125,7 @@ server.tool(
   async ({ repo, item_number }) => {
     const db = openDb();
     if (!db) {
-      return { content: [{ type: "text" as const, text: JSON.stringify({ error: "Database not available" }) }] };
+      return errorResult("Database not available");
     }
 
     try {
@@ -148,9 +149,9 @@ server.tool(
           ORDER BY t.started_at DESC LIMIT 20
         `).all(repo);
       }
-      return { content: [{ type: "text" as const, text: JSON.stringify(rows, null, 2) }] };
+      return textResult(rows);
     } catch (err) {
-      return { content: [{ type: "text" as const, text: JSON.stringify({ error: `DB query failed: ${err instanceof Error ? err.message : err}` }) }] };
+      return errorResult(`DB query failed: ${err instanceof Error ? err.message : err}`);
     } finally {
       db.close();
     }
@@ -171,9 +172,9 @@ server.tool(
         "number,title,headRefName,labels,author,updatedAt,isDraft",
       ]);
       const prs = PrListSchema.parse(JSON.parse(output));
-      return { content: [{ type: "text" as const, text: JSON.stringify(prs, null, 2) }] };
+      return textResult(prs);
     } catch (err) {
-      return { content: [{ type: "text" as const, text: JSON.stringify({ error: `gh CLI failed: ${err instanceof Error ? err.message : err}` }) }] };
+      return errorResult(`gh CLI failed: ${err instanceof Error ? err.message : err}`);
     }
   },
 );
@@ -188,17 +189,9 @@ server.tool(
     try {
       const raw = fs.readFileSync(configPath, "utf-8");
       const config = ConfigSnapshotSchema.parse(JSON.parse(raw));
-      return {
-        content: [{
-          type: "text" as const,
-          text: JSON.stringify({
-            skippedItems: config.skippedItems ?? [],
-            prioritizedItems: config.prioritizedItems ?? [],
-          }, null, 2),
-        }],
-      };
+      return textResult({ skippedItems: config.skippedItems ?? [], prioritizedItems: config.prioritizedItems ?? [] });
     } catch (err) {
-      return { content: [{ type: "text" as const, text: JSON.stringify({ error: `Config read failed: ${err instanceof Error ? err.message : err}` }) }] };
+      return errorResult(`Config read failed: ${err instanceof Error ? err.message : err}`);
     }
   },
 );
@@ -245,7 +238,7 @@ if (NAMEY_DB_URL) {
       try {
         pool = await getNameyPool();
       } catch (err) {
-        return { content: [{ type: "text" as const, text: JSON.stringify({ error: `Pool init failed: ${(err as Error).message}` }) }] };
+        return errorResult(`Pool init failed: ${(err as Error).message}`);
       }
       return handleNameyQuery(sql, pool);
     },

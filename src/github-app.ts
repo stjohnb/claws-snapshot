@@ -20,6 +20,7 @@ const RawRepoRespSchema = z.object({
     name: z.string(),
     full_name: z.string(),
     archived: z.boolean(),
+    private: z.boolean(),
     default_branch: z.string(),
     owner: z.object({ login: z.string() }),
   })),
@@ -338,6 +339,7 @@ export interface InstallationRepoEntry {
   fullName: string;
   defaultBranch: string;
   isArchived: boolean;
+  isPrivate: boolean;
 }
 
 function parseNextLink(linkHeader: string | null): string | null {
@@ -389,6 +391,7 @@ export async function listInstallationRepositories(owner: string): Promise<Insta
           fullName: r.full_name,
           defaultBranch: r.default_branch ?? "main",
           isArchived: Boolean(r.archived),
+          isPrivate: Boolean(r.private),
         });
       }
       url = parseNextLink(res.headers.get("link"));

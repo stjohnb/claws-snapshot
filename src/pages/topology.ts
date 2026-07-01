@@ -142,7 +142,6 @@ const MAINT_ROW_GAP = 44;
 const MAINT_PER_ROW = 8;
 
 const MAINTENANCE_JOBS = [
-  { id: "triage-kwyjibo-errors", label: "Kwyjibo Triage" },
   { id: "triage-claws-errors", label: "Claws Triage" },
   { id: "runner-monitor", label: "Runner Monitor" },
   { id: "email-monitor", label: "Email Monitor" },

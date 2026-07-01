@@ -28,6 +28,14 @@ type XtermTheme = {
   brightWhite: string;
 };
 
+interface XtermBufferLine {
+  translateToString(trimRight?: boolean): string;
+}
+interface XtermBuffer {
+  length: number;
+  getLine(y: number): XtermBufferLine | undefined;
+}
+
 interface XtermInstance {
   cols: number;
   rows: number;
@@ -38,6 +46,7 @@ interface XtermInstance {
   reset(): void;
   write(data: string): void;
   onData(cb: (data: string) => void): void;
+  buffer: { active: XtermBuffer };
 }
 
 interface XtermCtor {
@@ -152,6 +161,16 @@ declare const WebLinksAddon: { WebLinksAddon: new () => unknown };
   term.open(termEl);
   term.focus();
 
+  function getTerminalText(): string {
+    const buf = term.buffer.active;
+    const lines: string[] = [];
+    for (let i = 0; i < buf.length; i++) {
+      const line = buf.getLine(i);
+      lines.push(line ? line.translateToString(true) : "");
+    }
+    return lines.join("\n").replace(/\s+$/, "") + "\n";
+  }
+
   function setFontSize(next: number): void {
     const clamped = Math.max(FONT_SIZE_MIN, Math.min(FONT_SIZE_MAX, Math.round(next)));
     if (clamped === currentFontSize) return;
@@ -243,6 +262,52 @@ declare const WebLinksAddon: { WebLinksAddon: new () => unknown };
         .catch(() => {
           term.write("\r\n\x1b[33m[Clipboard access denied]\x1b[0m\r\n");
         });
+    });
+  }
+
+  const copyBtn = document.getElementById("copy-btn") as HTMLButtonElement | null;
+  const copyOverlay = document.getElementById("copy-overlay");
+  const copyTextarea = document.getElementById("copy-textarea") as HTMLTextAreaElement | null;
+  const copyAllBtn = document.getElementById("copy-all-btn") as HTMLButtonElement | null;
+  const copyCloseBtn = document.getElementById("copy-close-btn") as HTMLButtonElement | null;
+
+  function closeCopyOverlay(): void {
+    if (copyOverlay) copyOverlay.style.display = "none";
+    term.focus();
+  }
+
+  if (copyBtn && copyOverlay && copyTextarea) {
+    copyBtn.addEventListener("click", () => {
+      copyTextarea.value = getTerminalText();
+      copyOverlay.style.display = "flex";
+      copyTextarea.scrollTop = copyTextarea.scrollHeight;
+    });
+  }
+  if (copyCloseBtn) copyCloseBtn.addEventListener("click", closeCopyOverlay);
+  if (copyOverlay) {
+    copyOverlay.addEventListener("click", (e) => {
+      if (e.target === copyOverlay) closeCopyOverlay();
+    });
+  }
+  if (copyAllBtn && copyTextarea) {
+    copyAllBtn.addEventListener("click", () => {
+      const text = copyTextarea.value;
+      const done = (ok: boolean): void => {
+        copyAllBtn.textContent = ok ? "Copied ✓" : "Copy failed";
+        setTimeout(() => { copyAllBtn.textContent = "Copy all"; }, 1500);
+      };
+      const fallback = (): void => {
+        try {
+          copyTextarea.focus();
+          copyTextarea.select();
+          done(document.execCommand("copy"));
+        } catch { done(false); }
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(() => done(true), fallback);
+      } else {
+        fallback();
+      }
     });
   }
 

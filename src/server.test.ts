@@ -24,8 +24,6 @@ vi.mock("./config.js", () => ({
     slackWebhook: "https://hooks.slack.com/abcdef",
     githubOwners: ["owner1"],
     selfRepo: "owner1/repo1",
-    kwyjiboBaseUrl: "https://kwyjibo.vercel.app",
-    kwyjiboApiKey: "",
     openaiApiKey: "",
     port: 3000,
     intervals: { issueWorkerMs: 300000, issueRefinerMs: 300000, ciFixerMs: 600000, reviewAddresserMs: 300000, bugInvestigatorMs: 600000, autoMergerMs: 600000 },
@@ -41,8 +39,6 @@ vi.mock("./config.js", () => ({
     slackWebhook: "****cdef",
     githubOwners: ["owner1"],
     selfRepo: "owner1/repo1",
-    kwyjiboBaseUrl: "https://kwyjibo.vercel.app",
-    kwyjiboApiKey: "Not configured",
     openaiApiKey: "Not configured",
     port: 3000,
     intervals: { issueWorkerMs: 300000, issueRefinerMs: 300000, ciFixerMs: 600000, reviewAddresserMs: 300000, bugInvestigatorMs: 600000, autoMergerMs: 600000 },
@@ -61,7 +57,7 @@ vi.mock("./config.js", () => ({
   PRIORITIZED_ITEMS: [],
   EMAIL_ENABLED: false,
   NOTIFY_DASHBOARD_ACTIONS: true,
-  SENSITIVE_KEYS: new Set(["slackWebhook", "slackBotToken", "kwyjiboApiKey", "openaiApiKey", "emailAppPassword", "nameyDbUrl"]),
+  SENSITIVE_KEYS: new Set(["slackWebhook", "slackBotToken", "openaiApiKey", "emailAppPassword", "nameyDbUrl"]),
   DEEP_MERGED_KEYS: new Set(["intervals", "schedules"]),
   OPENROUTER_API_KEY: "",
   TOOL_USE_PROVIDER_FALLBACK_ORDER: ["claude"],
@@ -74,11 +70,13 @@ vi.mock("./config.js", () => ({
   DISABLED_JOBS_BY_REPO: {},
   HOME_ASSISTANT_BASE_URL: "",
   HOME_ASSISTANT_TOKEN: "",
+  NAMEY_DB_URL: "",
   FLEET_INFRA_REPO: "St-John-Software/fleet-infra",
   K3S_MONITOR_ENABLED: false,
   PROD_K8S_REPO: "St-John-Software/prod-infra",
   PROD_K8S_MONITOR_ENABLED: false,
   PROD_K8S_KUBECONFIG_PATH: "",
+  FLEET_KUBECONFIG_PATH: "",
 }));
 
 vi.mock("./log.js", () => ({
@@ -1294,13 +1292,30 @@ describe("Issue logs page", () => {
   });
 
   it("GET /logs/issue returns 200 with empty state when no runs", async () => {
+    const { listRepos: listReposFn } = await import("./github.js");
+    (listReposFn as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      { owner: "org", name: "repo", fullName: "org/repo" },
+    ]);
     const res = await request(server, "GET", "/logs/issue?repo=org/repo&number=42");
     expect(res.status).toBe(200);
     expect(res.body).toContain("No logs found for this issue");
     expect(res.body).toContain("repo#42");
   });
 
+  it("GET /logs/issue returns 404 for an unknown repo", async () => {
+    const { listRepos: listReposFn } = await import("./github.js");
+    (listReposFn as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      { owner: "org", name: "repo", fullName: "org/repo" },
+    ]);
+    const res = await request(server, "GET", "/logs/issue?repo=unknown/repo&number=42");
+    expect(res.status).toBe(404);
+  });
+
   it("GET /logs/issue renders runs when present", async () => {
+    const { listRepos: listReposFn } = await import("./github.js");
+    (listReposFn as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+      { owner: "org", name: "repo", fullName: "org/repo" },
+    ]);
     const { getRunsForIssue: fn, getLogsForRuns: logsFn, getWorkItemsForRuns: workFn } = await import("./db.js");
     (fn as ReturnType<typeof vi.fn>).mockReturnValueOnce([
       { run_id: "run-1", job_name: "issue-worker", status: "completed", started_at: "2025-01-01 00:00:00", completed_at: "2025-01-01 00:01:00" },

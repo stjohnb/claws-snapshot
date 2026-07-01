@@ -47,6 +47,7 @@ const { mockGh, mockClaude, mockDb } = vi.hoisted(() => ({
     hasPriorityLabel: vi.fn().mockReturnValue(false),
     getPRChangedFiles: vi.fn(),
     searchIssues: vi.fn(),
+    findIssueByExactTitle: vi.fn(),
     createIssue: vi.fn(),
     commentOnIssue: vi.fn(),
     getIssueComments: vi.fn(),
@@ -76,6 +77,7 @@ const { mockGh, mockClaude, mockDb } = vi.hoisted(() => ({
     updateTaskWorktree: vi.fn(),
     updateTaskModel: vi.fn(),
     updateTaskTokenUsage: vi.fn(),
+    trackTaskTokens: vi.fn().mockReturnValue(vi.fn()),
     recordTaskComplete: vi.fn(),
     recordTaskFailed: vi.fn(),
     hasPreviousCiFixerTasks: vi.fn(),
@@ -326,7 +328,7 @@ describe("ci-fixer", () => {
         "ci-fixer",
         expect.any(Function),
       );
-      expect(mockGh.searchIssues).toHaveBeenCalled();
+      expect(mockGh.findIssueByExactTitle).toHaveBeenCalled();
       expect(mockGh.createIssue).toHaveBeenCalled();
       expect(mockDb.hasPreviousCiFixerTasks).toHaveBeenCalled();
       expect(mockClaude.withExistingWorktree).toHaveBeenCalledWith(
@@ -491,7 +493,7 @@ describe("ci-fixer", () => {
 
   describe("fileUnrelatedIssue", () => {
     it("creates new issue and posts comment", async () => {
-      mockGh.searchIssues.mockResolvedValue([]);
+      mockGh.findIssueByExactTitle.mockResolvedValue(null);
       mockGh.createIssue.mockResolvedValue(99);
 
       await fileUnrelatedIssue(repo.fullName, [{
@@ -523,9 +525,9 @@ describe("ci-fixer", () => {
     });
 
     it("updates existing issue instead of creating duplicate", async () => {
-      mockGh.searchIssues.mockResolvedValue([
+      mockGh.findIssueByExactTitle.mockResolvedValue(
         { number: 50, title: "[ci-unrelated] CI failures unrelated to PR changes" },
-      ]);
+      );
 
       await fileUnrelatedIssue(repo.fullName, [{
         fingerprint: "flakey-test:auth-timeout",
@@ -545,6 +547,7 @@ describe("ci-fixer", () => {
     });
 
     it("issue filing fails — does not throw", async () => {
+      mockGh.findIssueByExactTitle.mockResolvedValue(null);
       mockGh.createIssue.mockRejectedValue(new Error("API error"));
 
       // Should not throw
@@ -560,7 +563,7 @@ describe("ci-fixer", () => {
     });
 
     it("posts multiple occurrences to same issue", async () => {
-      mockGh.searchIssues.mockResolvedValue([]);
+      mockGh.findIssueByExactTitle.mockResolvedValue(null);
       mockGh.createIssue.mockResolvedValue(99);
 
       await fileUnrelatedIssue(repo.fullName, [

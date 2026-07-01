@@ -3,6 +3,7 @@
 // is loaded separately via ALPINE_SCRIPT.
 interface SessionsListPage {
   killSession(id: string): Promise<void>;
+  resumeSession(id: string): Promise<void>;
   onRepoChange(): void;
 }
 
@@ -12,6 +13,12 @@ function sessionsListPage(): SessionsListPage {
       if (!confirm("Kill this session?")) return;
       await fetch("/sessions/" + encodeURIComponent(id) + "/kill", { method: "POST" });
       location.reload();
+    },
+    async resumeSession(id: string): Promise<void> {
+      const res = await fetch("/sessions/" + encodeURIComponent(id) + "/resume", { method: "POST" });
+      if (res.redirected) { location.href = res.url; return; }
+      if (!res.ok) { alert("Failed to resume session: " + (await res.text())); return; }
+      location.href = "/sessions/" + encodeURIComponent(id);
     },
     onRepoChange(): void {
       const repoEl = document.getElementById("session-repo") as HTMLSelectElement | null;

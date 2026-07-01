@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { LABELS, type Repo } from "../config.js";
-import { runRepoScanner, type ScannerSpec } from "./scanner-runner.js";
+import { runRepoScanner, RECURRENCE_TRACKING_SNIPPET_LINES, type ScannerSpec } from "./scanner-runner.js";
 import { listWorkflowFiles } from "./workflow-parser.js";
 
 interface Violation {
@@ -31,27 +31,7 @@ function formatIssueBody(violations: Violation[]): string {
     "**Recommended fix:**",
     "",
     "```bash",
-    "          # On recurrence: edit issue body to bump Occurrences/Last seen instead of commenting.",
-    "          set -euo pipefail",
-    "          TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-    '          TITLE="Build failure: ${WORKFLOW_NAME}"',
-    "          existing=$(gh issue list --repo \"$REPO\" --state open \\",
-    "            --search \"\\\"${TITLE}\\\" in:title\" --json number --jq '.[0].number // empty')",
-    "          if [ -n \"$existing\" ]; then",
-    "            body=$(gh issue view \"$existing\" --repo \"$REPO\" --json body --jq .body)",
-    "            if printf '%s' \"$body\" | grep -q '^\\*\\*First seen:\\*\\*'; then",
-    "              new_body=$(printf '%s' \"$body\" | awk -v ts=\"$TS\" '",
-    "                /^\\*\\*Last seen:\\*\\*/ { print \"**Last seen:** \" ts; next }",
-    "                /^\\*\\*Occurrences:\\*\\* / { print \"**Occurrences:** \" ($2 + 1); next }",
-    "                { print }')",
-    "            else",
-    "              new_body=\"${body}\"$'\\n\\n---\\n**First seen:** '\"${TS}\"$'\\n**Last seen:** '\"${TS}\"$'\\n**Occurrences:** 2'",
-    "            fi",
-    "            gh issue edit \"$existing\" --repo \"$REPO\" --body \"$new_body\"",
-    "          else",
-    "            body=$'Workflow **'\"${WORKFLOW_NAME}\"$'** failed on `main`: '\"${RUN_URL}\"$'\\n\\n---\\n**First seen:** '\"${TS}\"$'\\n**Last seen:** '\"${TS}\"$'\\n**Occurrences:** 1'",
-    "            gh issue create --repo \"$REPO\" --title \"$TITLE\" --body \"$body\" --label bug",
-    "          fi",
+    ...RECURRENCE_TRACKING_SNIPPET_LINES,
     "```",
     "",
     'If a recovery/close path uses `gh issue close --comment "..."`, that is fine — only standalone `gh issue comment` on recurrence is the problem.',

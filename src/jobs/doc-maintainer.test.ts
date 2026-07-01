@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { mockRepo, mockPR } from "../test-helpers.js";
+import { CLAWS_AUTOMATION_DOC } from "../resources/claws-info.js";
 
 vi.mock("../config.js", () => ({
   WORK_DIR: "/home/testuser/.claws",
@@ -19,6 +20,7 @@ vi.mock("../error-reporter.js", () => ({
 const { mockFs, mockGh, mockClaude, mockDb, mockPlanParser, mockSlack } = vi.hoisted(() => ({
   mockFs: {
     existsSync: vi.fn(),
+    readFileSync: vi.fn(),
     mkdirSync: vi.fn(),
     writeFileSync: vi.fn(),
     rmSync: vi.fn(),
@@ -50,6 +52,7 @@ const { mockFs, mockGh, mockClaude, mockDb, mockPlanParser, mockSlack } = vi.hoi
     updateTaskWorktree: vi.fn(),
     updateTaskModel: vi.fn(),
     updateTaskTokenUsage: vi.fn(),
+    trackTaskTokens: vi.fn().mockReturnValue(vi.fn()),
     recordTaskComplete: vi.fn(),
     recordTaskFailed: vi.fn(),
     markRepoProcessedDaily: vi.fn(),
@@ -88,6 +91,7 @@ describe("doc-maintainer", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockFs.existsSync.mockReturnValue(true);
+    mockFs.readFileSync.mockReturnValue(CLAWS_AUTOMATION_DOC);
     mockGh.listPRs.mockResolvedValue([]);
     mockGh.createPR.mockResolvedValue(100);
     mockGh.listRecentlyClosedIssues.mockResolvedValue([]);
@@ -123,14 +127,83 @@ describe("doc-maintainer", () => {
     expect(mockClaude.withNewWorktree).not.toHaveBeenCalled();
   });
 
-  it("skips repo when HEAD matches last doc-maintainer commit", async () => {
+  it("skips repo when HEAD matches last doc-maintainer commit and claws doc is current", async () => {
     mockClaude.getHeadSha.mockResolvedValue("abc123");
     mockClaude.getLastDocMaintainerSha.mockResolvedValue("abc123");
+    // readFileSync returns CLAWS_AUTOMATION_DOC by default (set in beforeEach)
 
     await run([repo]);
 
     expect(mockClaude.runClaude).not.toHaveBeenCalled();
     expect(mockDb.recordTaskComplete).toHaveBeenCalledWith(1, expect.any(Object));
+  });
+
+  it("syncs claws doc when it is missing even if no code changes since last doc commit", async () => {
+    mockClaude.getHeadSha.mockResolvedValue("abc123");
+    mockClaude.getLastDocMaintainerSha.mockResolvedValue("abc123");
+    // Doc file is absent
+    mockFs.existsSync.mockImplementation((p: string) => !p.endsWith("claws-automation.md"));
+    mockClaude.git.mockImplementation(async (args: string[]) => {
+      // Simulate "diff --cached" showing the file is staged
+      if (args[0] === "diff") return "docs/claws-automation.md\n";
+      return "";
+    });
+
+    await run([repo]);
+
+    expect(mockClaude.runClaude).toHaveBeenCalled();
+    expect(mockFs.writeFileSync).toHaveBeenCalledWith(
+      expect.stringContaining("claws-automation.md"),
+      CLAWS_AUTOMATION_DOC,
+    );
+    expect(mockClaude.git).toHaveBeenCalledWith(
+      expect.arrayContaining(["commit", "-m", expect.stringContaining("[doc-maintainer]")]),
+      expect.any(String),
+    );
+    expect(mockGh.createPR).toHaveBeenCalled();
+  });
+
+  it("syncs claws doc when it exists but has stale content", async () => {
+    mockClaude.getHeadSha.mockResolvedValue("abc123");
+    mockClaude.getLastDocMaintainerSha.mockResolvedValue("abc123");
+    // File exists but content is outdated
+    mockFs.readFileSync.mockReturnValue("outdated content");
+    mockClaude.git.mockImplementation(async (args: string[]) => {
+      if (args[0] === "diff") return "docs/claws-automation.md\n";
+      return "";
+    });
+
+    await run([repo]);
+
+    expect(mockClaude.runClaude).toHaveBeenCalled();
+    expect(mockFs.writeFileSync).toHaveBeenCalledWith(
+      expect.stringContaining("claws-automation.md"),
+      CLAWS_AUTOMATION_DOC,
+    );
+    expect(mockGh.createPR).toHaveBeenCalled();
+  });
+
+  it("no-op when claws doc is current and no code changes since last doc commit", async () => {
+    mockClaude.getHeadSha.mockResolvedValue("abc123");
+    mockClaude.getLastDocMaintainerSha.mockResolvedValue("abc123");
+    // readFileSync returns CLAWS_AUTOMATION_DOC by default (set in beforeEach)
+
+    await run([repo]);
+
+    expect(mockClaude.runClaude).not.toHaveBeenCalled();
+    expect(mockGh.createPR).not.toHaveBeenCalled();
+  });
+
+  it("instructs Claude to create CLAUDE.md if absent", async () => {
+    mockClaude.getLastDocMaintainerSha.mockResolvedValue(null);
+
+    await run([repo]);
+
+    expect(mockClaude.runClaude).toHaveBeenCalledWith(
+      expect.stringContaining("CLAUDE.md` is absent, create it"),
+      "/tmp/worktree",
+      expect.any(Object),
+    );
   });
 
   it("creates docs PR when no previous doc-maintainer commit exists", async () => {
@@ -310,8 +383,11 @@ describe("doc-maintainer", () => {
 
       await run([repo]);
 
-      // Should write exactly 10 plan files (the cap)
-      expect(mockFs.writeFileSync).toHaveBeenCalledTimes(10);
+      // Should write exactly 10 plan files (the cap) — plus 1 for the claws-automation.md sync
+      const planWrites = mockFs.writeFileSync.mock.calls.filter(
+        (args) => (args[0] as string).includes(".plans/"),
+      );
+      expect(planWrites).toHaveLength(10);
     });
   });
 

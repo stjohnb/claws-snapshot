@@ -47,6 +47,7 @@ const { mockGh, mockClaude, mockDb } = vi.hoisted(() => ({
     hasIgnoreLabel: vi.fn().mockReturnValue(false),
     isForkPR: vi.fn().mockReturnValue(false),
     populateQueueCache: vi.fn(),
+    populateQueueCacheFor: vi.fn(),
   },
   mockClaude: {
     withExistingWorktree: vi.fn(),
@@ -60,6 +61,7 @@ const { mockGh, mockClaude, mockDb } = vi.hoisted(() => ({
     updateTaskWorktree: vi.fn(),
     updateTaskModel: vi.fn(),
     updateTaskTokenUsage: vi.fn(),
+    trackTaskTokens: vi.fn().mockReturnValue(vi.fn()),
     recordTaskComplete: vi.fn(),
     recordTaskFailed: vi.fn(),
     withTaskRecording: vi.fn(async (jobName: string, repo: string, itemNumber: number, triggerLabel: string | null, fn: (taskId: number) => Promise<unknown>) => {

@@ -27,13 +27,13 @@ vi.mock("../slack.js", () => ({
   notify: mockNotify,
 }));
 
-const mockSearchIssues = vi.hoisted(() => vi.fn());
+const mockFindIssueByExactTitle = vi.hoisted(() => vi.fn());
 const mockCreateIssue = vi.hoisted(() => vi.fn());
 const mockCommentOnIssue = vi.hoisted(() => vi.fn());
 const mockGetIssueBody = vi.hoisted(() => vi.fn());
 const mockEditIssue = vi.hoisted(() => vi.fn());
 vi.mock("../github.js", () => ({
-  searchIssues: mockSearchIssues,
+  findIssueByExactTitle: mockFindIssueByExactTitle,
   createIssue: mockCreateIssue,
   commentOnIssue: mockCommentOnIssue,
   getIssueBody: mockGetIssueBody,
@@ -81,7 +81,7 @@ describe("runner-monitor", () => {
     vi.clearAllMocks();
     mockRunnerHosts.value = [];
     mockReportError.mockResolvedValue(undefined);
-    mockSearchIssues.mockResolvedValue([]);
+    mockFindIssueByExactTitle.mockResolvedValue(null);
     mockCreateIssue.mockResolvedValue(42);
     mockCommentOnIssue.mockResolvedValue(undefined);
     mockGetIssueBody.mockResolvedValue("");
@@ -296,7 +296,7 @@ describe("runner-monitor", () => {
 
   it("edits existing issue body with occurrence tracking instead of commenting", async () => {
     mockRunnerHosts.value = [defaultRunner];
-    mockSearchIssues.mockResolvedValue([{ number: 99, title: "[runner-monitor] Persistent high disk on test-runner" }]);
+    mockFindIssueByExactTitle.mockResolvedValue({ number: 99, title: "[runner-monitor] Persistent high disk on test-runner" });
     const existingBody = [
       "Disk usage on **test-runner** remains at **93%**.",
       "",
@@ -412,7 +412,7 @@ describe("runner-monitor", () => {
 
   it("does NOT notify Slack on subsequent no-op cleanups when issue already exists", async () => {
     mockRunnerHosts.value = [defaultRunner];
-    mockSearchIssues.mockResolvedValue([{ number: 77, title: "[runner-monitor] Persistent high disk on test-runner" }]);
+    mockFindIssueByExactTitle.mockResolvedValue({ number: 77, title: "[runner-monitor] Persistent high disk on test-runner" });
     mockGetIssueBody.mockResolvedValueOnce([
       "Disk usage on **test-runner** remains at **86%** after automated cleanup (was 86%).",
       "",

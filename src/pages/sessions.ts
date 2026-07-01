@@ -3,10 +3,11 @@ import { PAGE_CSS, TAILWIND_STYLESHEET, htmlOpenTag, buildNav, buildPageHeader, 
 import { ERROR_HANDLER_SCRIPT } from "../resources/error-handler.generated.js";
 import { SESSIONS_LIST_SCRIPT } from "../resources/sessions-list.generated.js";
 import { SESSION_TERMINAL_SCRIPT } from "../resources/session-terminal.generated.js";
+import { availableCapabilities } from "../capabilities.js";
 
 export function buildSessionsListPage(
   theme: Theme,
-  sessions: Array<{ id: string; repo: string | null; cwd: string; createdAt: number; alive: boolean; wsConnected: boolean; summary: string | null; summaryUpdatedAt: number | null }>,
+  sessions: Array<{ id: string; repo: string | null; cwd: string; createdAt: number; alive: boolean; resumable: boolean; wsConnected: boolean; summary: string | null; summaryUpdatedAt: number | null }>,
   repos: Array<{ fullName: string }>,
   defaultRepo: string | null = null,
 ): string {
@@ -16,6 +17,34 @@ export function buildSessionsListPage(
       return `<option value="${escapeHtml(r.fullName)}"${sel}>${escapeHtml(r.fullName)}</option>`;
     })
     .join("");
+
+  const repoCheckboxes = repos
+    .map((r) => `<label style="display:flex; gap:0.4rem; align-items:center; font-size:0.85rem;">
+      <input type="checkbox" name="repo" value="${escapeHtml(r.fullName)}"> ${escapeHtml(r.fullName)}
+    </label>`)
+    .join("");
+
+  const capBoxes = availableCapabilities().map((cap) =>
+    `<label style="display:inline-flex;gap:0.3rem;align-items:center;margin-right:0.75rem;font-size:0.85rem;">
+       <input type="checkbox" name="capability" value="${escapeHtml(cap.id)}"> ${escapeHtml(cap.label)}
+     </label>`).join("");
+  const capFieldset = capBoxes
+    ? `<fieldset style="border:1px solid var(--border);border-radius:4px;padding:0.5rem;margin:0.5rem 0;flex-basis:100%;">
+         <legend style="font-size:0.85rem;">Capabilities (none granted by default)</legend>${capBoxes}
+       </fieldset>`
+    : "";
+
+  const multiForm = repos.length < 2 ? "" : `
+  <form method="POST" action="/sessions/create-multi" style="margin-bottom:1.5rem; padding:0.75rem; border:1px solid var(--border); border-radius:4px;">
+    <div style="font-size:0.875rem; color:var(--text-secondary); margin-bottom:0.5rem;">
+      Multi-repo Claude session — tick two or more repos to launch Claude with a fresh worktree per repo (wired together via <code>--add-dir</code>).
+    </div>
+    <div style="display:flex; flex-direction:column; gap:0.3rem; max-height:14rem; overflow:auto; margin-bottom:0.6rem;">
+      ${repoCheckboxes}
+    </div>
+    ${capFieldset}
+    <button type="submit" class="trigger-btn">Create Multi-repo Session</button>
+  </form>`;
 
   let tableHtml: string;
   if (sessions.length === 0) {
@@ -35,7 +64,14 @@ export function buildSessionsListPage(
         ${summaryCell}
         <td>${created}</td>
         <td>${status}</td>
-        <td><button class="trigger-btn" @click="killSession('${escapeHtml(s.id)}')">Kill</button></td>
+        <td>${
+          s.alive
+            ? `<button class="trigger-btn" @click="killSession('${escapeHtml(s.id)}')">Kill</button>`
+            : (s.resumable
+                ? `<button class="trigger-btn" @click="resumeSession('${escapeHtml(s.id)}')">Resume</button> `
+                : "") +
+              `<button class="trigger-btn" @click="killSession('${escapeHtml(s.id)}')">Kill</button>`
+        }</td>
       </tr>`;
       })
       .join("");
@@ -73,8 +109,10 @@ ${htmlOpenTag(theme)}
         <option value="home-claude"${!defaultRepo ? " selected" : ""}>Claude (home directory)</option>
       </select>
     </label>
+    ${capFieldset}
     <button type="submit" class="trigger-btn">Create Session</button>
   </form>
+  ${multiForm}
   ${tableHtml}
   ${SESSIONS_LIST_SCRIPT}
 </body>
@@ -114,6 +152,10 @@ ${htmlOpenTag(theme)}
       .session-bar { padding: 0.35rem 0.6rem; font-size: 0.8rem; }
       .kb-key { font-size: 0.8rem; min-width: 2.2rem; min-height: 2rem; }
     }
+    #copy-overlay { position: fixed; inset: 0; z-index: 1000; background: rgba(0,0,0,0.6); display: none; flex-direction: column; padding: 1rem; box-sizing: border-box; }
+    .copy-panel { display: flex; flex-direction: column; flex: 1; min-height: 0; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+    .copy-panel-bar { display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; padding: 0.5rem 0.75rem; border-bottom: 1px solid var(--border); font-size: 0.9rem; color: var(--text); }
+    #copy-textarea { flex: 1; min-height: 0; width: 100%; box-sizing: border-box; border: 0; resize: none; padding: 0.5rem 0.75rem; font: 0.85rem/1.3 monospace; background: var(--bg); color: var(--text); white-space: pre-wrap; word-break: break-word; -webkit-user-select: text; user-select: text; overflow: auto; }
   </style>
   ${ALPINE_SCRIPT}
   ${ERROR_HANDLER_SCRIPT}
@@ -132,6 +174,7 @@ ${htmlOpenTag(theme)}
     <span class="session-dir"> | Dir: <code>${escapeHtml(session.cwd)}</code></span>
     | <a href="/sessions">← Back</a>
     | <button id="paste-btn" class="trigger-btn" style="font-size:0.85rem;padding:0.2rem 0.5rem;">Paste</button>
+    | <button id="copy-btn" class="trigger-btn" style="font-size:0.85rem;padding:0.2rem 0.5rem;">Copy</button>
   </div>
   <div id="terminal" data-session-id="${escapeHtml(session.id)}" data-session-alive="${session.alive ? "true" : "false"}"></div>
   <div id="mobile-keybar">
@@ -154,6 +197,18 @@ ${htmlOpenTag(theme)}
     <button type="button" class="kb-key" data-key="ctrl-c">^C</button>
     <button type="button" class="kb-key" data-key="ctrl-z">^Z</button>
     <button type="button" class="kb-key" data-key="ctrl-l">^L</button>
+  </div>
+  <div id="copy-overlay">
+    <div class="copy-panel">
+      <div class="copy-panel-bar">
+        <span>Select text to copy</span>
+        <span style="display:flex; gap:0.4rem;">
+          <button id="copy-all-btn" type="button" class="trigger-btn">Copy all</button>
+          <button id="copy-close-btn" type="button" class="trigger-btn">Close</button>
+        </span>
+      </div>
+      <textarea id="copy-textarea" readonly></textarea>
+    </div>
   </div>
   <script>
 (function(){

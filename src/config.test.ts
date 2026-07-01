@@ -33,10 +33,8 @@ beforeEach(() => {
   delete process.env["CLAWS_SLACK_WEBHOOK"];
   delete process.env["CLAWS_AUTH_TOKEN"];
   delete process.env["OPENAI_API_KEY"];
-  delete process.env["KWYJIBO_AUTOMATION_API_KEY"];
   delete process.env["CLAWS_GITHUB_OWNERS"];
   delete process.env["CLAWS_SELF_REPO"];
-  delete process.env["KWYJIBO_BASE_URL"];
   delete process.env["WHATSAPP_ENABLED"];
   delete process.env["WHATSAPP_ALLOWED_NUMBERS"];
   delete process.env["PORT"];
@@ -72,7 +70,6 @@ describe("config", () => {
       cp,
       JSON.stringify({
         slackWebhook: "https://hooks.slack.com/services/T123/B456/abcdef",
-        kwyjiboApiKey: "sk-kwyjibo-secret-key-12345",
         openaiApiKey: "sk-openai-key-98765",
         authToken: "my-secret-token-xyz",
         githubOwners: ["owner1"],
@@ -84,7 +81,6 @@ describe("config", () => {
 
     // Sensitive fields should be masked (last 4 chars visible)
     expect(display.slackWebhook).toBe("****cdef");
-    expect(display.kwyjiboApiKey).toBe("****2345");
     expect(display.openaiApiKey).toBe("****8765");
 
     // Non-sensitive fields should be shown as-is
@@ -102,11 +98,9 @@ describe("config", () => {
     delete process.env["CLAWS_SLACK_WEBHOOK"];
     delete process.env["CLAWS_AUTH_TOKEN"];
     delete process.env["OPENAI_API_KEY"];
-    delete process.env["KWYJIBO_AUTOMATION_API_KEY"];
 
     const display = getConfigForDisplay();
     expect(display.slackWebhook).toBe("Not configured");
-    expect(display.kwyjiboApiKey).toBe("Not configured");
     expect(display.openaiApiKey).toBe("Not configured");
   });
 
@@ -216,6 +210,59 @@ describe("config", () => {
     mod.writeConfig({ logRetentionDays: 99 });
 
     expect(listener).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("getIgnoredAdvisoriesForRepo", () => {
+  it("merges '*' global list with per-repo list", async () => {
+    const mod = await import("./config.js");
+
+    fs.mkdirSync(path.dirname(mod.CONFIG_PATH), { recursive: true });
+    fs.writeFileSync(
+      mod.CONFIG_PATH,
+      JSON.stringify({
+        dependabotIgnoredAdvisories: {
+          "*": ["GHSA-aaaa-0000-0001"],
+          "owner/repo": ["GHSA-bbbb-0000-0002"],
+        },
+      }),
+    );
+
+    mod.reloadConfig();
+    const result = mod.getIgnoredAdvisoriesForRepo("owner/repo");
+
+    expect(result).toEqual(new Set(["ghsa-aaaa-0000-0001", "ghsa-bbbb-0000-0002"]));
+  });
+
+  it("returns only global list when no repo-specific key", async () => {
+    const mod = await import("./config.js");
+
+    fs.mkdirSync(path.dirname(mod.CONFIG_PATH), { recursive: true });
+    fs.writeFileSync(
+      mod.CONFIG_PATH,
+      JSON.stringify({
+        dependabotIgnoredAdvisories: {
+          "*": ["GHSA-cccc-0000-0003"],
+        },
+      }),
+    );
+
+    mod.reloadConfig();
+    const result = mod.getIgnoredAdvisoriesForRepo("owner/other-repo");
+
+    expect(result).toEqual(new Set(["ghsa-cccc-0000-0003"]));
+  });
+
+  it("returns empty set when neither '*' nor repo key present", async () => {
+    const mod = await import("./config.js");
+
+    fs.mkdirSync(path.dirname(mod.CONFIG_PATH), { recursive: true });
+    fs.writeFileSync(mod.CONFIG_PATH, JSON.stringify({}));
+
+    mod.reloadConfig();
+    const result = mod.getIgnoredAdvisoriesForRepo("owner/repo");
+
+    expect(result).toEqual(new Set());
   });
 });
 

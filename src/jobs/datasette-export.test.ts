@@ -35,8 +35,8 @@ import { run } from "./datasette-export.js";
 import * as log from "../log.js";
 
 const defaultCfg = {
-  host: "192.168.0.251",
-  user: "brendan",
+  host: "203.0.113.20",
+  user: "user",
   port: 22,
   identityFile: "~/.ssh/id_ed25519",
   remotePath: "/data/claws.db",
@@ -86,7 +86,7 @@ describe("datasette-export", () => {
         "-o", "BatchMode=yes",
         "-i", expect.stringContaining(".ssh/id_ed25519"),
         "/home/user/.claws/claws-datasette-export.db",
-        "brendan@192.168.0.251:/data/claws.db",
+        "user@203.0.113.20:/data/claws.db",
       ]),
       { timeout: 120_000 },
       expect.any(Function),
@@ -154,36 +154,36 @@ describe("datasette-export", () => {
   });
 
   it("uses host without user when user is not set", async () => {
-    mockDatasetteExport.value = { host: "192.168.0.251", remotePath: "/data/claws.db" };
+    mockDatasetteExport.value = { host: "203.0.113.20", remotePath: "/data/claws.db" };
     mockScpSuccess();
 
     await run();
 
     const args = mockExecFile.mock.calls[0][1] as string[];
-    expect(args).toContain("192.168.0.251:/data/claws.db");
+    expect(args).toContain("203.0.113.20:/data/claws.db");
     expect(args).not.toContain("-i");
   });
 
   it("uses user@host format and omits -i when user is set but identityFile is not", async () => {
-    mockDatasetteExport.value = { host: "192.168.0.251", user: "brendan", remotePath: "/data/claws.db" };
+    mockDatasetteExport.value = { host: "203.0.113.20", user: "user", remotePath: "/data/claws.db" };
     mockScpSuccess();
 
     await run();
 
     const args = mockExecFile.mock.calls[0][1] as string[];
-    expect(args).toContain("brendan@192.168.0.251:/data/claws.db");
+    expect(args).toContain("user@203.0.113.20:/data/claws.db");
     expect(args).not.toContain("-i");
   });
 
   it("uses bare host format and includes -i when identityFile is set but user is not", async () => {
-    mockDatasetteExport.value = { host: "192.168.0.251", identityFile: "~/.ssh/id_ed25519", remotePath: "/data/claws.db" };
+    mockDatasetteExport.value = { host: "203.0.113.20", identityFile: "~/.ssh/id_ed25519", remotePath: "/data/claws.db" };
     mockScpSuccess();
 
     await run();
 
     const args = mockExecFile.mock.calls[0][1] as string[];
     const destination = args[args.length - 1];
-    expect(destination).toBe("192.168.0.251:/data/claws.db");
+    expect(destination).toBe("203.0.113.20:/data/claws.db");
     const iIdx = args.indexOf("-i");
     expect(iIdx).toBeGreaterThan(-1);
     expect(args[iIdx + 1]).toContain(".ssh/id_ed25519");

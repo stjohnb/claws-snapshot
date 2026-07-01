@@ -20,13 +20,13 @@ vi.mock("../config.js", () => ({
   LABELS: { priority: "Priority" },
 }));
 
-const mockSearchIssues = vi.hoisted(() => vi.fn());
+const mockFindIssueByExactTitle = vi.hoisted(() => vi.fn());
 const mockCreateIssue = vi.hoisted(() => vi.fn());
 const mockCommentOnIssue = vi.hoisted(() => vi.fn());
 const mockGetIssueBody = vi.hoisted(() => vi.fn());
 const mockEditIssue = vi.hoisted(() => vi.fn());
 vi.mock("../github.js", () => ({
-  searchIssues: mockSearchIssues,
+  findIssueByExactTitle: mockFindIssueByExactTitle,
   createIssue: mockCreateIssue,
   commentOnIssue: mockCommentOnIssue,
   getIssueBody: mockGetIssueBody,
@@ -47,6 +47,12 @@ vi.mock("../slack.js", () => ({
 const mockReportError = vi.hoisted(() => vi.fn());
 vi.mock("../error-reporter.js", () => ({
   reportError: mockReportError,
+}));
+
+const mockRefreshKubeconfig = vi.hoisted(() => vi.fn());
+vi.mock("./kubeconfig-refresh.js", () => ({
+  refreshKubeconfig: mockRefreshKubeconfig,
+  isStaleKubeconfigError: (e: Error) => /timed out after 30s|connection refused|unreachable/i.test(e.message),
 }));
 
 import { run, runK8sMonitor, podWorkloadName, workloadNameForPod, detectPodAlerts, detectNodeAlerts, detectFluxAlerts, dedupeAlertsByTitle, getK8sMonitorStatus, kubectlExec } from "./k3s-monitor.js";
@@ -215,7 +221,7 @@ describe("k3s-monitor", () => {
     mockK3sEnabled.value = true;
     mockK3sIgnoredNodes.value = [];
     mockFleetInfraRepo.value = "St-John-Software/fleet-infra";
-    mockSearchIssues.mockResolvedValue([]);
+    mockFindIssueByExactTitle.mockResolvedValue(null);
     mockCreateIssue.mockResolvedValue(1);
     mockCommentOnIssue.mockResolvedValue(undefined);
     mockGetIssueBody.mockResolvedValue(
@@ -223,6 +229,7 @@ describe("k3s-monitor", () => {
     );
     mockEditIssue.mockResolvedValue(undefined);
     mockReportError.mockResolvedValue(undefined);
+    mockRefreshKubeconfig.mockResolvedValue(undefined);
   });
 
   // ── Enabled/disabled ──
@@ -306,9 +313,7 @@ describe("k3s-monitor", () => {
   // ── Deduplication / occurrence tracking ──
 
   it("updates occurrence count in issue body on recurrence", async () => {
-    mockSearchIssues.mockResolvedValue([
-      { number: 42, title: "[k3s] CrashLoopBackOff: fleet-services/my-service" },
-    ]);
+    mockFindIssueByExactTitle.mockResolvedValue({ number: 42, title: "[k3s] CrashLoopBackOff: fleet-services/my-service" });
 
     makeKubectlResponseSequential([
       emptyNodeJson,
@@ -330,9 +335,7 @@ describe("k3s-monitor", () => {
   });
 
   it("increments occurrence count on each recurrence", async () => {
-    mockSearchIssues.mockResolvedValue([
-      { number: 42, title: "[k3s] CrashLoopBackOff: fleet-services/my-service" },
-    ]);
+    mockFindIssueByExactTitle.mockResolvedValue({ number: 42, title: "[k3s] CrashLoopBackOff: fleet-services/my-service" });
     const pods = JSON.stringify(podList([crashLoopPod()]));
 
     // First recurrence — existing body has count=1, should become 2
@@ -345,9 +348,7 @@ describe("k3s-monitor", () => {
     );
 
     vi.clearAllMocks();
-    mockSearchIssues.mockResolvedValue([
-      { number: 42, title: "[k3s] CrashLoopBackOff: fleet-services/my-service" },
-    ]);
+    mockFindIssueByExactTitle.mockResolvedValue({ number: 42, title: "[k3s] CrashLoopBackOff: fleet-services/my-service" });
     mockGetIssueBody.mockResolvedValue(
       "**Pod:** `my-service-abc123456-xk9pz`\n\n---\n**First seen:** 2025-01-15T10:00:00.000Z\n**Last seen:** 2025-01-15T11:00:00.000Z\n**Occurrences:** 2",
     );
@@ -365,9 +366,7 @@ describe("k3s-monitor", () => {
   });
 
   it("warns and skips editIssue when body has content after the tracking block", async () => {
-    mockSearchIssues.mockResolvedValue([
-      { number: 42, title: "[k3s] CrashLoopBackOff: fleet-services/my-service" },
-    ]);
+    mockFindIssueByExactTitle.mockResolvedValue({ number: 42, title: "[k3s] CrashLoopBackOff: fleet-services/my-service" });
     // Tracking block exists but trailing content causes $ anchor to miss
     mockGetIssueBody.mockResolvedValue(
       "**Pod:** `my-service-abc123456-xk9pz`\n\n---\n**First seen:** 2025-01-15T10:00:00.000Z\n**Last seen:** 2025-01-15T10:00:00.000Z\n**Occurrences:** 1\n\n> Note added by user",
@@ -390,9 +389,7 @@ describe("k3s-monitor", () => {
   });
 
   it("handles null body (issue with no description) without crashing", async () => {
-    mockSearchIssues.mockResolvedValue([
-      { number: 42, title: "[k3s] CrashLoopBackOff: fleet-services/my-service" },
-    ]);
+    mockFindIssueByExactTitle.mockResolvedValue({ number: 42, title: "[k3s] CrashLoopBackOff: fleet-services/my-service" });
     mockGetIssueBody.mockResolvedValue(null);
 
     makeKubectlResponseSequential([
@@ -413,9 +410,7 @@ describe("k3s-monitor", () => {
   });
 
   it("adds tracking retroactively to issues created before this feature", async () => {
-    mockSearchIssues.mockResolvedValue([
-      { number: 42, title: "[k3s] CrashLoopBackOff: fleet-services/my-service" },
-    ]);
+    mockFindIssueByExactTitle.mockResolvedValue({ number: 42, title: "[k3s] CrashLoopBackOff: fleet-services/my-service" });
     // Body without tracking block
     mockGetIssueBody.mockResolvedValue("**Pod:** `my-service-abc123456-xk9pz`\n**Namespace:** `fleet-services`");
 
@@ -904,6 +899,50 @@ describe("k3s-monitor", () => {
       ["Priority"],
     );
   });
+
+  it("refreshes kubeconfig and retries get-pods on stale/unreachable error", async () => {
+    makeKubectlResponseSequential([
+      emptyNodeJson,                                                       // get nodes
+      new Error("kubectl get pods --all-namespaces timed out after 30s"), // first get-pods fails
+      emptyPodJson,                                                        // retry get-pods succeeds
+      emptyKsJson,
+      emptyHrJson,
+    ]);
+
+    await runK8sMonitor({
+      repo: "St-John-Software/production-infra",
+      kubeconfigPath: "/tmp/kube.yaml",
+      kubeconfigRefresh: { tailscaleHostname: "prod-k8s", remotePath: "/etc/rancher/k3s/k3s.yaml" },
+      ignoredNodes: [],
+      logPrefix: "prod-k8s-monitor",
+    });
+
+    expect(mockRefreshKubeconfig).toHaveBeenCalledOnce();
+    expect(mockReportError).not.toHaveBeenCalled();
+  });
+
+  it("reports error when kubeconfig refresh throws (cluster down and SSH unreachable)", async () => {
+    mockRefreshKubeconfig.mockRejectedValue(new Error("ssh: connect: Connection timed out"));
+    makeKubectlResponseSequential([
+      emptyNodeJson,
+      new Error("kubectl get pods --all-namespaces timed out after 30s"),
+    ]);
+
+    await runK8sMonitor({
+      repo: "St-John-Software/production-infra",
+      kubeconfigPath: "/tmp/kube.yaml",
+      kubeconfigRefresh: { tailscaleHostname: "prod-k8s", remotePath: "/etc/rancher/k3s/k3s.yaml" },
+      ignoredNodes: [],
+      logPrefix: "prod-k8s-monitor",
+    });
+
+    expect(mockRefreshKubeconfig).toHaveBeenCalledOnce();
+    expect(mockReportError).toHaveBeenCalledWith(
+      "prod-k8s-monitor:kubectl-get-pods",
+      expect.any(String),
+      expect.any(Error),
+    );
+  });
 });
 
 // ── Status cache ──
@@ -914,7 +953,7 @@ describe("k3s-monitor status cache", () => {
     mockK3sEnabled.value = true;
     mockK3sIgnoredNodes.value = [];
     mockFleetInfraRepo.value = "St-John-Software/fleet-infra";
-    mockSearchIssues.mockResolvedValue([]);
+    mockFindIssueByExactTitle.mockResolvedValue(null);
     mockCreateIssue.mockResolvedValue(1);
     mockCommentOnIssue.mockResolvedValue(undefined);
     mockGetIssueBody.mockResolvedValue(null);
@@ -1454,7 +1493,7 @@ describe("run() Flux integration", () => {
     vi.clearAllMocks();
     mockK3sEnabled.value = true;
     mockFleetInfraRepo.value = "St-John-Software/fleet-infra";
-    mockSearchIssues.mockResolvedValue([]);
+    mockFindIssueByExactTitle.mockResolvedValue(null);
     mockCreateIssue.mockResolvedValue(1);
     mockGetIssueBody.mockResolvedValue(null);
     mockEditIssue.mockResolvedValue(undefined);

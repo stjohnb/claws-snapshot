@@ -58,6 +58,7 @@ const { mockGh, mockClaude, mockDb } = vi.hoisted(() => ({
     updateTaskWorktree: vi.fn(),
     updateTaskModel: vi.fn(),
     updateTaskTokenUsage: vi.fn(),
+    trackTaskTokens: vi.fn().mockReturnValue(vi.fn()),
     recordTaskComplete: vi.fn(),
     recordTaskFailed: vi.fn(),
     withTaskRecording: vi.fn(async (jobName: string, repo: string, itemNumber: number, triggerLabel: string | null, fn: (taskId: number) => Promise<unknown>) => {
@@ -523,6 +524,25 @@ describe("pr-reviewer", () => {
       expect(promptArg).toContain("Add Y to module Z");
     });
 
+    it("linked issue with refined plan — plan is framed as authoritative and appears before the issue body", async () => {
+      const pr = mockPR({ headRefName: "feature/x", body: "Closes #99" });
+      mockGh.getIssueBody.mockResolvedValue("User wants feature X with property Y");
+      const planComment = `*— Automated by Claws —*\n\n## Implementation Plan\nAdd Y to module Z`;
+      mockGh.getIssueComments.mockImplementation((_repo: string, n: number) =>
+        Promise.resolve(n === 99
+          ? [{ id: 1, body: planComment, login: "claws[bot]" }]
+          : []
+        )
+      );
+
+      await processPR(repo, pr);
+
+      const promptArg = mockClaude.runClaude.mock.calls[0][0] as string;
+      expect(promptArg).toContain("AUTHORITATIVE");
+      expect(promptArg.toLowerCase()).toContain("refined plan is the authoritative");
+      expect(promptArg.indexOf("Add Y to module Z")).toBeLessThan(promptArg.indexOf("User wants feature X"));
+    });
+
     it("linked issue via branch name — fetches and renders issue context", async () => {
       const pr = mockPR({ headRefName: "claws/issue-42-abcd", body: "" });
       mockGh.getIssueBody.mockResolvedValue("This is issue 42 body");
@@ -569,6 +589,8 @@ describe("pr-reviewer", () => {
       const promptArg = mockClaude.runClaude.mock.calls[0][0] as string;
       expect(promptArg).toContain("Issue #7 body");
       expect(promptArg).not.toContain("Refined plan");
+      expect(promptArg).toContain("source of truth");
+      expect(promptArg).not.toContain("AUTHORITATIVE");
     });
   });
 

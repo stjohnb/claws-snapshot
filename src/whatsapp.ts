@@ -57,10 +57,6 @@ let pairingTimeout: ReturnType<typeof setTimeout> | null = null;
 const PAIRING_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes
 const MAX_FAILURES_BEFORE_CLEAR = 5;
 
-export function isConnected(): boolean {
-  return connected;
-}
-
 export function isPairing(): boolean {
   return pairingListener !== null;
 }
@@ -115,7 +111,7 @@ function isGroupMessage(jid: string): boolean {
   return jid.endsWith("@g.us");
 }
 
-async function downloadAudio(
+export async function downloadAudio(
   message: proto.IMessage,
 ): Promise<Buffer | undefined> {
   const audioMsg = message.audioMessage;
@@ -124,18 +120,23 @@ async function downloadAudio(
   try {
     const stream = await downloadContentFromMessage(audioMsg, "audio");
     const chunks: Buffer[] = [];
-    for await (const chunk of stream) {
-      chunks.push(chunk as Buffer);
-    }
-    const buffer = Buffer.concat(chunks);
 
-    // Cap at ~10 minutes (~2.4 MB for Opus at 32kbps).
-    // Whisper API has a 25 MB limit, but we keep it reasonable.
+    // Cap at ~25 MB (Whisper API's hard limit). Enforce while streaming so an
+    // oversized/malformed payload can't drive memory up before the check.
     const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
-    if (buffer.length > MAX_AUDIO_BYTES) {
-      return undefined; // Caller should notify user
+    let total = 0;
+    for await (const chunk of stream) {
+      const buf = chunk as Buffer;
+      total += buf.length;
+      if (total > MAX_AUDIO_BYTES) {
+        log.warn(
+          `[whatsapp] Audio exceeded ${MAX_AUDIO_BYTES} bytes; aborting download`,
+        );
+        return undefined; // Caller should notify user
+      }
+      chunks.push(buf);
     }
-    return buffer;
+    return Buffer.concat(chunks);
   } catch (err) {
     log.warn(`[whatsapp] Failed to download audio: ${err}`);
     return undefined;

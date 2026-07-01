@@ -1,8 +1,6 @@
-import fs from "node:fs";
-import path from "node:path";
 import { LABELS, type Repo } from "../config.js";
-import { runRepoScanner, type ScannerSpec } from "./scanner-runner.js";
-import { listWorkflowFiles, parseWorkflow, type StepInfo } from "./workflow-parser.js";
+import { renderViolationTable, runRepoScanner, type ScannerSpec } from "./scanner-runner.js";
+import { listParsedWorkflows, type StepInfo } from "./workflow-parser.js";
 
 interface Violation {
   file: string;
@@ -57,35 +55,22 @@ function getCacheIssue(step: StepInfo): string | null {
 }
 
 function formatIssueBody(violations: Violation[]): string {
-  const lines = [
-    "| File | Job | Step (`uses`) | Issue |",
-    "|------|-----|---------------|-------|",
-  ];
-
-  for (const v of violations) {
-    lines.push(`| \`${v.file}\` | \`${v.job}\` | \`${v.uses}\` | ${v.issue} |`);
-  }
-
-  lines.push(
-    "",
-    "**Why this matters:** Self-hosted runners in this org persist their workspace and tool caches across runs, so `actions/cache` and `setup-*` `cache:` options add round-trips to GitHub's cache service without benefit and can actually slow runs.",
-    "",
-    "**Fix:** Remove the `- uses: actions/cache@...` step entirely, or delete the `cache:` key from the `with:` block of any `setup-*` action.",
-  );
-
-  return lines.join("\n");
+  return renderViolationTable({
+    columns: ["File", "Job", "Step (`uses`)", "Issue"],
+    rows: violations,
+    cells: (v) => [`\`${v.file}\``, `\`${v.job}\``, `\`${v.uses}\``, v.issue],
+    footer: [
+      "**Why this matters:** Self-hosted runners in this org persist their workspace and tool caches across runs, so `actions/cache` and `setup-*` `cache:` options add round-trips to GitHub's cache service without benefit and can actually slow runs.",
+      "",
+      "**Fix:** Remove the `- uses: actions/cache@...` step entirely, or delete the `cache:` key from the `with:` block of any `setup-*` action.",
+    ],
+  });
 }
 
 function scan(repoDir: string, _repo: Repo): { body: string; summary?: string } | null {
-  const wf = listWorkflowFiles(repoDir);
-  if (!wf) return null;
-
   const violations: Violation[] = [];
 
-  for (const file of wf.files) {
-    const content = fs.readFileSync(path.join(wf.dir, file), "utf-8");
-    const workflow = parseWorkflow(content);
-
+  for (const { file, workflow } of listParsedWorkflows(repoDir) ?? []) {
     for (const job of workflow.getJobs()) {
       if (!isSelfHostedRunner(job.runsOn)) continue;
 

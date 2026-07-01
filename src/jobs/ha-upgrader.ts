@@ -39,8 +39,7 @@ async function raiseHaUpgradeAlert(
 
   const repo = HOME_ASSISTANT_CONFIG_REPO || FLEET_INFRA_REPO;
 
-  const results = await gh.searchIssues(repo, title);
-  const existing = results.find((r) => r.title === title);
+  const existing = await gh.findIssueByExactTitle(repo, title);
   if (existing) return false;
 
   const releaseSummary = attributes.release_summary
@@ -60,6 +59,23 @@ async function raiseHaUpgradeAlert(
 
   await gh.createIssue(repo, title, bodyLines, [LABELS.priority]);
   return true;
+}
+
+async function escalateInstallFailure(
+  entity_id: string,
+  attributes: Record<string, unknown>,
+  latestVersion: string,
+  nextFailures: number,
+  installFailureTitles: string[],
+): Promise<void> {
+  if (nextFailures < 3) return;
+  try {
+    const failureTitle = `[HA] Install failed (${nextFailures}x): ${String(attributes.title ?? entity_id)} → ${latestVersion}`;
+    const raised = await raiseHaUpgradeAlert(entity_id, attributes, failureTitle);
+    if (raised) installFailureTitles.push(`${entity_id} (install failure)`);
+  } catch (alertErr) {
+    log.warn(`[ha-upgrader] Failed to raise issue for ${entity_id}: ${alertErr}`);
+  }
 }
 
 export async function run(): Promise<void> {
@@ -139,15 +155,7 @@ export async function run(): Promise<void> {
         log.warn(`[ha-upgrader] Failed to install ${entity_id}: ${err}`);
         const nextFailures = state.failure_count + 1;
         recordHaUpgraderAttempt(entity_id, latestVersion, Date.now(), nextFailures);
-        if (nextFailures >= 3) {
-          try {
-            const failureTitle = `[HA] Install failed (${nextFailures}x): ${String(attributes.title ?? entity_id)} → ${latestVersion}`;
-            const raised = await raiseHaUpgradeAlert(entity_id, attributes, failureTitle);
-            if (raised) installFailureTitles.push(`${entity_id} (install failure)`);
-          } catch (alertErr) {
-            log.warn(`[ha-upgrader] Failed to raise issue for ${entity_id}: ${alertErr}`);
-          }
-        }
+        await escalateInstallFailure(entity_id, attributes, latestVersion, nextFailures, installFailureTitles);
       }
     }
 
@@ -187,15 +195,7 @@ export async function run(): Promise<void> {
         log.warn(`[ha-upgrader] Failed to install high-risk ${entity_id}: ${err}`);
         const nextFailures = state.failure_count + 1;
         recordHaUpgraderAttempt(entity_id, latestVersion, Date.now(), nextFailures);
-        if (nextFailures >= 3) {
-          try {
-            const failureTitle = `[HA] Install failed (${nextFailures}x): ${String(attributes.title ?? entity_id)} → ${latestVersion}`;
-            const raised = await raiseHaUpgradeAlert(entity_id, attributes, failureTitle);
-            if (raised) installFailureTitles.push(`${entity_id} (install failure)`);
-          } catch (alertErr) {
-            log.warn(`[ha-upgrader] Failed to raise issue for ${entity_id}: ${alertErr}`);
-          }
-        }
+        await escalateInstallFailure(entity_id, attributes, latestVersion, nextFailures, installFailureTitles);
       }
     }
 

@@ -48,6 +48,7 @@ const { mockFs, mockGh, mockClaude, mockDb } = vi.hoisted(() => ({
     updateTaskWorktree: vi.fn(),
     updateTaskModel: vi.fn(),
     updateTaskTokenUsage: vi.fn(),
+    trackTaskTokens: vi.fn().mockReturnValue(vi.fn()),
     recordTaskComplete: vi.fn(),
     recordTaskFailed: vi.fn(),
     markRepoProcessedDaily: vi.fn(),
@@ -518,6 +519,23 @@ describe("improvement-identifier", () => {
     expect(mockDb.markRepoProcessedDaily).toHaveBeenCalled();
   });
 
+  it("truncated output (no closing fence) does NOT invoke reportError", async () => {
+    // Mid-string truncation, no closing ``` fence — the real max-tokens case.
+    mockClaude.runClaude.mockResolvedValue(
+      '```json\n{ "securityFindings": [ { "title": "x", "body": "unterminated and cut off here',
+    );
+
+    await run([repo]);
+
+    expect(reportError).not.toHaveBeenCalledWith(
+      "improvement-identifier:parse-findings",
+      expect.anything(),
+      expect.anything(),
+    );
+    expect(mockGh.createIssue).not.toHaveBeenCalled();
+    expect(mockDb.markRepoProcessedDaily).toHaveBeenCalled();
+  });
+
   it("caps security findings at MAX_FINDINGS_PER_RUN (5)", async () => {
     const manyFindings = JSON.stringify({
       securityFindings: [
@@ -696,5 +714,12 @@ describe("buildPrompt", () => {
   it("does not include private-repo guideline when isPrivate is false", () => {
     const prompt = buildPrompt("o/r", [], [], false);
     expect(prompt).not.toContain("This repository is PRIVATE");
+  });
+
+  it("includes conditional Web/SEO structured-data guidance", () => {
+    const prompt = buildPrompt("o/r", [], [], false);
+    expect(prompt).toContain("Web / SEO improvements");
+    expect(prompt).toContain("application/ld+json");
+    expect(prompt).toContain("ProfilePage");
   });
 });

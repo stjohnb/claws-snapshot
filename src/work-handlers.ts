@@ -96,6 +96,15 @@ export function registerAll(): void {
     await issueRefiner.processRefinement(repo, issue, data.unreacted);
   });
 
+  worker.registerHandler(AGENT_KINDS.ISSUE_REFINER_REPLAN, async (row) => {
+    const repo = await resolveRepo(row.repo);
+    if (!repo) throw new Error(`Unknown repo ${row.repo}`);
+    const issue = await fetchOpenIssue(row.repo, row.item_number);
+    if (!issue) return;
+    // Re-evaluate the existing plan against the issue's updated occurrence count.
+    await issueRefiner.processRefinement(repo, issue, []);
+  });
+
   worker.registerHandler(AGENT_KINDS.ISSUE_REFINER_FOLLOWUP, async (row) => {
     const repo = await resolveRepo(row.repo);
     if (!repo) throw new Error(`Unknown repo ${row.repo}`);

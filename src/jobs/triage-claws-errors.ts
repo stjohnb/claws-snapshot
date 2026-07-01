@@ -11,6 +11,24 @@ import { classifyComplexity } from "../classify-complexity.js";
 
 export const REPORT_HEADER = "## Claws Error Investigation Report";
 
+// Map over items with a bounded number of concurrent in-flight calls,
+// preserving input order in the returned array.
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  for (let i = 0; i < items.length; i += concurrency) {
+    const batch = items.slice(i, i + concurrency);
+    const settled = await Promise.all(batch.map((item) => fn(item)));
+    for (let j = 0; j < settled.length; j++) {
+      results[i + j] = settled[j];
+    }
+  }
+  return results;
+}
+
 export interface ClawsErrorDetails {
   fingerprint: string;
   context: string;
@@ -94,23 +112,40 @@ export async function deduplicateByFingerprint(
   const canonical: gh.Issue[] = [];
   const closed = new Set<number>();
 
-  // Check each fingerprint group
-  for (const [fp, group] of byFingerprint) {
-    let existingCanonical: gh.Issue | null = null;
+  // Precompute fingerprint → canonical existing issue once (O(E) instead of
+  // O(G×E)). First issue in listOpenIssues order wins for a given fingerprint,
+  // matching the original break-on-first-match loop.
+  const fingerprintToCanonical = new Map<string, gh.Issue>();
 
-    for (const existing of allOpenIssues) {
-      if (issueNumbers.has(existing.number)) continue;
-      const existingFp = extractFingerprint(existing.title);
-      if (existingFp === fp) {
-        existingCanonical = existing;
-        break;
-      }
-      const known = await getKnownFingerprints(repo, existing.number);
-      if (known.has(fp)) {
-        existingCanonical = existing;
-        break;
+  // Eligible existing issues, preserving listOpenIssues order (which determines
+  // first-wins). Skip issues that are part of the incoming batch.
+  const eligible = allOpenIssues.filter((e) => !issueNumbers.has(e.number));
+
+  // Fetch each issue's known fingerprints concurrently (bounded) to avoid the
+  // serial getIssueComments round-trips. Results stay aligned to `eligible` by
+  // index, so map assembly below remains deterministic and order-preserving.
+  const knownPerIssue = await mapWithConcurrency(
+    eligible,
+    5,
+    (existing) => getKnownFingerprints(repo, existing.number),
+  );
+
+  for (let i = 0; i < eligible.length; i++) {
+    const existing = eligible[i];
+    const existingFp = extractFingerprint(existing.title);
+    if (existingFp && !fingerprintToCanonical.has(existingFp)) {
+      fingerprintToCanonical.set(existingFp, existing);
+    }
+    for (const fp of knownPerIssue[i]) {
+      if (!fingerprintToCanonical.has(fp)) {
+        fingerprintToCanonical.set(fp, existing);
       }
     }
+  }
+
+  // Check each fingerprint group
+  for (const [fp, group] of byFingerprint) {
+    const existingCanonical = fingerprintToCanonical.get(fp) ?? null;
 
     if (existingCanonical) {
       for (const issue of group) {
@@ -328,22 +363,13 @@ async function processIssue(
       const model = getModel(tier, "tool-use", "claude");
       db.updateTaskModel(taskId, model);
       log.info(`[triage-claws-errors] Using model "${model}" for ${repo}#${issue.number}`);
-      // Two possible runClaude calls (retry on truncation) — accumulate before writing.
-      let taskTokensUsed: number | undefined;
-      let taskCostUsd: number | undefined;
-      const accumulateUsage = (t: number, c: number) => {
-        taskTokensUsed = (taskTokensUsed ?? 0) + t;
-        taskCostUsd = (taskCostUsd ?? 0) + c;
-      };
-      let output = await claude.runClaude(prompt, wtPath, { capability: "tool-use", mcpConfig: mcpConfigPath, timeoutMs, tier, model, agent: "plan", onTokensUsed: accumulateUsage });
+      // Two possible runClaude calls (retry on truncation) — shared callback accumulates across both.
+      const trackTokens = db.trackTaskTokens(taskId);
+      let output = await claude.runClaude(prompt, wtPath, { capability: "tool-use", mcpConfig: mcpConfigPath, timeoutMs, tier, model, agent: "plan", onTokensUsed: trackTokens });
 
       if (output.trim() && isReportTruncated(output)) {
         log.warn(`[triage-claws-errors] Investigation output appears truncated for ${repo}#${issue.number} (missing RELATED_ISSUES marker, ${output.length} chars) — retrying once`);
-        output = await claude.runClaude(prompt, wtPath, { capability: "tool-use", mcpConfig: mcpConfigPath, timeoutMs, tier, model, agent: "plan", onTokensUsed: accumulateUsage });
-      }
-
-      if (taskTokensUsed !== undefined && taskCostUsd !== undefined) {
-        db.updateTaskTokenUsage(taskId, taskTokensUsed, taskCostUsd);
+        output = await claude.runClaude(prompt, wtPath, { capability: "tool-use", mcpConfig: mcpConfigPath, timeoutMs, tier, model, agent: "plan", onTokensUsed: trackTokens });
       }
 
       if (output.trim() && isReportTruncated(output)) {
@@ -382,8 +408,8 @@ export async function run(repos: Repo[]): Promise<void> {
     const allIssues = await gh.listOpenIssues(repo);
     const clawsErrorIssues = allIssues.filter((i) => extractFingerprint(i.title) !== null);
 
-    // Filter to only issues without an investigation report
-    const uninvestigated: gh.Issue[] = [];
+    // Phase A: filter (isAllowedActor stays sequential — it logs on skip).
+    const candidates: gh.Issue[] = [];
     for (const issue of clawsErrorIssues) {
       if (gh.isItemSkipped(repo, issue.number)) continue;
       if (gh.hasIgnoreLabel(issue.labels)) continue;
@@ -391,10 +417,21 @@ export async function run(repos: Repo[]): Promise<void> {
         log.info(`[triage-claws-errors] Skipping issue #${issue.number} from non-allowed actor @${issue.author.login}`);
         continue;
       }
-      const comments = await gh.getIssueComments(repo, issue.number);
-      const hasReport = comments.some((c) => c.body.includes(REPORT_HEADER));
+      candidates.push(issue);
+    }
+
+    // Phase B: independent comment fetches in parallel.
+    const commentsPerCandidate = await Promise.all(
+      candidates.map((issue) => gh.getIssueComments(repo, issue.number)),
+    );
+
+    // Phase C: classify + populate cache in deterministic input order.
+    const uninvestigated: gh.Issue[] = [];
+    for (let i = 0; i < candidates.length; i++) {
+      const issue = candidates[i];
+      const hasReport = commentsPerCandidate[i].some((c) => c.body.includes(REPORT_HEADER));
       if (!hasReport) {
-        gh.populateQueueCache("needs-triage", repo, { number: issue.number, title: issue.title, type: "issue", updatedAt: issue.updatedAt, priority: gh.hasPriorityLabel(issue.labels), labels: issue.labels.map((l) => l.name) });
+        gh.populateQueueCacheFor("needs-triage", repo, issue, "issue");
         uninvestigated.push(issue);
       }
     }

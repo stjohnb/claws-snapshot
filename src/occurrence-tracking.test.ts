@@ -1,11 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-const mockSearchIssues = vi.hoisted(() => vi.fn());
+const mockFindIssueByExactTitle = vi.hoisted(() => vi.fn());
 const mockCreateIssue = vi.hoisted(() => vi.fn());
 const mockGetIssueBody = vi.hoisted(() => vi.fn());
 const mockEditIssue = vi.hoisted(() => vi.fn());
 vi.mock("./github.js", () => ({
-  searchIssues: mockSearchIssues,
+  findIssueByExactTitle: mockFindIssueByExactTitle,
   createIssue: mockCreateIssue,
   getIssueBody: mockGetIssueBody,
   editIssue: mockEditIssue,
@@ -17,7 +17,7 @@ vi.mock("./log.js", () => ({
   error: vi.fn(),
 }));
 
-import { appendOccurrenceTracking, updateOccurrenceTracking, applyOccurrenceTracking, ensureAlertIssue } from "./occurrence-tracking.js";
+import { appendOccurrenceTracking, updateOccurrenceTracking, applyOccurrenceTracking, ensureAlertIssue, parseOccurrenceCount } from "./occurrence-tracking.js";
 
 const TS1 = "2024-01-01T00:00:00.000Z";
 const TS2 = "2024-01-02T00:00:00.000Z";
@@ -92,6 +92,22 @@ describe("applyOccurrenceTracking", () => {
   });
 });
 
+describe("parseOccurrenceCount", () => {
+  it("returns the integer from a body with occurrence tracking", () => {
+    const body = `Some body.\n\n---\n**First seen:** ${TS1}\n**Last seen:** ${TS2}\n**Occurrences:** 5`;
+    expect(parseOccurrenceCount(body)).toBe(5);
+  });
+
+  it("returns null when occurrence tracking is absent", () => {
+    expect(parseOccurrenceCount("Just a plain body with no tracking.")).toBeNull();
+  });
+
+  it("returns 1 for Occurrences: 1", () => {
+    const body = `Body.\n\n---\n**First seen:** ${TS1}\n**Last seen:** ${TS1}\n**Occurrences:** 1`;
+    expect(parseOccurrenceCount(body)).toBe(1);
+  });
+});
+
 describe("ensureAlertIssue", () => {
   const OPTS = {
     repo: "org/repo",
@@ -107,7 +123,7 @@ describe("ensureAlertIssue", () => {
   });
 
   it("creates issue with occurrence tracking body when no existing issue found", async () => {
-    mockSearchIssues.mockResolvedValue([]);
+    mockFindIssueByExactTitle.mockResolvedValue(null);
     mockCreateIssue.mockResolvedValue(42);
 
     const result = await ensureAlertIssue(OPTS);
@@ -124,7 +140,7 @@ describe("ensureAlertIssue", () => {
 
   it("edits existing issue when tracking block is at end of body", async () => {
     const existingBody = `Details.\n\n---\n**First seen:** ${TS1}\n**Last seen:** ${TS1}\n**Occurrences:** 1`;
-    mockSearchIssues.mockResolvedValue([{ title: OPTS.title, number: 7 }]);
+    mockFindIssueByExactTitle.mockResolvedValue({ title: OPTS.title, number: 7 });
     mockGetIssueBody.mockResolvedValue(existingBody);
     mockEditIssue.mockResolvedValue(undefined);
 
@@ -137,7 +153,7 @@ describe("ensureAlertIssue", () => {
 
   it("returns tracking-not-updated when tracking block is not at end of body", async () => {
     const bodyWithTrailingNote = `**First seen:** ${TS1}\n**Last seen:** ${TS1}\n**Occurrences:** 1\n\nSomeone added a note after the tracking block.`;
-    mockSearchIssues.mockResolvedValue([{ title: OPTS.title, number: 99 }]);
+    mockFindIssueByExactTitle.mockResolvedValue({ title: OPTS.title, number: 99 });
     mockGetIssueBody.mockResolvedValue(bodyWithTrailingNote);
 
     const result = await ensureAlertIssue(OPTS);

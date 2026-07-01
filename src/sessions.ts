@@ -5,6 +5,7 @@ import { isShuttingDown } from "./shutdown.js";
 import { WORK_DIR } from "./config.js";
 import * as claude from "./claude.js";
 import { listRepos } from "./github.js";
+import { buildCapabilityEnvArgs, buildCapabilityPrompt } from "./capabilities.js";
 import type { Repo } from "./config.js";
 import {
   insertSession,
@@ -24,7 +25,7 @@ const SCROLLBACK_LIMIT = 50_000;
 const MAX_RESPAWN_ATTEMPTS = 3;
 const RESPAWN_MIN_LIFETIME_MS = 500;
 
-export const SESSION_MODES = ["repo-zsh", "repo-claude", "worktree-claude", "home-claude"] as const;
+export const SESSION_MODES = ["repo-zsh", "repo-claude", "worktree-claude", "home-claude", "multi-worktree-claude"] as const;
 export type SessionMode = (typeof SESSION_MODES)[number];
 
 export interface Session {
@@ -37,18 +38,23 @@ export interface Session {
   cwd: string;
   mode: SessionMode;
   worktreePath: string | null;
+  extraWorktrees: Array<{ repo: string; worktreePath: string }>;
+  capabilities: string[];
   scrollback: string;
   alive: boolean;
   exitCode: number | null;
   wsConnected: boolean;
   bridgeSpawnedAt: number;
   respawnCount: number;
+  resumable: boolean;
+  resumeRepos: string[];
   summary: string | null;
   summaryUpdatedAt: number | null;
 }
 
 export type CreateSessionError =
   | "shutting-down"
+  | "too-few-repos"
   | "repo-required-for-mode"
   | "repo-not-found"
   | "repo-not-listed"
@@ -65,6 +71,7 @@ export type CreateSessionResult =
 export function describeCreateSessionError(err: { reason: CreateSessionError; detail?: string }): string {
   switch (err.reason) {
     case "shutting-down": return "Server is shutting down";
+    case "too-few-repos": return "Select at least two repos for a multi-repo session";
     case "repo-required-for-mode": return "This mode requires a repo to be selected";
     case "repo-not-found": return `Repo not found${err.detail ? `: ${err.detail}` : ""}`;
     case "repo-not-listed": return `Repo is not in the configured repo list${err.detail ? `: ${err.detail}` : ""}`;
@@ -144,10 +151,16 @@ function handleBridgeExit(session: Session, exitCode: number): void {
     if (!sessions.has(session.id)) return;
     if (!exists) {
       session.alive = false;
-      log.info(`[sessions] Session ${session.id} tmux session ended (code ${exitCode})`);
+      session.resumable = true;
+      // Remember the repos needed to rebuild the worktree(s) at the same path
+      // before cleanup clears worktreePath/extraWorktrees.
+      if (session.mode === "worktree-claude" && session.repo) {
+        session.resumeRepos = [session.repo];
+      } else if (session.mode === "multi-worktree-claude") {
+        session.resumeRepos = [session.repo, ...session.extraWorktrees.map((w) => w.repo)].filter(Boolean) as string[];
+      }
+      log.info(`[sessions] Session ${session.id} exited (code ${exitCode}) — worktree freed, kept for resume`);
       void cleanupSessionWorktree(session);
-      deletePersistedSession(session.id);
-      setTimeout(() => sessions.delete(session.id), 30_000);
       return;
     }
     if (isShuttingDown()) return;
@@ -182,8 +195,25 @@ function handleBridgeExit(session: Session, exitCode: number): void {
   });
 }
 
-export async function createSession(repo: string | null, mode: SessionMode): Promise<CreateSessionResult> {
+/**
+ * Build the argv passed to `claude` for a session spawn. Always disables
+ * permission prompts; appends a `--append-system-prompt` capability-awareness
+ * block ONLY when at least one capability was granted (an empty prompt would
+ * otherwise leave a dangling flag that consumes the next argv).
+ */
+function claudeShellArgs(caps: string[], extra: string[]): string[] {
+  const prompt = buildCapabilityPrompt(caps);
+  const promptArgs = prompt ? ["--append-system-prompt", prompt] : [];
+  return ["--dangerously-skip-permissions", ...promptArgs, ...extra];
+}
+
+export async function createSession(repo: string | null, mode: SessionMode, capabilities: string[] = []): Promise<CreateSessionResult> {
   if (isShuttingDown()) return { ok: false, reason: "shutting-down" };
+
+  if (mode === "multi-worktree-claude") {
+    // Multi-repo sessions must be created via createMultiWorktreeSession.
+    return { ok: false, reason: "repo-required-for-mode" };
+  }
 
   if (!repo && (mode === "worktree-claude" || mode === "repo-claude")) {
     log.warn(`[sessions] Rejected: mode=${mode} requires a repo`);
@@ -235,13 +265,14 @@ export async function createSession(repo: string | null, mode: SessionMode): Pro
 
   const tmuxName = `claws-${id}`;
   const command = mode === "repo-zsh" ? "zsh" : "claude";
-  const shellArgs = mode === "repo-zsh" ? [] : ["--dangerously-skip-permissions"];
+  const envArgs = buildCapabilityEnvArgs(capabilities);
+  const shellArgs = mode === "repo-zsh" ? [] : claudeShellArgs(capabilities, []);
 
   const createRes = await tmuxCmd([
     "new-session", "-d", "-s", tmuxName,
     "-x", "120", "-y", "40",
     "-c", cwd,
-    command, ...shellArgs,
+    ...envArgs, command, ...shellArgs,
   ]);
   if (createRes.code !== 0) {
     log.warn(`[sessions] tmux new-session failed: ${createRes.stderr.trim()}`);
@@ -278,6 +309,8 @@ export async function createSession(repo: string | null, mode: SessionMode): Pro
       repo,
       cwd,
       worktree_path: worktreePath,
+      extra_worktrees: null,
+      capabilities: JSON.stringify(capabilities),
       created_at: Date.now(),
       summary: null,
       summary_updated_at: null,
@@ -303,12 +336,16 @@ export async function createSession(repo: string | null, mode: SessionMode): Pro
     cwd,
     mode,
     worktreePath,
+    extraWorktrees: [],
+    capabilities,
     scrollback: "",
     alive: true,
     exitCode: null,
     wsConnected: false,
     bridgeSpawnedAt: Date.now(),
     respawnCount: 0,
+    resumable: false,
+    resumeRepos: [],
     summary: null,
     summaryUpdatedAt: null,
   };
@@ -317,6 +354,145 @@ export async function createSession(repo: string | null, mode: SessionMode): Pro
 
   sessions.set(id, session);
   log.info(`[sessions] Created session ${id} (cwd: ${cwd}, mode: ${mode}, tmux: ${tmuxName})`);
+  return { ok: true, session };
+}
+
+/**
+ * Launch a Claude session wired to a fresh worktree for each of `repos`.
+ * Claude runs with its cwd set to the first repo's worktree; the remaining
+ * worktrees are passed via `--add-dir` so it can read/write across all of them.
+ */
+export async function createMultiWorktreeSession(repos: string[], capabilities: string[] = []): Promise<CreateSessionResult> {
+  if (isShuttingDown()) return { ok: false, reason: "shutting-down" };
+
+  const deduped: string[] = [];
+  for (const r of repos) {
+    if (r && !deduped.includes(r)) deduped.push(r);
+  }
+  if (deduped.length < 2) return { ok: false, reason: "too-few-repos" };
+
+  const id = crypto.randomBytes(8).toString("hex");
+  const reposBase = path.join(WORK_DIR, "repos");
+  const allRepos = await listRepos().catch(() => [] as Repo[]);
+
+  // Resolve every repo up front so we don't create worktrees for a batch that
+  // contains an invalid entry.
+  const resolved: Repo[] = [];
+  for (const repo of deduped) {
+    const mainClone = path.resolve(reposBase, repo);
+    if (!mainClone.startsWith(reposBase + path.sep) || !fs.existsSync(mainClone)) {
+      log.warn(`[sessions] Rejected multi-repo session: repo path does not exist: ${repo}`);
+      return { ok: false, reason: "repo-not-found", detail: repo };
+    }
+    const repoObj = allRepos.find((r) => r.fullName === repo);
+    if (!repoObj) {
+      log.warn(`[sessions] Rejected multi-repo session: repo not in listRepos(): ${repo}`);
+      return { ok: false, reason: "repo-not-listed", detail: repo };
+    }
+    resolved.push(repoObj);
+  }
+
+  const created: Array<{ repo: string; worktreePath: string }> = [];
+  for (const repoObj of resolved) {
+    try {
+      await claude.ensureClone(repoObj);
+    } catch (err) {
+      log.warn(`[sessions] Failed to refresh ${repoObj.fullName} before multi-repo session: ${err}`);
+      await removeWorktreesByRepo(created);
+      return { ok: false, reason: "fetch-failed", detail: String(err) };
+    }
+    try {
+      const wtPath = await claude.createWorktree(repoObj, `claws-wt/${id}`, "sessions");
+      created.push({ repo: repoObj.fullName, worktreePath: wtPath });
+    } catch (err) {
+      log.warn(`[sessions] Failed to create worktree for ${repoObj.fullName}: ${err}`);
+      await removeWorktreesByRepo(created);
+      return { ok: false, reason: "worktree-failed", detail: String(err) };
+    }
+  }
+
+  const cwd = created[0].worktreePath;
+  const extraWorktrees = created.slice(1);
+  const addDirArgs = extraWorktrees.flatMap((w) => ["--add-dir", w.worktreePath]);
+
+  const tmuxName = `claws-${id}`;
+  const createRes = await tmuxCmd([
+    "new-session", "-d", "-s", tmuxName,
+    "-x", "120", "-y", "40",
+    "-c", cwd,
+    ...buildCapabilityEnvArgs(capabilities), "claude", ...claudeShellArgs(capabilities, addDirArgs),
+  ]);
+  if (createRes.code !== 0) {
+    log.warn(`[sessions] tmux new-session failed for multi-repo session: ${createRes.stderr.trim()}`);
+    await removeWorktreesByRepo(created);
+    return { ok: false, reason: "tmux-failed", detail: createRes.stderr.trim() };
+  }
+
+  const mouseRes = await tmuxCmd(["set-option", "-t", `=${tmuxName}`, "mouse", "on"]);
+  if (mouseRes.code !== 0) {
+    log.warn(`[sessions] Failed to enable tmux mouse mode for ${tmuxName}: ${mouseRes.stderr.trim()}`);
+  }
+
+  let proc: pty.IPty;
+  try {
+    proc = spawnBridge(tmuxName, cwd);
+  } catch (err) {
+    log.warn(`[sessions] Failed to attach bridge to tmux session ${tmuxName}: ${err}`);
+    await tmuxKillSession(tmuxName);
+    await removeWorktreesByRepo(created);
+    return { ok: false, reason: "bridge-failed", detail: String(err) };
+  }
+
+  try {
+    insertSession({
+      id,
+      tmux_name: tmuxName,
+      mode: "multi-worktree-claude",
+      repo: created[0].repo,
+      cwd,
+      worktree_path: created[0].worktreePath,
+      extra_worktrees: JSON.stringify(extraWorktrees),
+      capabilities: JSON.stringify(capabilities),
+      created_at: Date.now(),
+      summary: null,
+      summary_updated_at: null,
+    });
+  } catch (err) {
+    log.error(`[sessions] Failed to persist multi-repo session ${id}: ${err}`);
+    proc.kill();
+    await tmuxKillSession(tmuxName);
+    await removeWorktreesByRepo(created);
+    return { ok: false, reason: "persist-failed", detail: String(err) };
+  }
+
+  const session: Session = {
+    id,
+    pty: proc,
+    tmuxName,
+    createdAt: Date.now(),
+    lastActivity: Date.now(),
+    repo: created[0].repo,
+    cwd,
+    mode: "multi-worktree-claude",
+    worktreePath: created[0].worktreePath,
+    extraWorktrees,
+    capabilities,
+    scrollback: "",
+    alive: true,
+    exitCode: null,
+    wsConnected: false,
+    bridgeSpawnedAt: Date.now(),
+    respawnCount: 0,
+    resumable: false,
+    resumeRepos: [],
+    summary: null,
+    summaryUpdatedAt: null,
+  };
+
+  wireBridgeHandlers(session);
+
+  sessions.set(id, session);
+  log.info(`[sessions] Created multi-repo session ${id} (repos: ${created.map((c) => c.repo).join(", ")}, tmux: ${tmuxName})`);
   return { ok: true, session };
 }
 
@@ -376,6 +552,7 @@ export async function recoverSessions(): Promise<void> {
           // best effort
         }
       }
+      await removeWorktreesByRepo(parseExtraWorktrees(row.extra_worktrees));
       continue;
     }
 
@@ -396,6 +573,7 @@ export async function recoverSessions(): Promise<void> {
         const repoObj = repos.find((r) => r.fullName === row.repo);
         if (repoObj) await claude.removeWorktree(repoObj, row.worktree_path).catch(() => {});
       }
+      await removeWorktreesByRepo(parseExtraWorktrees(row.extra_worktrees));
       continue;
     }
 
@@ -409,12 +587,16 @@ export async function recoverSessions(): Promise<void> {
       cwd: row.cwd,
       mode: row.mode as SessionMode,
       worktreePath: row.worktree_path,
+      extraWorktrees: parseExtraWorktrees(row.extra_worktrees),
+      capabilities: parseCapabilities(row.capabilities),
       scrollback: captured.slice(-SCROLLBACK_LIMIT),
       alive: true,
       exitCode: null,
       wsConnected: false,
       bridgeSpawnedAt: Date.now(),
       respawnCount: 0,
+      resumable: false,
+      resumeRepos: [],
       summary: row.summary,
       summaryUpdatedAt: row.summary_updated_at,
     };
@@ -427,7 +609,42 @@ export async function recoverSessions(): Promise<void> {
   await reapOrphanTmuxSessions(knownNames, tmuxAlive);
 }
 
+function parseExtraWorktrees(raw: string | null): Array<{ repo: string; worktreePath: string }> {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function parseCapabilities(raw: string | null): string[] {
+  if (!raw) return [];
+  try {
+    const v = JSON.parse(raw);
+    return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+async function removeWorktreesByRepo(
+  items: Array<{ repo: string; worktreePath: string }>,
+): Promise<void> {
+  if (items.length === 0) return;
+  const repos = await listRepos().catch(() => [] as Repo[]);
+  for (const it of items) {
+    const repoObj = repos.find((r) => r.fullName === it.repo);
+    if (repoObj) await claude.removeWorktree(repoObj, it.worktreePath).catch(() => {});
+  }
+}
+
 async function cleanupSessionWorktree(session: Session): Promise<void> {
+  if (session.extraWorktrees.length > 0) {
+    await removeWorktreesByRepo(session.extraWorktrees);
+    session.extraWorktrees = [];
+  }
   if (!session.worktreePath || !session.repo) return;
   const worktreePath = session.worktreePath;
   session.worktreePath = null;
@@ -455,6 +672,7 @@ export function listSessions(): Array<{
   cwd: string;
   createdAt: number;
   alive: boolean;
+  resumable: boolean;
   wsConnected: boolean;
   summary: string | null;
   summaryUpdatedAt: number | null;
@@ -465,6 +683,7 @@ export function listSessions(): Array<{
     cwd: s.cwd,
     createdAt: s.createdAt,
     alive: s.alive,
+    resumable: s.resumable,
     wsConnected: s.wsConnected,
     summary: s.summary,
     summaryUpdatedAt: s.summaryUpdatedAt,
@@ -483,28 +702,94 @@ export function killSession(id: string): boolean {
   return true;
 }
 
-const SUMMARY_INTERVAL_MS = 90_000;
+export async function resumeSession(id: string): Promise<CreateSessionResult> {
+  if (isShuttingDown()) return { ok: false, reason: "shutting-down" };
+  const session = sessions.get(id);
+  if (!session) return { ok: false, reason: "repo-not-found", detail: id };
+  if (session.alive) return { ok: true, session }; // already running
+
+  // Recreate worktree(s) at the SAME path so `claude --continue` finds the
+  // path-keyed conversation history. The worktree is rebuilt fresh from the
+  // default branch — uncommitted work from the old session is gone (acceptable;
+  // important work is pushed as a branch). History lives in ~/.claude, not the
+  // worktree, so it survives.
+  if (session.mode === "worktree-claude" || session.mode === "multi-worktree-claude") {
+    const allRepos = await listRepos().catch(() => [] as Repo[]);
+    const rebuilt: Array<{ repo: string; worktreePath: string }> = [];
+    for (const repoName of session.resumeRepos) {
+      const repoObj = allRepos.find((r) => r.fullName === repoName);
+      if (!repoObj) return { ok: false, reason: "repo-not-listed", detail: repoName };
+      try {
+        const wt = await claude.createWorktree(repoObj, `claws-wt/${id}`, "sessions");
+        rebuilt.push({ repo: repoName, worktreePath: wt });
+      } catch (err) {
+        return { ok: false, reason: "worktree-failed", detail: String(err) };
+      }
+    }
+    if (rebuilt.length === 0) return { ok: false, reason: "worktree-failed", detail: "no repos to rebuild" };
+    session.cwd = rebuilt[0].worktreePath;       // identical to original cwd
+    session.worktreePath = rebuilt[0].worktreePath;
+    session.extraWorktrees = rebuilt.slice(1);
+  } else if (!fs.existsSync(session.cwd)) {
+    log.warn(`[sessions] Cannot resume ${id}: cwd no longer exists: ${session.cwd}`);
+    return { ok: false, reason: "repo-not-found", detail: session.cwd };
+  }
+
+  const command = session.mode === "repo-zsh" ? "zsh" : "claude";
+  const addDirArgs = session.extraWorktrees.flatMap((w) => ["--add-dir", w.worktreePath]);
+  const envArgs = buildCapabilityEnvArgs(session.capabilities);
+  const shellArgs = session.mode === "repo-zsh"
+    ? []
+    : claudeShellArgs(session.capabilities, ["--continue", ...addDirArgs]);
+
+  const createRes = await tmuxCmd([
+    "new-session", "-d", "-s", session.tmuxName,
+    "-x", "120", "-y", "40", "-c", session.cwd,
+    ...envArgs, command, ...shellArgs,
+  ]);
+  if (createRes.code !== 0) {
+    log.warn(`[sessions] tmux new-session failed on resume: ${createRes.stderr.trim()}`);
+    return { ok: false, reason: "tmux-failed", detail: createRes.stderr.trim() };
+  }
+  await tmuxCmd(["set-option", "-t", `=${session.tmuxName}`, "mouse", "on"]);
+
+  let proc: pty.IPty;
+  try {
+    proc = spawnBridge(session.tmuxName, session.cwd);
+  } catch (err) {
+    await tmuxKillSession(session.tmuxName);
+    return { ok: false, reason: "bridge-failed", detail: String(err) };
+  }
+
+  session.pty = proc;
+  session.alive = true;
+  session.resumable = false;
+  session.exitCode = null;
+  session.scrollback = "";
+  session.respawnCount = 0;
+  session.bridgeSpawnedAt = Date.now();
+  session.lastActivity = Date.now();
+  wireBridgeHandlers(session);
+  log.info(`[sessions] Resumed session ${id} (cwd: ${session.cwd}, mode: ${session.mode})`);
+  return { ok: true, session };
+}
+
+const SUMMARY_INTERVAL_MS = 30_000;
 const inFlightSummaries = new Set<string>();
 
-async function summarizeSession(session: Session): Promise<void> {
+export async function summarizeSession(session: Session): Promise<void> {
   if (isShuttingDown()) return;
   if (!session.alive) return;
+  if (session.summary) return;
   if (inFlightSummaries.has(session.id)) return;
-  if (Date.now() - (session.summaryUpdatedAt ?? 0) < SUMMARY_INTERVAL_MS - 5_000) return;
-  if (session.summaryUpdatedAt !== null && session.lastActivity <= session.summaryUpdatedAt) return;
   if (!session.scrollback) return;
+
+  const clean = stripVTControlCharacters(session.scrollback);
+  const trimmed = clean.slice(-12000);
+  if (trimmed.trim().length < 80) return;
 
   inFlightSummaries.add(session.id);
   try {
-    const clean = stripVTControlCharacters(session.scrollback);
-    const trimmed = clean.slice(-12000);
-    if (trimmed.trim().length < 80) {
-      session.summary = "Starting…";
-      session.summaryUpdatedAt = Date.now();
-      updateSessionSummary(session.id, session.summary, session.summaryUpdatedAt);
-      return;
-    }
-
     const prompt = `Summarise what the user is currently doing in this interactive terminal session in <=10 words. Be specific: name the file, command, repo, PR/issue number, or task if visible in the output. Avoid generic phrases like "working on code" or "running commands". If the session is sitting at a shell prompt with no recent activity, reply "Idle at shell prompt". If the most recent activity is a Claude/agent session, summarise the agent's current task, not the literal CLI invocation.
 
 Reply with just the summary text. No quotes, no trailing punctuation, no preamble.
@@ -523,6 +808,7 @@ ${trimmed}
 
     const raw = await claude.runClaude(prompt, os.homedir(), {
       capability: "text-only",
+      provider: "claude",
       tier: "sonnet",
       timeoutMs: 60_000,
       agent: "plan",
@@ -553,7 +839,7 @@ setInterval(() => {
 // Periodically reap sessions whose tmux has died (bridge gave up respawning).
 setInterval(() => {
   for (const [id, session] of sessions) {
-    if (!session.alive) {
+    if (!session.alive && !session.resumable) {
       killSession(id);
     }
   }

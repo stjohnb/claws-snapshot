@@ -18,6 +18,10 @@ TypeScript on Node.js, ESM modules. Relative imports must use the `.js` suffix (
   - `retryWithBackoff` — `src/retry.ts`
   - `sleep` — `src/util.ts`
   - `ensureAlertIssue` — `src/occurrence-tracking.ts`
+  - `findIssueByExactTitle` — `src/github.ts` (exact-title issue lookup; use instead of `searchIssues().find(r => r.title === title)` — GitHub search is substring-based and this helper narrows to an exact match)
+  - `trackTaskTokens` — `src/db.ts` (canonical `onTokensUsed` callback factory for all agent call sites; accumulates across multiple `runClaude` calls)
+  - `renderViolationTable` — `src/jobs/scanner-runner.ts` (shared Markdown table builder for scanner violation reports)
+  - `formatGuardedTitleList` — `src/prompt-guard.ts` (build a guarded bullet list of GitHub-supplied issue/PR titles; used by prompt builders that embed open issue/PR titles)
 - All GitHub API access goes through `src/github.ts`. Never use raw `fetch` to `api.github.com`.
 - All `gh`/`git` subprocesses must inherit the env from `buildEnvForGh`/`buildEnvForGhGit` in `src/github-app.ts` for installation-token auth.
 - When adding a new job, register it in `main.ts` and consider adding it to `triggers` chains.

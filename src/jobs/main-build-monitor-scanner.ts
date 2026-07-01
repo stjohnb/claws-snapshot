@@ -1,8 +1,6 @@
-import fs from "node:fs";
-import path from "node:path";
 import { LABELS, type Repo } from "../config.js";
-import { runRepoScanner, type ScannerSpec } from "./scanner-runner.js";
-import { listWorkflowFiles, parseWorkflow, type ParsedWorkflow } from "./workflow-parser.js";
+import { runRepoScanner, RECURRENCE_TRACKING_SNIPPET_LINES, type ScannerSpec } from "./scanner-runner.js";
+import { listParsedWorkflows, type ParsedWorkflow, type ParsedWorkflowFile } from "./workflow-parser.js";
 
 interface MainBuildWorkflow {
   filename: string;
@@ -45,17 +43,11 @@ interface ScanResult {
   monitoredWorkflowNames: Set<string>;
 }
 
-function scanRepo(workflowsDir: string, files: string[]): ScanResult {
-  const parsed = files.map((filename) => {
-    const filePath = path.join(workflowsDir, filename);
-    const content = fs.readFileSync(filePath, "utf-8");
-    return { filename, content, workflow: parseWorkflow(content) };
-  });
-
+function scanRepo(parsed: ParsedWorkflowFile[]): ScanResult {
   const mainBuildWorkflows: MainBuildWorkflow[] = [];
-  for (const { filename, workflow } of parsed) {
+  for (const { file, workflow } of parsed) {
     if (triggersOnMainPush(workflow) || triggersOnSchedule(workflow)) {
-      mainBuildWorkflows.push({ filename, name: workflow.getName() ?? filename });
+      mainBuildWorkflows.push({ filename: file, name: workflow.getName() ?? file });
     }
   }
 
@@ -119,27 +111,7 @@ function formatIssueBody(
       "          RUN_URL: ${{ github.event.workflow_run.html_url }}",
       "          REPO: ${{ github.repository }}",
       "        run: |",
-      "          # On recurrence: edit issue body to bump Occurrences/Last seen instead of commenting.",
-      "          set -euo pipefail",
-      "          TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-      '          TITLE="Build failure: ${WORKFLOW_NAME}"',
-      "          existing=$(gh issue list --repo \"$REPO\" --state open \\",
-      "            --search \"\\\"${TITLE}\\\" in:title\" --json number --jq '.[0].number // empty')",
-      "          if [ -n \"$existing\" ]; then",
-      "            body=$(gh issue view \"$existing\" --repo \"$REPO\" --json body --jq .body)",
-      "            if printf '%s' \"$body\" | grep -q '^\\*\\*First seen:\\*\\*'; then",
-      "              new_body=$(printf '%s' \"$body\" | awk -v ts=\"$TS\" '",
-      "                /^\\*\\*Last seen:\\*\\*/ { print \"**Last seen:** \" ts; next }",
-      "                /^\\*\\*Occurrences:\\*\\* / { print \"**Occurrences:** \" ($2 + 1); next }",
-      "                { print }')",
-      "            else",
-      "              new_body=\"${body}\"$'\\n\\n---\\n**First seen:** '\"${TS}\"$'\\n**Last seen:** '\"${TS}\"$'\\n**Occurrences:** 2'",
-      "            fi",
-      "            gh issue edit \"$existing\" --repo \"$REPO\" --body \"$new_body\"",
-      "          else",
-      "            body=$'Workflow **'\"${WORKFLOW_NAME}\"$'** failed on `main`: '\"${RUN_URL}\"$'\\n\\n---\\n**First seen:** '\"${TS}\"$'\\n**Last seen:** '\"${TS}\"$'\\n**Occurrences:** 1'",
-      "            gh issue create --repo \"$REPO\" --title \"$TITLE\" --body \"$body\" --label bug",
-      "          fi",
+      ...RECURRENCE_TRACKING_SNIPPET_LINES,
       "```",
       "",
       "> Keep `notify-failures.yml` itself out of the `workflows:` list to avoid it triggering on its own runs.",
@@ -155,10 +127,10 @@ function formatIssueBody(
 }
 
 function scan(repoDir: string, repo: Repo): { body: string; summary?: string } | null {
-  const wf = listWorkflowFiles(repoDir);
-  if (!wf) return null;
+  const parsed = listParsedWorkflows(repoDir);
+  if (!parsed) return null;
 
-  const { mainBuildWorkflows, hasMonitorWorkflow, monitoredWorkflowNames } = scanRepo(wf.dir, wf.files);
+  const { mainBuildWorkflows, hasMonitorWorkflow, monitoredWorkflowNames } = scanRepo(parsed);
 
   if (mainBuildWorkflows.length === 0) return null;
 

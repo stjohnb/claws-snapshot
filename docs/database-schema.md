@@ -261,6 +261,8 @@ and deletes rows whose tmux session is gone).
 | `repo` | TEXT | nullable | Full repo name (present for repo-scoped modes) |
 | `cwd` | TEXT | NOT NULL | Working directory path |
 | `worktree_path` | TEXT | nullable | Worktree path for `worktree-claude` sessions |
+| `extra_worktrees` | TEXT | nullable | JSON array of additional `{ repo, worktreePath }` for `multi-worktree-claude` sessions |
+| `capabilities` | TEXT | nullable | JSON array of selected capability IDs (e.g. `["home-assistant","namey-db"]`); used by `resumeSession` to re-apply env gating and the `--append-system-prompt` capability awareness block |
 | `created_at` | INTEGER | NOT NULL | Unix timestamp (ms) when the session was created |
 
 No indexes; row count is small (max 5 sessions at a time). No pruning —
@@ -272,7 +274,7 @@ Stores connectivity verification results written by `runConnectivityVerification
 Each row holds a JSON `payload` with per-check pass/fail results (database,
 GitHub App, CLIs — `gh`, `claude`, `codex`, `opencode` — OpenRouter, Slack
 webhook DNS, IMAP login/logout, per-runner SSH, datasette SSH, Ollama, namey
-PostgreSQL, Kwyjibo, WhatsApp auth). Each check is wrapped in a 30 s timeout.
+PostgreSQL, WhatsApp auth). Each check is wrapped in a 30 s timeout.
 Used by the `/verify` dashboard page and the `GET /api/activation` endpoint.
 
 | Column | Type | Constraints | Description |

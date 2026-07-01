@@ -23,7 +23,6 @@ export const SENSITIVE_ENV_KEYS = [
   "CLAWS_OPENROUTER_API_KEY", "OPENROUTER_API_KEY",
   "CLAWS_AUTH_TOKEN",
   "CLAWS_SLACK_BOT_TOKEN", "CLAWS_SLACK_WEBHOOK_URL",
-  "KWYJIBO_AUTOMATION_API_KEY",
   "BRENDAN_SERVER_GMAIL_APP_PASSWORD",
 ] as const;
 
@@ -51,7 +50,7 @@ export function datestamp(): string {
 
 // ── Git helpers ──
 
-const GIT_TRANSIENT_RE = /\b(500|502|503|504|ETIMEDOUT|ECONNRESET|ECONNREFUSED|connection reset)\b|TLS handshake timeout|Could not resolve host|The requested URL returned error: 5\d\d|i\/o timeout/i;
+const GIT_TRANSIENT_RE = /\b(500|502|503|504|ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAGAIN|connection reset)\b|TLS handshake timeout|Could not resolve host|The requested URL returned error: 5\d\d|i\/o timeout|failed to create new OS thread|resource temporarily unavailable/i;
 const GIT_MAX_RETRIES = 2;
 
 async function resolveEnvForGit(owner?: string): Promise<NodeJS.ProcessEnv | undefined> {

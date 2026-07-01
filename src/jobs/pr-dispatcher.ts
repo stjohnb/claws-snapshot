@@ -25,14 +25,7 @@ export async function run(repos: Repo[]): Promise<void> {
         for (const pr of prs) {
           if (!pr.labels.some((l) => l.name === LABELS.problematic)) continue;
           populated.add(pr.number);
-          gh.populateQueueCache("problematic", repo.fullName, {
-            number: pr.number,
-            title: pr.title,
-            type: "pr",
-            updatedAt: pr.updatedAt,
-            priority: gh.hasPriorityLabel(pr.labels),
-            labels: pr.labels.map((l) => l.name),
-          });
+          gh.populateQueueCacheFor("problematic", repo.fullName, pr, "pr");
           if (gh.isDispatchSkippable(repo.fullName, pr)) continue;
           if (ciFixerDisabled) continue;
           worker.enqueue(AGENT_KINDS.CI_FIXER_PROBLEMATIC, repo.fullName, pr.number, {
@@ -108,14 +101,7 @@ export async function run(repos: Repo[]): Promise<void> {
             if (await gh.getPRMergeableState(repo.fullName, pr.number) === "CONFLICTING") continue;
 
             populated.add(pr.number);
-            gh.populateQueueCache("needs-review-addressing", repo.fullName, {
-              number: pr.number,
-              title: pr.title,
-              type: "pr",
-              updatedAt: pr.updatedAt,
-              priority: gh.hasPriorityLabel(pr.labels),
-              labels: pr.labels.map((l) => l.name),
-            });
+            gh.populateQueueCacheFor("needs-review-addressing", repo.fullName, pr, "pr");
             await gh.removeLabel(repo.fullName, pr.number, LABELS.ready);
             reviewAddresserPRNumbers.add(pr.number);
             worker.enqueue(AGENT_KINDS.REVIEW_ADDRESSER, repo.fullName, pr.number, {
@@ -159,14 +145,7 @@ export async function run(repos: Repo[]): Promise<void> {
           if (reviewAddresserPRNumbers.has(pr.number)) continue;
           if (!pr.labels.some((l) => l.name === LABELS.ready)) continue;
           populated.add(pr.number);
-          gh.populateQueueCache("ready", repo.fullName, {
-            number: pr.number,
-            title: pr.title,
-            type: "pr",
-            updatedAt: pr.updatedAt,
-            priority: gh.hasPriorityLabel(pr.labels),
-            labels: pr.labels.map((l) => l.name),
-          });
+          gh.populateQueueCacheFor("ready", repo.fullName, pr, "pr");
         }
 
         if (!isRateLimited()) {

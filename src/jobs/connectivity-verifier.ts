@@ -9,6 +9,7 @@ import * as config from "../config.js";
 import * as log from "../log.js";
 import { healthCheck, insertVerificationReport, getLatestVerificationReport } from "../db.js";
 import { ensureGitHubAppConfigured, getAnyInstallationToken, isGitHubAppEnabled } from "../github-app.js";
+import { resolveIdentityFile } from "../util.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -153,10 +154,7 @@ async function checkSshHost(label: string, user: string | undefined, host: strin
     "-o", "StrictHostKeyChecking=yes",
   ];
   if (identityFile) {
-    const expanded = identityFile.startsWith("~")
-      ? path.join(process.env.HOME ?? "", identityFile.slice(1))
-      : identityFile;
-    args.push("-i", expanded);
+    args.push("-i", resolveIdentityFile(identityFile));
   }
   if (port) args.push("-p", String(port));
   args.push(`${user ?? "root"}@${host}`, "true");
@@ -189,16 +187,6 @@ async function checkNameyDb(): Promise<{ ok: boolean; detail?: string }> {
     try { await client.end(); } catch { /* best effort */ }
     return { ok: false, detail: err instanceof Error ? err.message : String(err) };
   }
-}
-
-async function checkKwyjibo(): Promise<{ ok: boolean; detail?: string }> {
-  if (!config.KWYJIBO_BASE_URL) return { ok: false, detail: "KWYJIBO_BASE_URL not set" };
-  const res = await fetch(config.KWYJIBO_BASE_URL.replace(/\/$/, ""), {
-    method: "HEAD",
-    signal: AbortSignal.timeout(15_000),
-  });
-  if (!res.ok && res.status !== 405) return { ok: false, detail: `HTTP ${res.status}` };
-  return { ok: true, detail: `HTTP ${res.status}` };
 }
 
 async function checkWhatsAppAuth(): Promise<{ ok: boolean; detail?: string }> {
@@ -253,7 +241,6 @@ export async function runConnectivityVerification(): Promise<VerificationReport>
     ...sshChecks,
     timed("ollama", checkOllama),
     timed("namey-db", checkNameyDb),
-    timed("kwyjibo", checkKwyjibo),
     timed("whatsapp-auth", checkWhatsAppAuth),
     timed("home-assistant", checkHomeAssistant),
   ]);
