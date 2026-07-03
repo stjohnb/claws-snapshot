@@ -18,7 +18,7 @@
     "@modelcontextprotocol/sdk": "^1.29.0",
     "baileys": "^7.0.0-rc13",
     "better-sqlite3": "^12",
-    "hono": "^4.12.24",
+    "hono": "^4.12.27",
     "imapflow": "^1.4.3",
     "mailparser": "^3.9.11",
     "node-pty": "^1.0.0",
