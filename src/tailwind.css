@@ -1,0 +1,28 @@
+/*
+ * Tailwind CSS input. Compiled by `npm run build:css` into
+ * src/resources/tailwind-css.generated.ts and served at /static/tailwind.css.
+ * Run after changing markup so new utility classes are picked up.
+ */
+
+@import "tailwindcss";
+
+@source "./pages/**/*.ts";
+
+@custom-variant dark (
+  &:where([data-theme="dark"], [data-theme="dark"] *),
+  @media (prefers-color-scheme: dark) { &:where(:not([data-theme="light"] *):not([data-theme="light"])) }
+);
+
+@theme {
+  --color-bg: var(--bg);
+  --color-bg-secondary: var(--bg-secondary);
+  --color-text: var(--text);
+  --color-text-secondary: var(--text-secondary);
+  --color-text-subtle: var(--text-subtle);
+  --color-accent: var(--accent);
+  --color-border: var(--border);
+  --color-border-hover: var(--border-hover);
+  --color-success: var(--success);
+  --color-danger: var(--danger);
+  --color-warning: var(--warning);
+}

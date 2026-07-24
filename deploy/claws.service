@@ -1,0 +1,24 @@
+[Unit]
+Description=Claws - GitHub Automation Service
+After=network.target
+
+[Service]
+Type=simple
+User=brendan
+Group=brendan
+WorkingDirectory=/opt/claws
+EnvironmentFile=-/home/brendan/.claws/env
+ExecStart=/usr/bin/node /opt/claws/dist/main.js
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=330
+KillMode=process
+MemoryHigh=2.5G
+MemoryMax=3G
+TasksMax=800
+CPUWeight=80
+OOMScoreAdjust=200
+
+[Install]
+WantedBy=multi-user.target
