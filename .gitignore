@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.env
+config.json
+.mcp-claws.json
+*.log
+prompts-*.jsonl
+__pycache__/
