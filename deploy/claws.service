@@ -1,0 +1,25 @@
+[Unit]
+Description=Claws - GitHub Automation Service
+After=network.target
+
+[Service]
+Type=simple
+User=brendan
+Group=brendan
+WorkingDirectory=/opt/claws
+EnvironmentFile=-/home/brendan/.claws/env
+ExecStart=/usr/bin/node /opt/claws/dist/main.js
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=330
+KillMode=process
+# Headroom for a session-granted Playwright Chromium tree (issue #2510); the tmux server and its children share this cgroup.
+MemoryHigh=4G
+MemoryMax=5G
+TasksMax=800
+CPUWeight=80
+OOMScoreAdjust=200
+
+[Install]
+WantedBy=multi-user.target

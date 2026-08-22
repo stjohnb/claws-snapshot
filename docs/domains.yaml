@@ -1,0 +1,17 @@
+# Every domain the org owns. Checked daily by the domain-posture-scanner job
+# (src/jobs/domain-posture-scanner.ts, docs/jobs/domain-posture-scanner.md).
+#   domain  — registrable domain (required)
+#   project — owning project, for the alert issue body (required)
+#   web     — hostnames to probe over HTTPS/HTTP; omit or [] to skip web checks
+#   ignore  — check ids to suppress for this domain, e.g. [caa-missing]
+domains:
+  - domain: namey.baby
+    project: namey
+    web: [namey.baby, www.namey.baby]
+  - domain: bonkus.io
+    project: bonkus
+    web: [bonkus.io, www.bonkus.io]
+  - domain: bstjohn.net
+    project: homelab / shared infrastructure
+  - domain: perudo.net
+    project: perudo

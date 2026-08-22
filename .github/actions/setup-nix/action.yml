@@ -1,0 +1,24 @@
+---
+name: Set up Nix
+description: >-
+  Put the self-hosted runner's Nix on PATH, failing loudly if the runner has
+  no Nix at all. Same action nixos-config carries — the org's runners are
+  NixOS (or Ubuntu-with-nix during the beefy-actions transition), and every
+  CI dependency beyond nix itself comes from this repo's flake.nix via
+  `nix develop`, not from the runner.
+
+runs:
+  using: composite
+  steps:
+    - name: Put Nix on PATH
+      shell: bash
+      run: |
+        if [ -x /nix/var/nix/profiles/default/bin/nix ]; then
+          echo "/nix/var/nix/profiles/default/bin" >> "$GITHUB_PATH"
+        elif command -v nix >/dev/null 2>&1; then
+          echo "nix already on PATH: $(command -v nix)"
+        else
+          echo "::error::Nix is not installed on this runner."
+          echo "Install it, or label a Nix-capable runner and target that label."
+          exit 1
+        fi
