@@ -1,0 +1,271 @@
+name: Release
+
+# Triggers removed for the public snapshot — this workflow is intentionally disabled.
+# See the private source repository for the active version.
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+# Toolchain comes from this repo's flake.nix via `nix develop` — same policy
+# as ci.yml: the runners are self-hosted NixOS boxes that provide only nix,
+# git and docker, and each repo brings its own CI dependencies, isolated in
+# the nix store. Every node/npm step below MUST be prefixed with
+# `nix $NIX_FLAGS develop --command`; a bare `npm ci` dies with
+# `npm: command not found` / exit 127 on a NixOS runner (issue #2343).
+# No actions/setup-node, no sudo/apt-get on the runner itself. The `apt-get`
+# further down runs INSIDE the Debian container image, which is a normal
+# Debian userland and the intended place to install the node-gyp toolchain
+# (python3/make/g++) that `better-sqlite3` and `node-pty` need to build.
+#
+# The devShell remains the only source of node/npm for the TypeScript build
+# (`npm run build`), but `node_modules` for the release tarball is built
+# inside a `node:<major>-bookworm-slim` Docker container instead: nixpkgs-
+# unstable's glibc 2.42 makes node-pty's native `pty.node` require
+# `cfsetospeed@GLIBC_2.42`, which the non-nix Ubuntu deploy host cannot
+# resolve (issue #2348, release v2026-08-05.5 crash-looped and was rolled
+# back). Building `node_modules` under Debian bookworm's older glibc keeps
+# the shipped native modules loadable on the deploy host.
+#
+# The container steps stream files in over stdin (tar) and copy results out
+# with `docker cp` — NEVER `docker run -v "$PWD":...`. The workspace lives on
+# a bind mount private to the runner unit's mount namespace, so the docker
+# daemon resolves that path in its own namespace and mounts an EMPTY
+# directory (run 31051681679; same failure class as bin-scraper#250).
+# `docker cp` to the host extracts client-side, so results come back owned
+# by the runner user with no chown needed.
+env:
+  NIX_FLAGS: --extra-experimental-features nix-command --extra-experimental-features flakes
+
+jobs:
+  release:
+    runs-on: [self-hosted, linux, x64]
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-tags: true
+          fetch-depth: 0
+      - name: Set up Nix
+        uses: ./.github/actions/setup-nix
+      - name: Check docker is available
+        run: |
+          command -v docker >/dev/null 2>&1 || {
+            echo "::error::docker is not available on this runner. The release tarball's native modules must be built in a Debian container; ask for docker via St-John-Software/nixos-config."
+            exit 1
+          }
+      - name: Compute version tag
+        id: version
+        run: |
+          today=$(date -u +%Y-%m-%d)
+          last=$(git tag --list "v${today}.*" --sort=-v:refname | head -n1)
+          if [ -z "$last" ]; then
+            v=1
+          else
+            v=$(( ${last##*.} + 1 ))
+          fi
+          echo "tag=v${today}.${v}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve build Node major version
+        id: node
+        run: |
+          major=$(nix $NIX_FLAGS develop --command node -p "process.versions.node.split('.')[0]")
+          echo "major=$major" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$major" > .node-version
+
+      - name: Install dependencies (portable native modules)
+        env:
+          IMAGE: node:${{ steps.node.outputs.major }}-bookworm-slim
+        run: |
+          CN="claws-release-ci-${{ github.run_id }}"
+          docker rm -f "$CN" >/dev/null 2>&1 || true
+          tar -cf - package.json package-lock.json .npmrc | docker run -i --name "$CN" \
+            -e npm_config_cache=/tmp/.npm \
+            "$IMAGE" bash -euo pipefail -c '
+              mkdir -p /src && tar -xf - -C /src && cd /src
+              apt_ok=0
+              for i in 1 2 3; do
+                if apt-get -o Acquire::Retries=3 update \
+                  && apt-get install -y --no-install-recommends python3 make g++ ca-certificates; then
+                  apt_ok=1; break
+                fi
+                echo "apt attempt $i failed (Debian mirror unreachable?), retrying after 15s"
+                apt-get clean
+                rm -rf /var/lib/apt/lists/*
+                sleep 15
+              done
+              [ "$apt_ok" = 1 ] || { echo "::error::apt-get could not install the native-module build toolchain (python3 make g++ ca-certificates) after 3 attempts — deb.debian.org was unreachable from the release container."; exit 1; }
+              ok=0
+              for i in 1 2 3; do
+                if npm ci; then ok=1; break; fi
+                echo "npm ci attempt $i failed, retrying after 3s" >&2
+                rm -rf node_modules
+                sleep 3
+              done
+              [ "$ok" = 1 ] || { echo "npm ci failed after 3 attempts" >&2; exit 1; }
+            ' || { s=$?; docker rm -f "$CN" >/dev/null 2>&1; exit "$s"; }
+          rm -rf node_modules
+          docker cp "$CN":/src/node_modules ./node_modules
+          docker rm "$CN" >/dev/null
+      - name: Inject version into build
+        run: echo 'export const VERSION = "${{ steps.version.outputs.tag }}";' > src/version.ts
+      - run: nix $NIX_FLAGS develop --command npm run build
+
+      - name: Prune dev dependencies
+        env:
+          IMAGE: node:${{ steps.node.outputs.major }}-bookworm-slim
+        run: |
+          CN="claws-release-prune-${{ github.run_id }}"
+          docker rm -f "$CN" >/dev/null 2>&1 || true
+          tar -cf - package.json package-lock.json .npmrc node_modules | docker run -i --name "$CN" \
+            -e npm_config_cache=/tmp/.npm \
+            "$IMAGE" bash -euo pipefail -c '
+              mkdir -p /src && tar -xf - -C /src && cd /src
+              npm prune --omit=dev
+            ' || { s=$?; docker rm -f "$CN" >/dev/null 2>&1; exit "$s"; }
+          rm -rf node_modules
+          docker cp "$CN":/src/node_modules ./node_modules
+          docker rm "$CN" >/dev/null
+
+      - name: Verify packaged native modules are host-portable
+        env:
+          IMAGE: node:${{ steps.node.outputs.major }}-bookworm-slim
+        run: |
+          if grep -rl --include='*.node' -e '/nix/store' node_modules; then
+            echo "::error::A packaged .node references /nix/store — it was compiled in the nix devShell and will not load on the non-nix deploy host (issue #2348)."
+            exit 1
+          fi
+          tar -cf - node_modules | docker run -i --rm "$IMAGE" bash -euo pipefail -c '
+            mkdir -p /src && tar -xf - -C /src && cd /src
+            node -e "require(\"node-pty\"); require(\"better-sqlite3\"); require(\"sharp\"); console.log(\"native modules load OK under plain glibc\")"
+          '
+
+      - name: Create release tarball
+        run: |
+          rm -rf deploy/skills
+          if [ -d .skills ]; then
+            cp -r .skills deploy/skills
+          elif [ -d .claude/skills ]; then
+            cp -r .claude/skills deploy/skills
+          fi
+          # Normalise owner/mode: deploy.sh extracts as root, so tar would otherwise
+          # restore the runner's uid/gid/mode verbatim onto the host (issue #2407).
+          tar --owner=0 --group=0 --numeric-owner --mode='u+rwX,go+rX' \
+            -czf claws.tar.gz dist/ deploy/ node_modules/ .node-version
+
+      - name: Push tag
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          git tag "$TAG"
+          git push origin "$TAG"
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${{ steps.version.outputs.tag }}$" | head -n1)
+          if [ -z "$PREV_TAG" ]; then
+            echo "body=Initial release" >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "body<<RELEASE_EOF"
+              git log --oneline --no-merges "$PREV_TAG"..HEAD | head -20
+              echo "RELEASE_EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          body: ${{ steps.notes.outputs.body }}
+          files: claws.tar.gz
+
+  docker:
+    needs: release
+    runs-on: [self-hosted, linux, x64]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+      - name: Validate prerequisites
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_INFRA_VERSION_BUMP }}
+        run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::FLEET_INFRA_VERSION_BUMP secret is not available to this workflow run"
+            exit 1
+          fi
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Compute image repo (lowercase)
+        id: repo
+        run: echo "name=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+      # Do NOT add `cache-to: type=gha` / `cache-from: type=gha` here.
+      # The gha BuildKit cache leaked 6+ GB into the org-shared 2 GB Actions
+      # storage quota (issues #1698, #1717). Releases are infrequent; rebuilding
+      # layers from the registry each time is the intended trade-off.
+      # docker/build-push-action auto-uploads a `.dockerbuild` build record as a
+      # workflow artifact on every run (default 90-day retention). With a release
+      # per push to main these accumulated to 280 artifacts / 15+ MB against the
+      # org-shared 2 GB Actions-storage quota (issue #1750). We don't consume the
+      # build record, so disable the upload.
+      # Docker Hub intermittently 500s when BuildKit resolves base-image
+      # metadata (#1966). One retry absorbs the blip rather than losing the
+      # image for an already-tagged release.
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v7
+        continue-on-error: true
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ steps.repo.outputs.name }}:${{ needs.release.outputs.tag }}
+            ghcr.io/${{ steps.repo.outputs.name }}:latest
+
+      - name: Build and push image (retry)
+        id: build-retry
+        if: steps.build.outcome == 'failure'
+        uses: docker/build-push-action@v7
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ steps.repo.outputs.name }}:${{ needs.release.outputs.tag }}
+            ghcr.io/${{ steps.repo.outputs.name }}:latest
+
+      - name: Set up Nix
+        if: steps.build.outcome == 'success' || steps.build-retry.outcome == 'success'
+        uses: ./.github/actions/setup-nix
+
+      - name: Dispatch fleet-infra claws-staging bump
+        if: steps.build.outcome == 'success' || steps.build-retry.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_INFRA_VERSION_BUMP }}
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          nix $NIX_FLAGS develop .#scripts --command bash -euo pipefail -c '
+            gh workflow run update-claws-staging.yml \
+              --repo St-John-Software/fleet-infra \
+              --ref main \
+              --field tag="$TAG"
+            echo "Dispatched fleet-infra update-claws-staging.yml with tag=$TAG"
+          '

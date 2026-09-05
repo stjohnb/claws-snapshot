@@ -1,0 +1,33 @@
+name: CI
+
+# Triggers removed for the public snapshot — this workflow is intentionally disabled.
+# See the private source repository for the active version.
+on:
+  workflow_dispatch:
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# The org's CI runs on self-hosted NixOS runners, and every toolchain this
+# workflow needs — node, and the C toolchain for the native modules
+# (better-sqlite3, node-pty) — comes from this repo's own flake.nix via
+# `nix develop`, isolated in the nix store from whatever other repos put on
+# the same runners. Do NOT add actions/setup-node, sudo/apt-get, or ask for
+# packages on the runner itself; add tools to flake.nix instead.
+env:
+  # Don't rely on the runner's nix.conf having flakes turned on.
+  NIX_FLAGS: --extra-experimental-features nix-command --extra-experimental-features flakes
+
+jobs:
+  build:
+    runs-on: [self-hosted, linux]
+    # 20, not 10: the first run after a flake.lock bump downloads the node/gcc
+    # closure into the runner's nix store. Warm runs are unaffected.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Nix
+        uses: ./.github/actions/setup-nix
+      - run: nix $NIX_FLAGS develop --command npm ci
+      - run: nix $NIX_FLAGS develop --command npm run build
+      - run: nix $NIX_FLAGS develop --command npm test
