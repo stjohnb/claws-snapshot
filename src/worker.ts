@@ -1,0 +1,250 @@
+import * as db from "./db.js";
+import { MAX_WORK_WORKERS, shouldRunWorkPipeline } from "./config.js";
+import * as log from "./log.js";
+import { runContext, withRunContext } from "./log.js";
+import { isShuttingDown, ShutdownError } from "./shutdown.js";
+import { RateLimitError } from "./github.js";
+import { reportError } from "./error-reporter.js";
+import { handleTimeoutIfApplicable, handleMemoryLimitIfApplicable } from "./timeout-handler.js";
+import { randomUUID } from "node:crypto";
+import { sleep } from "./util.js";
+import { isDeployDraining, registerInFlightCounter } from "./deploy-drain.js";
+
+/** Stable string identifiers persisted in the work_queue.kind column. */
+export const AGENT_KINDS = {
+  CI_FIXER_CONFLICT: "ci-fixer:conflict",
+  CI_FIXER: "ci-fixer",
+  CI_FIXER_RERUN: "ci-fixer:rerun",
+  CI_FIXER_PROBLEMATIC: "ci-fixer:problematic",
+  REVIEW_ADDRESSER: "review-addresser",
+  PR_REVIEWER: "pr-reviewer",
+  AUTO_MERGER_SWEEP: "auto-merger:sweep",
+  ISSUE_WORKER: "issue-worker",
+  ISSUE_WORKER_CONTINUE: "issue-worker:continue",
+  ISSUE_REFINER_FOLLOWUP: "issue-refiner:followup",
+  ISSUE_REFINER_PLAN: "issue-refiner:plan",
+  ISSUE_REFINER_REFINE: "issue-refiner:refine",
+  ISSUE_REFINER_REPLAN: "issue-refiner:replan",
+  ESCALATION_REVIEW: "escalation-reviewer",
+} as const;
+
+export type WorkRow = db.WorkQueueRow;
+export type WorkHandler = (row: WorkRow, args: Record<string, unknown>) => Promise<void>;
+
+const handlers = new Map<string, WorkHandler>();
+
+/** Register a handler for a given kind. Called once at startup by `registerWorkHandlers`. */
+export function registerHandler(kind: string, fn: WorkHandler): void {
+  handlers.set(kind, fn);
+}
+
+export async function enqueue(
+  kind: string,
+  repo: string,
+  itemNumber: number,
+  opts: { priority?: boolean; args?: Record<string, unknown> } = {},
+): Promise<db.EnqueueResult | null> {
+  if (isShuttingDown()) return null;
+  const result = await db.enqueueWork(kind, repo, itemNumber, opts);
+  if (result && !result.alreadyQueued) {
+    wakeup();
+  }
+  return result;
+}
+
+export async function workerStatus(): Promise<{ workers: number; running: number; queued: number }> {
+  const counts = await db.countWorkByStatus();
+  return {
+    workers: MAX_WORK_WORKERS,
+    running: counts.running ?? 0,
+    queued: counts.queued ?? 0,
+  };
+}
+
+const IDLE_POLL_MS = 5000;
+const ERROR_BACKOFF_MS = 1000;
+
+let wakeupResolve: (() => void) | null = null;
+let wakeupPromise: Promise<void> = new Promise((r) => {
+  wakeupResolve = r;
+});
+
+function wakeup(): void {
+  const r = wakeupResolve;
+  // Re-create the promise *before* resolving so a wakeup that arrives during
+  // resolution is captured by the next loop iteration's await.
+  wakeupPromise = new Promise((res) => {
+    wakeupResolve = res;
+  });
+  if (r) r();
+}
+
+let started = false;
+let stopForTests = false;
+const fiberPromises: Promise<void>[] = [];
+
+/**
+ * What each fiber is doing right now. `"claiming"` is recorded before the claim
+ * query so a claim in progress when a deploy drain starts is still counted.
+ */
+const inFlight = new Map<number, WorkRow | "claiming">();
+registerInFlightCounter(() => inFlight.size);
+
+/** Work-queue rows currently claimed or running, for the self-deploy drain (#3055). */
+export function inFlightWork(): {
+  count: number;
+  rows: Array<{ kind: string; repo: string; itemNumber: number; startedAt: string | null }>;
+} {
+  const rows: Array<{ kind: string; repo: string; itemNumber: number; startedAt: string | null }> = [];
+  for (const entry of inFlight.values()) {
+    if (entry === "claiming") continue;
+    rows.push({ kind: entry.kind, repo: entry.repo, itemNumber: entry.item_number, startedAt: entry.started_at });
+  }
+  return { count: inFlight.size, rows };
+}
+
+/** Spawn N worker fibers. Idempotent. */
+export function start(workers: number = MAX_WORK_WORKERS): void {
+  if (started) return;
+  started = true;
+  stopForTests = false;
+  const n = Math.max(0, workers);
+  for (let i = 0; i < n; i++) {
+    fiberPromises.push(workerLoop(i));
+  }
+  log.info(`[worker] Started ${n} worker fiber(s)`);
+}
+
+async function workerLoop(workerId: number): Promise<void> {
+  while (!isShuttingDown() && !stopForTests) {
+    // A pending self-deploy is draining: leave queued rows for after the restart.
+    if (!shouldRunWorkPipeline() || isDeployDraining()) {
+      await Promise.race([
+        wakeupPromise,
+        sleep(IDLE_POLL_MS),
+      ]);
+      continue;
+    }
+
+    let row: WorkRow | null = null;
+    inFlight.set(workerId, "claiming");
+    try {
+      const runId = runContext.getStore()?.runId ?? null;
+      row = await db.claimNextWork(runId);
+    } catch (err) {
+      inFlight.delete(workerId);
+      log.warn(`[worker:${workerId}] claim failed: ${err}`);
+      await sleep(ERROR_BACKOFF_MS);
+      continue;
+    }
+
+    if (!row) {
+      inFlight.delete(workerId);
+      await Promise.race([
+        wakeupPromise,
+        sleep(IDLE_POLL_MS),
+      ]);
+      continue;
+    }
+
+    inFlight.set(workerId, row);
+    try {
+      await runRow(workerId, row);
+    } finally {
+      inFlight.delete(workerId);
+    }
+  }
+}
+
+/** @internal — exported for tests. */
+export async function runRow(workerId: number, row: WorkRow): Promise<void> {
+  const handler = handlers.get(row.kind);
+  if (!handler) {
+    log.warn(`[worker:${workerId}] No handler registered for kind="${row.kind}" (id=${row.id})`);
+    await db.markWorkFailed(row.id, `no handler for kind=${row.kind}`);
+    return;
+  }
+
+  let args: Record<string, unknown> = {};
+  try {
+    args = row.args_json ? JSON.parse(row.args_json) : {};
+  } catch {
+    args = {};
+  }
+
+  const runId = row.run_id ?? randomUUID();
+  const ownsRun = !row.run_id;
+  if (ownsRun) {
+    try {
+      await db.insertJobRun(runId, `work:${row.kind}`);
+    } catch {
+      // best effort — duplicate or DB hiccup; continue without DB-side run row
+    }
+  }
+
+  await withRunContext(runId, async () => {
+    log.info(`[worker:${workerId}] ${row.kind} ${row.repo}#${row.item_number} (id=${row.id})`);
+
+    try {
+      await handler(row, args);
+      await db.markWorkSucceeded(row.id);
+      if (ownsRun) {
+        try { await db.completeJobRun(runId, "completed"); } catch { /* best effort */ }
+      }
+    } catch (err) {
+      if (err instanceof ShutdownError) {
+        if (isShuttingDown()) {
+          // Real process shutdown: leave the row in 'running'. The next boot has a
+          // different pid, so recoverWorkOnStartup() resets it to 'queued'.
+          log.info(`[worker:${workerId}] ${row.kind} ${row.repo}#${row.item_number} interrupted by shutdown`);
+        } else {
+          // A per-run cancellation (POST /cancel, POST /logs/:runId/cancel) while the
+          // service stays up. Startup recovery will never fire for this pid, so the row
+          // must reach a terminal state or it blocks redispatch forever (#2685).
+          await db.markWorkCancelled(row.id, "run cancelled");
+          log.info(`[worker:${workerId}] ${row.kind} ${row.repo}#${row.item_number} cancelled`);
+        }
+        if (ownsRun) {
+          try { await db.completeJobRun(runId, "cancelled"); } catch { /* best effort */ }
+        }
+        return;
+      }
+      if (err instanceof RateLimitError) {
+        log.warn(`[worker:${workerId}] ${row.kind} ${row.repo}#${row.item_number} rate limited`);
+        await db.markWorkFailed(row.id, "rate-limited");
+        if (ownsRun) {
+          try { await db.completeJobRun(runId, "failed"); } catch { /* best effort */ }
+        }
+        return;
+      }
+      await db.markWorkFailed(row.id, err instanceof Error ? err.message : String(err));
+      if (ownsRun) {
+        try { await db.completeJobRun(runId, "failed"); } catch { /* best effort */ }
+      }
+      try {
+        await handleTimeoutIfApplicable(row.kind.split(":")[0], row.repo, row.item_number, err);
+      } catch {
+        // best effort
+      }
+      try {
+        await handleMemoryLimitIfApplicable(row.kind.split(":")[0], row.repo, row.item_number, err);
+      } catch {
+        // best effort
+      }
+      try {
+        await reportError(`${row.kind}:run`, `${row.repo}#${row.item_number}`, err);
+      } catch {
+        // best effort
+      }
+    }
+  });
+}
+
+/** @internal — tests only. */
+export function _resetForTests(): void {
+  handlers.clear();
+  stopForTests = false;
+  started = false;
+  fiberPromises.length = 0;
+  inFlight.clear();
+}

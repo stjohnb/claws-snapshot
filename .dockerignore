@@ -1,0 +1,14 @@
+.git
+.github
+node_modules
+dist
+error.log
+ideas
+docs/refinements
+docs/plans
+.claws
+*.db
+*.db-*
+claws.tar.gz
+.vitest
+coverage

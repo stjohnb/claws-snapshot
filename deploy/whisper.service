@@ -1,0 +1,21 @@
+[Unit]
+Description=faster-whisper OpenAI-compatible transcription server for Claws
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=brendan
+Group=brendan
+# Self-contained PEP-723 script; `uv run --script` resolves its deps on first
+# start and downloads the model (~142 MB) into ~/.cache/huggingface.
+Environment=WHISPER_MODEL=Systran/faster-whisper-base
+ExecStart=/usr/bin/env uv run --script /opt/claws/deploy/whisper-server.py
+Restart=on-failure
+RestartSec=10
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target
