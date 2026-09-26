@@ -1,0 +1,334 @@
+name: Release
+
+# Besides push, claude-code-release.yml calls this workflow (`workflow_call`)
+# when npm has a Claude Code version the latest release did not ship (#3088).
+# That daily check lives in its own workflow so a no-op scheduled success never
+# lands in Release's run history (main-build-monitor would read it as "green
+# again" and close an open Release failure alert), and so it never joins the
+# `release` concurrency group unless it is actually going to release.
+# `workflow_dispatch` forces a manual release; main-build-monitor ignores it.
+#
+# Coalescing back-to-back merges (#3096): every run builds `main` HEAD at
+# checkout time, not its own triggering commit. A push run whose triggering
+# commit is already contained in the newest release tag, with that tag's
+# image already pushed, exits via the `check` job without tagging, building
+# or dispatching anything. That skip only confirms the image was pushed, not
+# that the earlier run's fleet-infra staging dispatch succeeded — if that
+# step failed, staging stays behind until a push lands outside any tag.
+# Combined with the `release` concurrency group below (one running + one
+# pending, older pending runs cancelled), a burst of N pushes to main yields
+# at most two releases: the run already in progress, and one pending run
+# that builds whatever HEAD is by the time it starts.
+# Triggers removed for the public snapshot — this workflow is intentionally disabled.
+# See the private source repository for the active version.
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+# Toolchain comes from this repo's flake.nix via `nix develop` — same policy
+# as ci.yml: the runners are self-hosted NixOS boxes that provide only nix,
+# git and docker, and each repo brings its own CI dependencies, isolated in
+# the nix store. Every node/npm step below MUST be prefixed with
+# `nix $NIX_FLAGS develop --command`; a bare `npm ci` dies with
+# `npm: command not found` / exit 127 on a NixOS runner (issue #2343).
+# No actions/setup-node, no sudo/apt-get on the runner itself.
+#
+# The `docker` job's Dockerfile builder stage does its own `npm ci`, version
+# injection and `npm run build` from a Debian-based image, so this workflow's
+# `release` job builds nothing beyond the version tag and release notes.
+env:
+  NIX_FLAGS: --extra-experimental-features nix-command --extra-experimental-features flakes
+
+jobs:
+  # Skips a push run whose triggering commit has already shipped, so a burst
+  # of merges yields at most two releases (#3096). Always builds for a
+  # `workflow_call` or `workflow_dispatch` run, since those target an
+  # already-tagged HEAD to ship a new Claude Code version or a manual release.
+  check:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      build: ${{ steps.check.outputs.build }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-tags: true
+          fetch-depth: 0
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Check whether this push's commit already shipped
+        id: check
+        run: |
+          if [ "$GITHUB_EVENT_NAME" != "push" ]; then
+            echo "$GITHUB_EVENT_NAME run, always releasing main HEAD"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          latest=$(git tag --list 'v*' --sort=-v:refname | head -n1)
+          if [ -z "$latest" ] || ! git merge-base --is-ancestor "$GITHUB_SHA" "$latest" 2>/dev/null; then
+            echo "$GITHUB_SHA has not shipped yet (newest tag: ${latest:-none}), releasing"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          image="ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]'):$latest"
+          if out=$(docker manifest inspect "$image" 2>&1 >/dev/null); then
+            msg="$GITHUB_SHA already shipped in $latest (image present); main HEAD $(git rev-parse HEAD) has nothing new from this push, skipping"
+            echo "$msg"
+            echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          elif echo "$out" | grep -qiE 'no such manifest|manifest unknown'; then
+            echo "$latest's image was never pushed, releasing main HEAD"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::docker manifest inspect $image failed: $out"
+            exit 1
+          fi
+
+  release:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: [self-hosted, linux, x64]
+    # ~2 min warm (run 33868857954). 30 covers a cold nix closure download after a
+    # flake.lock bump plus the npm view retry loops below.
+    timeout-minutes: 30
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      claude_version: ${{ steps.claude.outputs.version }}
+      codex_version: ${{ steps.codex.outputs.version }}
+      sha: ${{ steps.head.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-tags: true
+          fetch-depth: 0
+      - name: Record HEAD being released
+        id: head
+        run: |
+          sha=$(git rev-parse HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          msg="Releasing main HEAD $sha (triggered by $GITHUB_SHA)"
+          echo "$msg"
+          echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+      - name: Set up Nix
+        uses: ./.github/actions/setup-nix
+      # Every build installs an exact, recorded Claude Code version instead of
+      # floating on `latest` (#3088). One attempt used to be enough, but this
+      # now gates every release, so a registry blip must not lose one (#1966).
+      - name: Resolve Claude Code version
+        id: claude
+        run: |
+          v=""
+          for i in 1 2 3; do
+            v=$(nix $NIX_FLAGS develop --command npm view @anthropic-ai/claude-code@latest version) && break
+            echo "npm view attempt $i failed, retrying after 10s" >&2
+            v=""
+            sleep 10
+          done
+          if ! echo "$v" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::npm view returned an unexpected Claude Code version after 3 attempts: '$v'"
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      # Same reasoning as the Claude Code resolve step above, so Codex's
+      # baked-in version is visible and reproducible per build (#3312).
+      - name: Resolve Codex version
+        id: codex
+        run: |
+          v=""
+          for i in 1 2 3; do
+            v=$(nix $NIX_FLAGS develop --command npm view @openai/codex@latest version) && break
+            echo "npm view attempt $i failed, retrying after 10s" >&2
+            v=""
+            sleep 10
+          done
+          if ! echo "$v" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::npm view returned an unexpected Codex version after 3 attempts: '$v'"
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Compute version tag
+        id: version
+        run: |
+          today=$(date -u +%Y-%m-%d)
+          last=$(git tag --list "v${today}.*" --sort=-v:refname | head -n1)
+          if [ -z "$last" ]; then
+            v=1
+          else
+            v=$(( ${last##*.} + 1 ))
+          fi
+          echo "tag=v${today}.${v}" >> "$GITHUB_OUTPUT"
+
+      - name: Push tag
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          git tag "$TAG"
+          git push origin "$TAG"
+
+      - name: Generate release notes
+        id: notes
+        env:
+          CLAUDE_CODE_VERSION: ${{ steps.claude.outputs.version }}
+          CODEX_VERSION: ${{ steps.codex.outputs.version }}
+        run: |
+          PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${{ steps.version.outputs.tag }}$" | head -n1)
+          if [ -z "$PREV_TAG" ]; then
+            {
+              echo "body<<RELEASE_EOF"
+              echo "Claude Code CLI: $CLAUDE_CODE_VERSION"
+              echo "Codex CLI: $CODEX_VERSION"
+              echo ""
+              echo "Initial release"
+              echo "RELEASE_EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "body<<RELEASE_EOF"
+              echo "Claude Code CLI: $CLAUDE_CODE_VERSION"
+              echo "Codex CLI: $CODEX_VERSION"
+              echo ""
+              git log --oneline --no-merges "$PREV_TAG"..HEAD | head -20
+              echo "RELEASE_EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          target_commitish: ${{ steps.head.outputs.sha }}
+          name: ${{ steps.version.outputs.tag }}
+          body: ${{ steps.notes.outputs.body }}
+
+  docker:
+    needs: release
+    runs-on: [self-hosted, linux, x64]
+    # A hung image build must never hold the pool. Two 15-minute build attempts plus
+    # ~1 minute of checkout/login/nix/dispatch fits inside this. Without it the job
+    # inherits GitHub's 360-minute default and twice on 2026-09-04 blocked every
+    # [self-hosted, linux] job in the org for hours (#2861).
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+      - name: Validate prerequisites
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_INFRA_VERSION_BUMP }}
+        run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::FLEET_INFRA_VERSION_BUMP secret is not available to this workflow run"
+            exit 1
+          fi
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Compute image repo (lowercase)
+        id: repo
+        run: echo "name=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+      # Do NOT add `cache-to: type=gha` / `cache-from: type=gha` here.
+      # The gha BuildKit cache leaked 6+ GB into the org-shared 2 GB Actions
+      # storage quota (issues #1698, #1717). Releases are infrequent; rebuilding
+      # layers from the registry each time is the intended trade-off.
+      # Docker Hub intermittently 500s when BuildKit resolves base-image
+      # metadata (#1966). One retry absorbs the blip rather than losing the
+      # image for an already-tagged release.
+      #
+      # Build with the Docker daemon's own builder — the same path ci.yml's
+      # docker-build job uses — instead of docker/build-push-action's buildx
+      # `docker-container` driver. That driver's containerd resolver probes
+      # `/v2/<name>/blobs/<digest>` when resolving a digest-pinned `FROM`;
+      # GHCR answers that with 403 for a private package (our own
+      # claws-session-shell), which the resolver treats as fatal, while the
+      # daemon builder resolves via `/manifests/<digest>` and never hits that
+      # endpoint (#3251). Do NOT reintroduce `docker/setup-buildx-action`
+      # here. If a future change genuinely needs the container driver, switch
+      # `CLAWS_SESSION_SHELL_IMAGE` from a digest to the `:<commit-sha>` tag
+      # nixos-config also publishes.
+      - name: Build and push image
+        id: build
+        continue-on-error: true
+        # Warm daemon build is under a minute (run 35728782679: 0m45s), cold build is ~8 min
+        # on either runner (run 35723674371: 7m48s on nas; run 35737097276: 8m12s on ryzen).
+        # Each runner has its own daemon cache, and the step drops the version tag after
+        # pushing, so the first release after any cache eviction, runner rebuild or
+        # base-image change is cold. 15 min caps a genuine hang (#2862) while giving a cold
+        # build real headroom; the retry (#1966) absorbs Docker Hub 500s, not slow builds.
+        timeout-minutes: 15
+        env:
+          IMAGE: ghcr.io/${{ steps.repo.outputs.name }}
+          TAG: ${{ needs.release.outputs.tag }}
+          CLAUDE_CODE_VERSION: ${{ needs.release.outputs.claude_version }}
+          CODEX_VERSION: ${{ needs.release.outputs.codex_version }}
+        run: |
+          docker build \
+            --build-arg CLAWS_VERSION="$TAG" \
+            --build-arg CLAUDE_CODE_VERSION="$CLAUDE_CODE_VERSION" \
+            --build-arg CODEX_VERSION="$CODEX_VERSION" \
+            -t "$IMAGE:$TAG" -t "$IMAGE:latest" .
+          docker push "$IMAGE:$TAG"
+          docker push "$IMAGE:latest"
+          # Keep :latest for layer reuse; drop the version tag so releases don't
+          # accumulate multi-GB images on the shared self-hosted runner.
+          docker image rm "$IMAGE:$TAG" >/dev/null 2>&1 || true
+
+      - name: Build and push image (retry)
+        id: build-retry
+        if: steps.build.outcome == 'failure'
+        timeout-minutes: 15
+        env:
+          IMAGE: ghcr.io/${{ steps.repo.outputs.name }}
+          TAG: ${{ needs.release.outputs.tag }}
+          CLAUDE_CODE_VERSION: ${{ needs.release.outputs.claude_version }}
+          CODEX_VERSION: ${{ needs.release.outputs.codex_version }}
+        run: |
+          docker build \
+            --build-arg CLAWS_VERSION="$TAG" \
+            --build-arg CLAUDE_CODE_VERSION="$CLAUDE_CODE_VERSION" \
+            --build-arg CODEX_VERSION="$CODEX_VERSION" \
+            -t "$IMAGE:$TAG" -t "$IMAGE:latest" .
+          docker push "$IMAGE:$TAG"
+          docker push "$IMAGE:latest"
+          # Keep :latest for layer reuse; drop the version tag so releases don't
+          # accumulate multi-GB images on the shared self-hosted runner.
+          docker image rm "$IMAGE:$TAG" >/dev/null 2>&1 || true
+
+      - name: Set up Nix
+        if: steps.build.outcome == 'success' || steps.build-retry.outcome == 'success'
+        uses: ./.github/actions/setup-nix
+
+      - name: Dispatch fleet-infra claws bump
+        if: steps.build.outcome == 'success' || steps.build-retry.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_INFRA_VERSION_BUMP }}
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          nix $NIX_FLAGS develop .#scripts --command bash -euo pipefail -c '
+            gh workflow run update-claws.yml \
+              --repo St-John-Software/fleet-infra \
+              --ref main \
+              --field tag="$TAG"
+            echo "Dispatched fleet-infra update-claws.yml with tag=$TAG"
+          '

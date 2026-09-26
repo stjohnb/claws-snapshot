@@ -1,0 +1,90 @@
+name: CI
+
+# Triggers removed for the public snapshot — this workflow is intentionally disabled.
+# See the private source repository for the active version.
+on:
+  workflow_dispatch:
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# The org's CI runs on self-hosted NixOS runners, and every toolchain this
+# workflow needs — node, and the C toolchain for the native modules
+# (better-sqlite3, node-pty) — comes from this repo's own flake.nix via
+# `nix develop`, isolated in the nix store from whatever other repos put on
+# the same runners. Do NOT add actions/setup-node, sudo/apt-get, or ask for
+# packages on the runner itself; add tools to flake.nix instead.
+env:
+  # Don't rely on the runner's nix.conf having flakes turned on.
+  NIX_FLAGS: --extra-experimental-features nix-command --extra-experimental-features flakes
+
+jobs:
+  build:
+    runs-on: [self-hosted, linux]
+    # 20, not 10: the first run after a flake.lock bump downloads the node/gcc
+    # closure into the runner's nix store. Warm runs are unaffected.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Nix
+        uses: ./.github/actions/setup-nix
+      - run: nix $NIX_FLAGS develop --command npm ci
+      - run: nix $NIX_FLAGS develop --command npm run build
+      # npm run build regenerates src/resources/*.generated.ts from
+      # src/client/*.ts and overwrites them in place. If a PR edited a
+      # client source file without committing the rebuilt bundle, the
+      # working tree is now dirty — fail loudly instead of shipping a
+      # stale bundle that silently drops the source fix.
+      - name: Verify generated client bundles are committed
+        run: git diff --exit-code -- src/resources/*.generated.ts
+      - run: nix $NIX_FLAGS develop --command npm test
+      # Same DB suites again against PGlite — real Postgres compiled to wasm,
+      # in-process, installed by npm ci. Proves the dialect and the schema; pool
+      # contention and SKIP LOCKED concurrency are only exercised in staging.
+      - run: nix $NIX_FLAGS develop --command npm run test:pg
+
+  # Only release.yml ever ran `docker build` against this Dockerfile, and only
+  # on main after merge. That left ~150 lines of hand-written shell across the
+  # secret-scanning RUN blocks (#3179) unexecuted anywhere before merge; three
+  # review rounds each found a real, previously-invisible bug in that shell by
+  # reading it, one round apart. Build it here instead, gated to Dockerfile/
+  # deploy/** changes so most pushes skip the extra ~2 min.
+  #
+  # Uses the Docker daemon's own builder (no buildx), same as release.yml's
+  # docker job now does (#3251) — a Dockerfile change that builds here will
+  # also build at release time.
+  docker-build:
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Check whether Dockerfile or deploy/** changed
+        id: changed
+        run: |
+          before="${{ github.event.before }}"
+          if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$before" 2>/dev/null; then
+            echo "No usable previous commit to diff against — building"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif git diff --name-only "$before" "${{ github.sha }}" | grep -qE '^(Dockerfile|deploy/)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      # Builds through the runtime stage so both secret-scanning RUN blocks
+      # (session-shell-defaults) and the zsh -i login smoke test (runtime) execute.
+      # Pull-only: this job never pushes an image.
+      - name: Log in to GHCR (pull claws-session-shell)
+        if: steps.changed.outputs.run == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build runtime image
+        if: steps.changed.outputs.run == 'true'
+        run: docker build --target runtime .

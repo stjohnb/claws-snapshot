@@ -1,0 +1,711 @@
+import type { Theme } from "./layout.js";
+import {
+  PAGE_CSS,
+  TAILWIND_STYLESHEET,
+  HEAD_META,
+  escapeHtml,
+  htmlOpenTag,
+  buildPageHeader,
+  THEME_SCRIPT,
+  ALPINE_SCRIPT,
+  LOCAL_TIME_SCRIPT,
+  timestampHtml,
+} from "./layout.js";
+import { getConfigForDisplay, VALID_AGENT_NAMES, getUnknownConfigKeys } from "../config.js";
+import * as config from "../config.js";
+import type { MacRunner } from "../config.js";
+import { isOpenCodeBinaryAvailable } from "../claude.js";
+import { MODEL_TIER_TABLE } from "../model-selector.js";
+import type { VerificationReport } from "../jobs/connectivity-verifier.js";
+
+function isEnvOverridden(envVar: string): boolean {
+  return process.env[envVar] !== undefined && process.env[envVar] !== "";
+}
+
+/** The connectivity-check report shown in the Activation section (formerly /verify). */
+function buildConnectivityChecks(report: VerificationReport | null): string {
+  const body = report
+    ? `<p class="field-note">Report generated: ${timestampHtml(report.generatedAt)}</p>
+    <div class="table-scroll">
+      <table class="data-cards">
+        <thead><tr><th>Check</th><th>Status</th><th>Detail</th><th class="hide-sm">Duration</th></tr></thead>
+        <tbody>
+          ${report.checks.map((c) => `<tr>
+            <td class="cell-title" data-label="Check">${escapeHtml(c.name)}</td>
+            <td data-label="Status" class="${c.ok ? "running" : "slack-error"}">${c.ok ? "OK" : "FAIL"}</td>
+            <td data-label="Detail"><code>${escapeHtml(c.detail ?? "")}</code></td>
+            <td data-label="Duration" class="hide-sm">${c.ms}ms</td>
+          </tr>`).join("\n          ")}
+        </tbody>
+      </table>
+    </div>`
+    : `<p class="queue-empty">No verification report yet</p>`;
+  return `<h3>Connectivity checks</h3>
+    <div class="field-note">Slack and email are reachability-checked only (DNS / IMAP login), so running the checks sends no messages.</div>
+    ${body}
+    <form method="POST" action="/api/verify/run">
+      <button type="submit" class="trigger-btn">Run checks</button>
+    </form>`;
+}
+
+export function buildConfigPage(saved: boolean, theme: Theme, report: VerificationReport | null = null): string {
+  // SECURITY INVARIANT: this page must read config through getConfigForDisplay(),
+  // never loadConfig(). getConfigForDisplay() rewrites every SENSITIVE_KEYS entry
+  // (src/config.ts) to maskValue() output — "****"+last4, or "Not configured" when
+  // unset — so no plaintext secret is ever serialised into this HTML. The password
+  // fields below deliberately put that masked indicator in `placeholder`: it shows
+  // the operator which secrets are set without handing the value to the browser.
+  // Not a secret leak — do not "fix" it, and do not switch this to loadConfig().
+  // Corollary: cfg.<sensitiveKey> is ALWAYS a truthy display string, so never test
+  // it for presence — use the live export from config.js (e.g. OPENROUTER_API_KEY).
+  const cfg = getConfigForDisplay();
+
+  const envMap: Record<string, string> = {
+    slackWebhook: "CLAWS_SLACK_WEBHOOK",
+    slackBotToken: "CLAWS_SLACK_BOT_TOKEN",
+    slackIdeasChannel: "CLAWS_SLACK_IDEAS_CHANNEL",
+    githubOwners: "CLAWS_GITHUB_OWNERS",
+    selfRepo: "CLAWS_SELF_REPO",
+    port: "PORT",
+    whatsappEnabled: "WHATSAPP_ENABLED",
+    whatsappAllowedNumbers: "WHATSAPP_ALLOWED_NUMBERS",
+    openaiApiKey: "OPENAI_API_KEY",
+    emailUser: "CLAWS_EMAIL_USER",
+    emailAppPassword: "BRENDAN_SERVER_GMAIL_APP_PASSWORD",
+    emailRecipient: "CLAWS_EMAIL_RECIPIENT",
+    emailEnabled: "CLAWS_EMAIL_ENABLED",
+    oidcClientId: "CLAWS_OIDC_CLIENT_ID",
+    oidcClientSecret: "CLAWS_OIDC_CLIENT_SECRET",
+    oidcBaseUrl: "CLAWS_OIDC_BASE_URL",
+    oidcApplicationSlug: "CLAWS_OIDC_APPLICATION_SLUG",
+    oidcRedirectUri: "CLAWS_OIDC_REDIRECT_URI",
+    dashboardUrl: "CLAWS_DASHBOARD_URL",
+    openrouterApiKey: "CLAWS_OPENROUTER_API_KEY",
+    reviewModelTier: "CLAWS_REVIEW_MODEL_TIER",
+    // Every configurable tier × provider cell carries its own env override.
+    ...Object.fromEntries(
+      MODEL_TIER_TABLE.flatMap((row) =>
+        Object.values(row.providers)
+          .filter((cell) => cell.configKey && cell.envVar)
+          .map((cell) => [cell.configKey as string, cell.envVar as string]),
+      ),
+    ),
+  };
+
+  function envNote(key: string): string {
+    const envVar = envMap[key];
+    if (envVar && isEnvOverridden(envVar)) {
+      return `<div class="env-note">Set via environment variable ${escapeHtml(envVar)}</div>`;
+    }
+    return "";
+  }
+
+  function isDisabled(key: string): boolean {
+    const envVar = envMap[key];
+    return !!(envVar && isEnvOverridden(envVar));
+  }
+
+  function renderField(opts: {
+    name: string;
+    label: string;
+    value: string;
+    note?: string;
+    type?: "text" | "number";
+    min?: number;
+    max?: number;
+    disabled?: boolean;
+  }): string {
+    const { name, label, value, note, type = "text", min, max, disabled = false } = opts;
+    return `<div class="config-field">
+      <label for="${escapeHtml(name)}">${escapeHtml(label)}</label>
+      <input type="${type}" name="${escapeHtml(name)}" id="${escapeHtml(name)}" value="${escapeHtml(value)}"${min !== undefined ? ` min="${min}"` : ""}${max !== undefined ? ` max="${max}"` : ""}${disabled ? " disabled" : ""}>
+      ${note ?? ""}
+    </div>`;
+  }
+
+  function renderSecretField(opts: {
+    name: string;
+    label: string;
+    placeholder: string;
+    note?: string;
+    disabled?: boolean;
+  }): string {
+    const { name, label, placeholder, note, disabled = false } = opts;
+    // `placeholder` receives an already-masked indicator ("****"+last4 or
+    // "Not configured") from getConfigForDisplay(), never a live secret value.
+    // See the SECURITY INVARIANT comment at the top of buildConfigPage.
+    return `<div class="config-field">
+      <label for="${escapeHtml(name)}">${escapeHtml(label)}</label>
+      <input type="password" name="${escapeHtml(name)}" id="${escapeHtml(name)}" placeholder="${escapeHtml(placeholder)}"${disabled ? " disabled" : ""}>
+      ${note ?? ""}
+    </div>`;
+  }
+
+  function renderTextareaField(opts: {
+    name: string;
+    label: string;
+    value: string;
+    note?: string;
+    rows?: number;
+    disabled?: boolean;
+  }): string {
+    const { name, label, value, note, rows = 8, disabled = false } = opts;
+    return `<div class="config-field config-field-full">
+      <label for="${escapeHtml(name)}">${escapeHtml(label)}</label>
+      <textarea name="${escapeHtml(name)}" id="${escapeHtml(name)}" rows="${rows}"${disabled ? " disabled" : ""}>${escapeHtml(value)}</textarea>
+      ${note ?? ""}
+    </div>`;
+  }
+
+  function renderCheckboxField(opts: {
+    name: string;
+    label: string;
+    checked: boolean;
+    note?: string;
+    value?: string;
+    disabled?: boolean;
+  }): string {
+    const { name, label, checked, note, value = "true", disabled = false } = opts;
+    return `<div class="config-field config-field-full">
+      <label class="config-check" for="${escapeHtml(name)}">
+        <input type="checkbox" name="${escapeHtml(name)}" id="${escapeHtml(name)}" value="${escapeHtml(value)}"${checked ? " checked" : ""}${disabled ? " disabled" : ""}>
+        <span>${escapeHtml(label)}</span>
+      </label>
+      ${note ?? ""}
+    </div>`;
+  }
+
+  function renderSelectField(opts: {
+    name: string;
+    label: string;
+    value: string;
+    options: ReadonlyArray<{ value: string; label: string }>;
+    note?: string;
+    disabled?: boolean;
+  }): string {
+    const { name, label, value, options, note, disabled = false } = opts;
+    const optionHtml = options
+      .map((o) => `<option value="${escapeHtml(o.value)}"${o.value === value ? " selected" : ""}>${escapeHtml(o.label)}</option>`)
+      .join("");
+    return `<div class="config-field">
+      <label for="${escapeHtml(name)}">${escapeHtml(label)}</label>
+      <select class="form-select" name="${escapeHtml(name)}" id="${escapeHtml(name)}"${disabled ? " disabled" : ""}>${optionHtml}</select>
+      ${note ?? ""}
+    </div>`;
+  }
+
+  function renderStatusRow(label: string, value: string, note?: string): string {
+    return `<div class="config-status-row">
+      <div class="config-status-label">${escapeHtml(label)}</div>
+      <div class="config-status-value">${escapeHtml(value)}</div>
+      ${note ? `<div class="field-note">${note}</div>` : ""}
+    </div>`;
+  }
+
+  function renderSection(title: string, body: string, open = false): string {
+    return `<details class="config-section"${open ? " open" : ""}>
+      <summary>${escapeHtml(title)}</summary>
+      <div class="config-section-body">${body}</div>
+    </details>`;
+  }
+
+  function joinNotes(...notes: Array<string | undefined>): string {
+    return notes.filter(Boolean).join("");
+  }
+
+  const intervals = cfg.intervals as Record<string, number>;
+  const schedules = cfg.schedules as Record<string, number>;
+  const providerLabels: Record<string, string> = {
+    claude: "Anthropic (Claude)",
+    codex: "OpenAI (Codex)",
+    opencode: "OpenCode (via OpenRouter)",
+  };
+  const providerShortLabels: Record<string, string> = {
+    claude: "Claude",
+    codex: "Codex",
+    opencode: "OpenCode",
+  };
+  const unknownKeys = Array.from(getUnknownConfigKeys());
+  const macRunners = Array.isArray(cfg.macRunners) ? cfg.macRunners as MacRunner[] : [];
+
+  const generalSection = renderSection("General", [
+    renderField({
+      name: "githubOwners",
+      label: "GitHub Owners (comma-separated)",
+      value: Array.isArray(cfg.githubOwners) ? (cfg.githubOwners as string[]).join(", ") : "",
+      note: envNote("githubOwners"),
+      disabled: isDisabled("githubOwners"),
+    }),
+    renderField({
+      name: "selfRepo",
+      label: "Self Repo",
+      value: String(cfg.selfRepo ?? ""),
+      note: envNote("selfRepo"),
+      disabled: isDisabled("selfRepo"),
+    }),
+    renderField({
+      name: "logRetentionDays",
+      label: "Log Retention (days)",
+      value: String(Number(cfg.logRetentionDays)),
+      type: "number",
+      min: 1,
+    }),
+    renderField({
+      name: "logRetentionPerJob",
+      label: "Min Logs Kept Per Job",
+      value: String(Number(cfg.logRetentionPerJob)),
+      type: "number",
+      min: 0,
+    }),
+    renderCheckboxField({
+      name: "notifyDashboardActions",
+      label: "Notify Dashboard Actions via Slack",
+      checked: cfg.notifyDashboardActions !== false,
+      note: '<div class="field-note">Send Slack notifications for configuration and activation changes (pause/resume, config edits, activation flip, WhatsApp pairing). Issue operations (create, close, transfer, refine) and routine actions (queue triage, session lifecycle, merges, cancellations) never notify.</div>',
+    }),
+  ].join(""), true);
+
+  const integrationsSection = renderSection("Integrations", [
+    renderSecretField({
+      name: "slackWebhook",
+      label: "Slack Webhook",
+      placeholder: String(cfg.slackWebhook ?? ""),
+      note: joinNotes(
+        envNote("slackWebhook"),
+        '<div class="field-note">Leave empty to keep current value</div>',
+      ),
+      disabled: isDisabled("slackWebhook"),
+    }),
+    renderSecretField({
+      name: "slackBotToken",
+      label: "Slack Bot Token (Ideas)",
+      placeholder: String(cfg.slackBotToken ?? ""),
+      note: joinNotes(
+        envNote("slackBotToken"),
+        '<div class="field-note">Leave empty to keep current value</div>',
+      ),
+      disabled: isDisabled("slackBotToken"),
+    }),
+    renderField({
+      name: "slackIdeasChannel",
+      label: "Slack Ideas Channel ID",
+      value: String(cfg.slackIdeasChannel ?? ""),
+      note: envNote("slackIdeasChannel"),
+      disabled: isDisabled("slackIdeasChannel"),
+    }),
+    renderStatusRow(
+      "WhatsApp Enabled",
+      cfg.whatsappEnabled ? "Enabled" : "Disabled",
+      'Read-only status. Requires restart to change. Pair via <a href="/whatsapp">/whatsapp</a>.',
+    ),
+    renderField({
+      name: "whatsappAllowedNumbers",
+      label: "WhatsApp Allowed Numbers (comma-separated)",
+      value: Array.isArray(cfg.whatsappAllowedNumbers) ? (cfg.whatsappAllowedNumbers as string[]).join(", ") : "",
+      note: envNote("whatsappAllowedNumbers"),
+      disabled: isDisabled("whatsappAllowedNumbers"),
+    }),
+    renderSecretField({
+      name: "openaiApiKey",
+      label: "OpenAI API Key",
+      placeholder: String(cfg.openaiApiKey ?? ""),
+      note: joinNotes(
+        envNote("openaiApiKey"),
+        '<div class="field-note">Leave empty to keep current value</div>',
+      ),
+      disabled: isDisabled("openaiApiKey"),
+    }),
+  ].join(""));
+
+  const emailSection = renderSection("Email", [
+    renderStatusRow(
+      "Email Enabled",
+      cfg.emailEnabled ? "Enabled" : "Disabled",
+      "Read-only status. Requires restart to change.",
+    ),
+    renderField({
+      name: "emailUser",
+      label: "Email User",
+      value: String(cfg.emailUser ?? ""),
+      note: envNote("emailUser"),
+      disabled: isDisabled("emailUser"),
+    }),
+    renderSecretField({
+      name: "emailAppPassword",
+      label: "Email App Password",
+      placeholder: String(cfg.emailAppPassword ?? ""),
+      note: joinNotes(
+        envNote("emailAppPassword"),
+        '<div class="field-note">Leave empty to keep current value</div>',
+      ),
+      disabled: isDisabled("emailAppPassword"),
+    }),
+    renderField({
+      name: "emailRecipient",
+      label: "Email Recipient",
+      value: String(cfg.emailRecipient ?? ""),
+      note: envNote("emailRecipient"),
+      disabled: isDisabled("emailRecipient"),
+    }),
+  ].join(""));
+
+  const runnerEnrollment = macRunners.map((runner) => {
+    const enabled = runner.enabled !== false;
+    const id = `macRunnerEnabled_${runner.host}`;
+    return `<label class="config-check" for="${escapeHtml(id)}">
+      <input type="checkbox" name="${escapeHtml(id)}" id="${escapeHtml(id)}"${enabled ? " checked" : ""}>
+      <span>${escapeHtml(runner.name ?? runner.host)} <span class="field-note">(${escapeHtml(runner.host)})</span></span>
+    </label>`;
+  }).join("");
+
+  // Repos that enrol themselves via their own claws.json ("runners": ["macos"]),
+  // minus any the host list already names — the two are unioned (#2898).
+  const hostMacRunnerRepos = Array.isArray(cfg.macRunnerRepos) ? (cfg.macRunnerRepos as string[]) : [];
+  const repoDeclaredMacRepos = config.getMacRunnerRepos().filter((r) => !hostMacRunnerRepos.includes(r));
+
+  const runnersSection = renderSection("Runners", [
+    renderTextareaField({
+      name: "runners",
+      label: "Runner Hosts (JSON)",
+      value: JSON.stringify(cfg.runners ?? [], null, 2),
+      note: '<div class="field-note">Format: [{"name","host","user","identityFile", "actionsDir": "/path/to/actions-runner"}] — for a NixOS systemd runner use {"serviceUnit": "github-runner-&lt;name&gt;", "workDir": "/var/lib/...-work", "toolDir": "/var/lib/...-tool"} instead of actionsDir</div>',
+    }),
+    `<div class="config-field config-field-full">
+      <label>Mac Runner Enrolment (mac-runner-waker)</label>
+      <div class="field-note">Untick a Mac to stop waking it — no SSH attempt and no alerts while it is off the LAN.</div>
+      <div class="config-check-group">${runnerEnrollment}</div>
+      <input type="hidden" name="macRunnerHosts" value="${escapeHtml(macRunners.map((runner) => runner.host).join(","))}">
+    </div>`,
+    renderTextareaField({
+      name: "macRunners",
+      label: "Mac Runners (JSON)",
+      value: JSON.stringify(cfg.macRunners ?? [], null, 2),
+      note: '<div class="field-note">Format: [{"name": "...", "host": "...", "labels": ["macos","xcode26"]}]</div>',
+    }),
+    renderField({
+      name: "macRunnerRepos",
+      label: "Mac Runner Repos (comma-separated)",
+      value: hostMacRunnerRepos.join(", "),
+      note: `<div class="field-note">Repos to poll for queued Mac jobs, e.g. "owner/repo"${repoDeclaredMacRepos.length > 0 ? ` — also enabled by their own claws.json ("runners": ["macos"]): ${escapeHtml(repoDeclaredMacRepos.join(", "))}` : ""}</div>`,
+    }),
+  ].join(""));
+
+  const schedulingSection = renderSection("Scheduling", [
+    `<div class="config-subsection">
+      <h3>Intervals (minutes)</h3>
+      <div class="config-grid">
+        ${Object.entries(intervals).map(([key, value]) => renderField({
+          name: `interval_${key}`,
+          label: key.replace(/Ms$/, ""),
+          value: String(Math.round(value / 60000)),
+          type: "number",
+          min: 1,
+        })).join("")}
+      </div>
+    </div>`,
+    `<div class="config-subsection">
+      <h3>Schedules (hour, 0-23)</h3>
+      <div class="config-grid">
+        ${Object.entries(schedules).map(([key, value]) => renderField({
+          name: `schedule_${key}`,
+          label: key.replace(/Hour$/, ""),
+          value: String(value),
+          type: "number",
+          min: 0,
+          max: 23,
+        })).join("")}
+      </div>
+    </div>`,
+  ].join(""));
+
+  const authenticationSection = renderSection("Authentication", [
+    `<div class="config-subsection">
+      <h3>SSO (authentik / OIDC)</h3>
+      <div class="config-grid">
+        ${renderField({
+          name: "oidcBaseUrl",
+          label: "Authentik Base URL",
+          value: String(cfg.oidcBaseUrl ?? ""),
+          note: joinNotes(
+            envNote("oidcBaseUrl"),
+            '<div class="field-note">e.g. https://auth.home.bstjohn.net — all four OIDC fields are required to enable login; without them the dashboard is inaccessible</div>',
+          ),
+          disabled: isDisabled("oidcBaseUrl"),
+        })}
+        ${renderField({
+          name: "oidcApplicationSlug",
+          label: "Application Slug",
+          value: String(cfg.oidcApplicationSlug ?? ""),
+          note: joinNotes(
+            envNote("oidcApplicationSlug"),
+            '<div class="field-note">The application slug in authentik (e.g. claws)</div>',
+          ),
+          disabled: isDisabled("oidcApplicationSlug"),
+        })}
+        ${renderField({
+          name: "oidcClientId",
+          label: "Client ID",
+          value: String(cfg.oidcClientId ?? ""),
+          note: envNote("oidcClientId"),
+          disabled: isDisabled("oidcClientId"),
+        })}
+        ${renderSecretField({
+          name: "oidcClientSecret",
+          label: "Client Secret",
+          placeholder: String(cfg.oidcClientSecret ?? ""),
+          note: joinNotes(
+            envNote("oidcClientSecret"),
+            '<div class="field-note">Leave empty to keep current value</div>',
+          ),
+          disabled: isDisabled("oidcClientSecret"),
+        })}
+        ${renderField({
+          name: "oidcRedirectUri",
+          label: "Redirect URI",
+          value: String(cfg.oidcRedirectUri ?? ""),
+          note: joinNotes(
+            envNote("oidcRedirectUri"),
+            '<div class="field-note">e.g. https://claws.home.bstjohn.net/auth/callback</div>',
+          ),
+          disabled: isDisabled("oidcRedirectUri"),
+        })}
+        ${renderField({
+          name: "dashboardUrl",
+          label: "Dashboard URL",
+          value: String(cfg.dashboardUrl ?? ""),
+          note: joinNotes(
+            envNote("dashboardUrl"),
+            '<div class="field-note">e.g. https://claws.home.bstjohn.net — used for links in Slack alerts; defaults to the OIDC redirect URI\'s origin</div>',
+          ),
+          disabled: isDisabled("dashboardUrl"),
+        })}
+      </div>
+    </div>`,
+  ].join(""));
+
+  const disabledAgentsSection = renderSection("Disabled Agents", [
+    '<div class="field-note">Uncheck agents to disable them within the issue-dispatcher/pr-dispatcher jobs.</div>',
+    `<div class="config-check-group">
+      ${VALID_AGENT_NAMES.map((name) => {
+        const checked = !(Array.isArray(cfg.disabledAgents) && (cfg.disabledAgents as string[]).includes(name));
+        return `<label class="config-check" for="agent_${escapeHtml(name)}">
+          <input type="checkbox" name="enabledAgent_${escapeHtml(name)}" id="agent_${escapeHtml(name)}" value="true"${checked ? " checked" : ""}>
+          <span>${escapeHtml(name)}</span>
+        </label>`;
+      }).join("")}
+    </div>`,
+  ].join(""));
+
+  const providerConfig = cfg.aiProviders as config.AiProviderConfig | undefined;
+  const opencodeAvailable = !!config.OPENROUTER_API_KEY || isOpenCodeBinaryAvailable();
+  /**
+   * The tier × provider grid, driven entirely by MODEL_TIER_TABLE so the page
+   * and `getModel()` can never disagree about which key feeds which tier. A
+   * cell with no `configKey` is a Claude CLI alias with nothing to configure,
+   * and renders as read-only text.
+   */
+  const renderModelTierTable = () => {
+    const rows = MODEL_TIER_TABLE.map((row) => {
+      const cells = config.AI_PROVIDER_NAMES.map((provider) => {
+        const cell = row.providers[provider];
+        if (!cell.configKey) {
+          return `<div class="config-field">
+            <label>${escapeHtml(providerShortLabels[provider])}</label>
+            <div class="tier-fixed"><code>${escapeHtml(cell.defaultModel)}</code></div>
+            <div class="field-note">CLI alias — always the newest model in this tier</div>
+          </div>`;
+        }
+        const value = String((cfg as Record<string, unknown>)[cell.configKey] ?? cell.defaultModel);
+        return `<div class="config-field">
+          <label for="${escapeHtml(cell.configKey)}">${escapeHtml(providerShortLabels[provider])}</label>
+          <input type="text" name="${escapeHtml(cell.configKey)}" id="${escapeHtml(cell.configKey)}" value="${escapeHtml(value)}" aria-label="${escapeHtml(cell.label)}"${isDisabled(cell.configKey) ? " disabled" : ""}>
+          ${envNote(cell.configKey)}
+        </div>`;
+      }).join("");
+      return `<div class="tier-row">
+        <div class="tier-row-head">
+          <span class="tier-name">${escapeHtml(row.label)}</span>
+          <span class="field-note">${escapeHtml(row.description)}</span>
+        </div>
+        <div class="tier-row-fields">${cells}</div>
+      </div>`;
+    }).join("");
+    return `<div class="field-note">Every agent picks a tier; this table says which concrete model each tier means for each provider. Clear a Codex field for the CLI’s own default.</div>
+      <div class="tier-table">${rows}</div>`;
+  };
+
+  const renderProviderControls = () => {
+    const rows = config.AI_PROVIDER_NAMES.map((provider) => {
+      const entry = providerConfig?.[provider] ?? config.DEFAULT_AI_PROVIDERS[provider];
+      const checked = entry.enabled !== false ? " checked" : "";
+      const weight = Number.isFinite(Number(entry.weight)) ? String(entry.weight) : String(config.DEFAULT_AI_PROVIDERS[provider].weight);
+      const noKey = provider === "opencode" && !opencodeAvailable
+        ? ' <span class="config-inline-note">(no API key set)</span>'
+        : "";
+      return `<div class="provider-row">
+        <label class="config-check" for="providerEnabled_${provider}">
+          <input type="checkbox" name="providerEnabled_${provider}" id="providerEnabled_${provider}" value="true"${checked}>
+          <span>${providerLabels[provider]}${noKey}</span>
+        </label>
+        <div class="config-field provider-weight">
+          <label for="providerWeight_${provider}">Weight</label>
+          <input type="number" name="providerWeight_${provider}" id="providerWeight_${provider}" value="${escapeHtml(weight)}" min="0.01" step="0.01">
+        </div>
+      </div>`;
+    }).join("");
+    return `<div class="provider-table">${rows}</div>`;
+  };
+
+  const aiProvidersSection = renderSection("AI Providers", [
+    '<div class="field-note">Eligible agent runs choose randomly among enabled providers using these weights. The <strong>Use Claude</strong>, <strong>Use Codex</strong>, and <strong>Use OpenCode</strong> labels pin one issue or PR when that provider is eligible.</div>',
+    renderProviderControls(),
+    renderSecretField({
+      name: "openrouterApiKey",
+      label: "OpenRouter API Key",
+      placeholder: String(cfg.openrouterApiKey ?? ""),
+      note: joinNotes(
+        envNote("openrouterApiKey"),
+        '<div class="field-note">Leave empty to keep current value. Required for the OpenCode provider.</div>',
+      ),
+      disabled: isDisabled("openrouterApiKey"),
+    }),
+    renderField({
+      name: "ollamaBaseUrl",
+      label: "Ollama Base URL",
+      value: String(cfg.ollamaBaseUrl ?? "https://ollama.home.bstjohn.net"),
+      note: '<div class="field-note">Base URL for local Ollama instance used for rate-limit classification</div>',
+    }),
+    renderField({
+      name: "ollamaTimeoutMs",
+      label: "Ollama Classification Timeout (seconds)",
+      value: String(Math.round(Number(cfg.ollamaTimeoutMs ?? 60000) / 1000)),
+      type: "number",
+      min: 5,
+      note: '<div class="field-note">Timeout for Ollama queries. Use 60+ seconds to allow cold GPU model loading.</div>',
+    }),
+    renderField({
+      name: "ollamaConsecutiveFailuresBeforeDisable",
+      label: "Consecutive Failures Before Skipping Ollama",
+      value: String(Number(cfg.ollamaConsecutiveFailuresBeforeDisable ?? 3)),
+      type: "number",
+      min: 1,
+      note: '<div class="field-note">After this many consecutive Ollama failures, skip for 5 minutes and use regex fallback</div>',
+    }),
+    renderField({
+      name: "providerRateLimitCooldownMs",
+      label: "Provider Rate Limit Cooldown (minutes)",
+      value: String(Math.round(Number(cfg.providerRateLimitCooldownMs ?? 300000) / 60000)),
+      type: "number",
+      min: 1,
+      note: '<div class="field-note">How long to skip a rate-limited provider before retrying</div>',
+    }),
+    renderModelTierTable(),
+    renderSelectField({
+      name: "reviewModelTier",
+      label: "Default Review Model Tier",
+      value: String(cfg.reviewModelTier ?? "sonnet"),
+      options: MODEL_TIER_TABLE.map((row) => ({ value: row.tier, label: row.label })),
+      note: joinNotes(
+        '<div class="field-note">Tier PR reviews run on when neither the plan nor the PR body names one.</div>',
+        envNote("reviewModelTier"),
+      ),
+      disabled: isDisabled("reviewModelTier"),
+    }),
+    renderField({
+      name: "improvementIdentifierModel",
+      label: "Improvement Identifier Model",
+      value: String(cfg.improvementIdentifierModel ?? "openrouter/z-ai/glm-5.3"),
+      note: '<div class="field-note">OpenRouter model ID used for improvement-identifier\'s repo analysis via OpenCode</div>',
+    }),
+  ].join(""));
+
+  const activationDescription = config.ACTIVATION_STATE === "active"
+    ? '<strong class="status-active">active</strong> - scheduler runs all configured jobs, WhatsApp pairs, and external side-effects are live.'
+    : config.ACTIVATION_STATE === "staging"
+    ? '<strong class="status-active">staging</strong> - only issue/PR pipeline workers run, and only live items carrying <code>Claws Staging</code> are eligible.'
+    : '<strong class="status-verify-only">verify-only</strong> - no jobs run. Deployment is isolated while you validate connectivity below.';
+  const activationButtons = config.ACTIVATION_STATE === "active" || config.ACTIVATION_STATE === "staging"
+    ? '<button type="button" onclick="claws_setActivation(\'verify-only\')" class="btn-danger activation-btn">Switch to verify-only</button>'
+    : [
+        '<button type="button" onclick="claws_setActivation(\'staging\')" class="btn-success activation-btn">Enable staging pipeline</button>',
+        '<button type="button" onclick="claws_setActivation(\'active\')" class="activation-btn">Activate fully</button>',
+      ].join("\n    ");
+
+  return `<!DOCTYPE html>
+${htmlOpenTag(theme)}
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  ${HEAD_META}
+  <title>claws — config</title>
+  ${TAILWIND_STYLESHEET}
+  <style>${PAGE_CSS}</style>
+  ${ALPINE_SCRIPT}
+</head>
+<body x-data="configPage()">
+  ${buildPageHeader("Config", theme)}
+  ${THEME_SCRIPT}
+  ${LOCAL_TIME_SCRIPT}
+  ${saved ? '<div class="banner">Configuration saved and applied.</div>' : ""}
+
+  <section class="config-static-block" id="activation">
+    <h2>Activation</h2>
+    <p class="config-activation-status">Current state:
+      ${activationDescription}
+    </p>
+    <div class="field-note">Toggling activation requires a process restart so jobs and WhatsApp can be re-initialised cleanly. After clicking, restart this process (e.g. <code>kubectl rollout restart statefulset/claws</code> or <code>systemctl restart claws</code>).</div>
+    ${activationButtons}
+    ${buildConnectivityChecks(report)}
+  </section>
+  <script>
+    function claws_setActivation(state) {
+      if (!confirm("Flip activation to '" + state + "'? You will need to restart the process afterwards.")) return;
+      fetch("/api/activation", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ state: state, confirm: true }),
+      }).then(function(r) { return r.json(); }).then(function(j) {
+        if (j.error) { alert("Error: " + j.error); return; }
+        alert("Activation state set to '" + j.state + "'. " + (j.restartRequired ? "Restart required." : ""));
+        window.location.reload();
+      }).catch(function(err) { alert("Request failed: " + err); });
+    }
+  </script>
+
+  ${unknownKeys.length === 0 ? "" : `<section class="warning-banner config-static-block config-warning-block">
+    <h2>Unknown Config Keys</h2>
+    <p>The following keys in your config.json are not recognized and will be ignored. You can remove them to clean up your configuration:</p>
+    <ul>
+      ${unknownKeys.map((key) => `<li><code>${escapeHtml(key)}</code></li>`).join("")}
+    </ul>
+    <form method="POST" action="/config/remove-unknown-keys">
+      <button type="submit" class="btn-danger">Remove Unknown Keys</button>
+    </form>
+  </section>`}
+
+  <form method="POST" action="/config" class="config-form">
+    ${generalSection}
+    ${integrationsSection}
+    ${emailSection}
+    ${runnersSection}
+    ${schedulingSection}
+    ${authenticationSection}
+    ${disabledAgentsSection}
+    ${aiProvidersSection}
+
+    <button type="submit" class="save-btn">Save Configuration</button>
+  </form>
+
+  <script>
+    function configPage() {
+      return {
+        init() {
+          this.bindGroup();
+        },
+        bindGroup() {},
+      };
+    }
+  </script>
+</body>
+</html>`;
+}
