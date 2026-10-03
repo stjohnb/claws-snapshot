@@ -1,0 +1,114 @@
+name: Claude Code Release
+
+# The image disables the Claude CLI's self-updater (#3088 — uid 1000 can never
+# write to the root-owned npm prefix it was installed into), so new CLI versions
+# only reach sessions through a new image. This checks npm daily and calls
+# release.yml when the latest release did not ship the current version, or when
+# that release's image never got pushed.
+#
+# It is a separate workflow rather than a `schedule` trigger on release.yml:
+# - main-build-monitor treats a workflow's newest push/schedule run as its state,
+#   so a no-op scheduled success in Release's history would close an open Release
+#   failure alert while the pipeline is still broken.
+# - release.yml's workflow-level `release` concurrency group keeps one pending run,
+#   and a new one cancels it. This file's own `check` job runs outside that group,
+#   so a no-op scheduled check never joins it or evicts a pending push release.
+#   When it does call release.yml, both a push run and this call build current
+#   main HEAD (#3096), so replacing a pending push release loses nothing either way.
+# The release runs via `workflow_call`, not `gh workflow run`, so a failed
+# scheduled release is reported under this workflow's name; main-build-monitor
+# ignores `workflow_dispatch` runs.
+# Triggers removed for the public snapshot — this workflow is intentionally disabled.
+# See the private source repository for the active version.
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+
+env:
+  NIX_FLAGS: --extra-experimental-features nix-command --extra-experimental-features flakes
+
+jobs:
+  check:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      build: ${{ steps.check.outputs.build }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Nix
+        uses: ./.github/actions/setup-nix
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Check for a new Claude Code version
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v=""
+          for i in 1 2 3; do
+            v=$(nix $NIX_FLAGS develop --command npm view @anthropic-ai/claude-code@latest version) && break
+            echo "npm view attempt $i failed, retrying after 10s" >&2
+            v=""
+            sleep 10
+          done
+          if ! echo "$v" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::npm view returned an unexpected Claude Code version after 3 attempts: '$v'"
+            exit 1
+          fi
+
+          # gh release view with no tag returns the latest published release,
+          # skipping drafts. A failure here (auth, API 5xx, devShell build) must
+          # not read as "no previous version", or every day would cut a release.
+          if ! release=$(nix $NIX_FLAGS develop .#scripts --command gh release view --repo "$GITHUB_REPOSITORY" --json body,tagName,publishedAt --jq '[.tagName, .publishedAt, .body] | join("\n")'); then
+            echo "::error::gh release view failed; cannot tell which Claude Code version the latest release shipped"
+            exit 1
+          fi
+          tag=$(printf '%s\n' "$release" | sed -n '1p')
+          publishedAt=$(printf '%s\n' "$release" | sed -n '2p')
+          # Empty only for a release cut before #3088 started recording the version.
+          last=$(printf '%s\n' "$release" | tail -n +3 | grep -m1 '^Claude Code CLI: ' | sed 's/^Claude Code CLI: //' || true)
+          if [ -z "$last" ] || [ "$last" != "$v" ]; then
+            echo "Claude Code version changed (latest release $tag: '${last:-none}', npm latest: '$v'), releasing"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # The version line is written when the GitHub Release is created, before
+          # the docker job runs, so a release whose image build failed would
+          # otherwise count as shipped.
+          image="ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]'):$tag"
+          if out=$(docker manifest inspect "$image" 2>&1 >/dev/null); then
+            echo "Claude Code version unchanged ($v) and $image exists, skipping release"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          elif echo "$out" | grep -qiE 'no such manifest|manifest unknown'; then
+            # The docker job that pushes the image takes ~4 min against a 20 min
+            # timeout, so a release younger than that (plus margin) may just still
+            # be building; only treat an older, still-missing image as failed.
+            age=$(( $(date +%s) - $(date -d "$publishedAt" +%s) ))
+            if [ "$age" -gt 2700 ]; then
+              echo "Claude Code version unchanged ($v) but $image was never pushed (release is $((age / 60))m old), releasing"
+              echo "build=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Claude Code version unchanged ($v) but $image build may still be in progress (release is $((age / 60))m old), skipping"
+              echo "build=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "::error::docker manifest inspect $image failed: $out"
+            exit 1
+          fi
+
+  release:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    permissions:
+      contents: write
+      packages: write
+    uses: ./.github/workflows/release.yml
+    secrets: inherit

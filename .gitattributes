@@ -1,0 +1,3 @@
+# Keep the snapshot PII scrub map out of the public snapshot export.
+# `git archive` (used by scripts/update-snapshot.sh) honours export-ignore.
+scripts/snapshot-scrub.map export-ignore
