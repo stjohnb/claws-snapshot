@@ -1,0 +1,105 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+
+const { mockConfig } = vi.hoisted(() => ({
+  mockConfig: {
+    HOME_ASSISTANT_BASE_URL: "http://ha.local" as string | undefined,
+    HOME_ASSISTANT_TOKEN: "test-token" as string | undefined,
+    HOME_ASSISTANT_CONFIG_REPO: "St-John-Software/home-assistant-config",
+  },
+}));
+vi.mock("./config.js", () => mockConfig);
+
+import { haWebSocketUrl, isHaTransient, isHomeAssistantConfigRepo, homeAssistantMcpAvailable } from "./home-assistant.js";
+
+beforeEach(() => {
+  mockConfig.HOME_ASSISTANT_BASE_URL = "http://ha.local";
+  mockConfig.HOME_ASSISTANT_TOKEN = "test-token";
+});
+
+describe("isHaTransient", () => {
+  it("returns true for HA API 500", () => {
+    expect(isHaTransient(new Error("HA API 500 for /api/states: Internal Server Error"))).toBe(true);
+  });
+
+  it("returns true for HA API 502", () => {
+    expect(isHaTransient(new Error("HA API 502 for /api/states: Bad Gateway"))).toBe(true);
+  });
+
+  it("returns true for HA API 503", () => {
+    expect(isHaTransient(new Error("HA API 503 for /api/states: Service Unavailable"))).toBe(true);
+  });
+
+  it("returns true for HA API 504", () => {
+    expect(isHaTransient(new Error("HA API 504 for /api/states: Gateway Timeout"))).toBe(true);
+  });
+
+  it("returns true for HA API 429 (rate limited)", () => {
+    expect(isHaTransient(new Error("HA API 429 for /api/states: Too Many Requests"))).toBe(true);
+  });
+
+  it("returns false for HA API 404", () => {
+    expect(isHaTransient(new Error("HA API 404 for /api/states/missing: Not Found"))).toBe(false);
+  });
+
+  it("returns false for HA API 401", () => {
+    expect(isHaTransient(new Error("HA API 401 for /api/states: Unauthorized"))).toBe(false);
+  });
+
+  it("returns false for HA API 501", () => {
+    expect(isHaTransient(new Error("HA API 501 for /api/states: Not Implemented"))).toBe(false);
+  });
+
+  it("returns true when err.name is TimeoutError", () => {
+    const err = new Error("The operation was aborted due to timeout");
+    err.name = "TimeoutError";
+    expect(isHaTransient(err)).toBe(true);
+  });
+
+  it("returns false for a generic Error", () => {
+    expect(isHaTransient(new Error("Something went wrong"))).toBe(false);
+  });
+});
+
+describe("isHomeAssistantConfigRepo", () => {
+  it("returns true for the configured repo", () => {
+    expect(isHomeAssistantConfigRepo("St-John-Software/home-assistant-config")).toBe(true);
+  });
+
+  it("returns true for the configured repo case-insensitively", () => {
+    expect(isHomeAssistantConfigRepo("st-john-software/HOME-ASSISTANT-CONFIG")).toBe(true);
+  });
+
+  it("returns false for an unrelated repo", () => {
+    expect(isHomeAssistantConfigRepo("St-John-Software/claws")).toBe(false);
+  });
+});
+
+describe("homeAssistantMcpAvailable", () => {
+  it("returns true for the HA config repo when HA is configured", () => {
+    expect(homeAssistantMcpAvailable("St-John-Software/home-assistant-config")).toBe(true);
+  });
+
+  it("returns false for an unrelated repo even when HA is configured", () => {
+    expect(homeAssistantMcpAvailable("St-John-Software/claws")).toBe(false);
+  });
+
+  it("returns false for the HA config repo when HA is not configured", () => {
+    mockConfig.HOME_ASSISTANT_BASE_URL = undefined;
+    mockConfig.HOME_ASSISTANT_TOKEN = undefined;
+    expect(homeAssistantMcpAvailable("St-John-Software/home-assistant-config")).toBe(false);
+  });
+});
+
+describe("haWebSocketUrl", () => {
+  it("maps https to wss", () => {
+    expect(haWebSocketUrl("https://ha.example.net")).toBe("wss://ha.example.net/api/websocket");
+  });
+
+  it("maps http to ws", () => {
+    expect(haWebSocketUrl("http://ha.local:8123")).toBe("ws://ha.local:8123/api/websocket");
+  });
+
+  it("strips a trailing slash", () => {
+    expect(haWebSocketUrl("https://ha.example.net/")).toBe("wss://ha.example.net/api/websocket");
+  });
+});

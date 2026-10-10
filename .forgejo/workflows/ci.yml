@@ -1,0 +1,103 @@
+name: CI
+
+# Runs on Forgejo Actions; the repo moved off GitHub (docs/forgejo-cutover.md).
+on:
+  push:
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+      - LICENSE
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# The org's CI runs on self-hosted NixOS runners, and every toolchain this
+# workflow needs — node, and the C toolchain for the native modules
+# (better-sqlite3, node-pty) — comes from this repo's own flake.nix via
+# `nix develop`, isolated in the nix store from whatever other repos put on
+# the same runners. Do NOT add actions/setup-node, sudo/apt-get, or ask for
+# packages on the runner itself; add tools to flake.nix instead.
+env:
+  # Don't rely on the runner's nix.conf having flakes turned on.
+  NIX_FLAGS: --extra-experimental-features nix-command --extra-experimental-features flakes
+
+jobs:
+  build:
+    runs-on: [self-hosted, linux]
+    # 20, not 10: the first run after a flake.lock bump downloads the node/gcc
+    # closure into the runner's nix store. Warm runs are unaffected.
+    timeout-minutes: 20
+    steps:
+      - uses: https://github.com/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Nix
+        uses: ./.github/actions/setup-nix
+      # Verifies sharp's native libvips installed; retries a clean install if not.
+      - run: nix $NIX_FLAGS develop --command bash scripts/ci-npm-ci.sh
+      - run: nix $NIX_FLAGS develop --command npm run build
+      # npm run build regenerates src/resources/*.generated.ts from
+      # src/client/*.ts and overwrites them in place. If a PR edited a
+      # client source file without committing the rebuilt bundle, the
+      # working tree is now dirty — fail loudly instead of shipping a
+      # stale bundle that silently drops the source fix.
+      - name: Verify generated client bundles are committed
+        run: git diff --exit-code -- src/resources/*.generated.ts
+      - run: nix $NIX_FLAGS develop --command npm test
+      # Same DB suites again against PGlite — real Postgres compiled to wasm,
+      # in-process, installed by npm ci. Proves the dialect and the schema; pool
+      # contention and SKIP LOCKED concurrency are only exercised in staging.
+      - run: nix $NIX_FLAGS develop --command npm run test:pg
+
+  # Builds the Dockerfile before merge so the secret-scanning RUN blocks
+  # (#3179) execute somewhere other than release.yml, gated to
+  # Dockerfile/deploy/** changes so most pushes skip the extra ~2 min.
+  #
+  # Uses the Docker daemon's own builder (no buildx), same as release.yml's
+  # docker job (#3251) — a Dockerfile change that builds here will also build
+  # at release time.
+  docker-build:
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: https://github.com/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Check whether Dockerfile or deploy/** changed
+        id: changed
+        run: |
+          before="${{ github.event.before }}"
+          if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$before" 2>/dev/null; then
+            echo "No usable previous commit to diff against — building"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif git diff --name-only "$before" "${{ github.sha }}" | grep -qE '^(Dockerfile|deploy/)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Set up Nix
+        if: steps.changed.outputs.run == 'true'
+        uses: ./.github/actions/setup-nix
+      # Builds through the runtime stage so both secret-scanning RUN blocks
+      # (session-shell-defaults) and the zsh -i login smoke test (runtime) execute.
+      # Pull-only: this job never pushes an image. `docker` comes from the
+      # scripts devShell; the runner provides only the daemon.
+      - name: Build runtime image
+        if: steps.changed.outputs.run == 'true'
+        env:
+          LAN_USER: ${{ secrets.LAN_REGISTRY_PULL_USER }}
+          LAN_PASS: ${{ secrets.LAN_REGISTRY_PULL_PASSWORD }}
+        run: |
+          nix $NIX_FLAGS develop .#scripts --command bash -euo pipefail <<'SCRIPT'
+          missing=""
+          [ -n "${LAN_USER:-}" ] || missing="$missing LAN_REGISTRY_PULL_USER"
+          [ -n "${LAN_PASS:-}" ] || missing="$missing LAN_REGISTRY_PULL_PASSWORD"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secret(s):$missing — needed to pull claws-session-shell from registry.home.bstjohn.net"
+            exit 1
+          fi
+          printf '%s' "$LAN_PASS" | docker login registry.home.bstjohn.net -u "$LAN_USER" --password-stdin
+          docker pull registry.home.bstjohn.net/st-john-software/claws-session-shell:latest
+          docker build --target runtime .
+          SCRIPT

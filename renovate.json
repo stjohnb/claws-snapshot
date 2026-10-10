@@ -1,0 +1,23 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "timezone": "Europe/London",
+  "schedule": ["after 7pm"],
+  "packageRules": [
+    {
+      "description": "One PR for the DSPy tooling's Python dependencies, as Dependabot's pip group did",
+      "matchFileNames": ["tools/dspy/**"],
+      "groupName": "tools/dspy"
+    },
+    {
+      "description": "One PR for Dockerfile base-image bumps, as Dependabot's docker group did",
+      "matchManagers": ["dockerfile"],
+      "groupName": "docker"
+    },
+    {
+      "description": "Self-built LAN registry images are bumped by their own release pipelines, not Renovate",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["registry.home.bstjohn.net/st-john-software/**"],
+      "enabled": false
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+# Watched by the upstream-watcher job — see docs/jobs/upstream-watcher.md.
+# Unblocks fleet-infra#975 once fleet-infra#974 (LAN-registry cutover, PR 3 of 3) merges.
+target:
+  repo: St-John-Software/fleet-infra
+  issue: 975
+require: all
+conditions:
+  - kind: pr_merged
+    repo: St-John-Software/fleet-infra
+    number: 974
+note: >-
+  The posted plan's "Blocking precondition" section is now satisfied: re-check that
+  apps/arpwatch/deployment.yaml and apps/forgejo-runner/config.yaml point at
+  registry.home.bstjohn.net before dropping the GHCR push from the build workflows.

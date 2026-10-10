@@ -1,0 +1,388 @@
+name: Release
+
+# Publishes a Forgejo release and pushes the service image to the LAN registry
+# only (registry.home.bstjohn.net); see docs/forgejo-cutover.md.
+#
+# Besides push, claude-code-release.yml calls this workflow (`workflow_call`)
+# when npm has a Claude Code version the latest release did not ship (#3088).
+# That daily check lives in its own workflow so a no-op scheduled success never
+# lands in Release's run history (main-build-monitor would read it as "green
+# again" and close an open Release failure alert), and so it never joins the
+# `release` concurrency group unless it is actually going to release.
+# `workflow_dispatch` forces a manual release; main-build-monitor ignores it.
+#
+# Coalescing back-to-back merges (#3096): every run builds `main` HEAD at
+# checkout time, not its own triggering commit. A push run whose triggering
+# commit is already contained in the newest release tag, with that tag's
+# image already pushed, exits via the `check` job without tagging, building
+# or dispatching anything. That skip only confirms the image was pushed, not
+# that the earlier run's fleet-infra staging dispatch succeeded — if that
+# step failed, staging stays behind until a push lands outside any tag.
+# Combined with the `release` concurrency group below (one running + one
+# pending, older pending runs cancelled), a burst of N pushes to main yields
+# at most two releases: the run already in progress, and one pending run
+# that builds whatever HEAD is by the time it starts.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "ideas/**"
+      - "*.md"
+      - "tools/dspy/README.md"
+      - LICENSE
+  workflow_call: {}
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+# Toolchain comes from this repo's flake.nix via `nix develop` — same policy
+# as ci.yml: the runners are self-hosted NixOS boxes that provide only nix,
+# git and docker, and each repo brings its own CI dependencies, isolated in
+# the nix store. Every node/npm step below MUST be prefixed with
+# `nix $NIX_FLAGS develop --command`; a bare `npm ci` dies with
+# `npm: command not found` / exit 127 on a NixOS runner (issue #2343).
+# The `docker`, `curl` and `jq` clients come from the `scripts` devShell.
+# No actions/setup-node, no sudo/apt-get on the runner itself.
+#
+# Registry logins use `docker login --password-stdin` and log out on exit, so
+# no credential lingers in the runner's docker config after the step.
+#
+# The `docker` job's Dockerfile builder stage does its own `npm ci`, version
+# injection and `npm run build` from a Debian-based image, so this workflow's
+# `release` job builds nothing beyond the version tag and release notes.
+env:
+  NIX_FLAGS: --extra-experimental-features nix-command --extra-experimental-features flakes
+  IMAGE: registry.home.bstjohn.net/st-john-software/claws
+
+jobs:
+  # Skips a push run whose triggering commit has already shipped, so a burst
+  # of merges yields at most two releases (#3096). Always builds for a
+  # `workflow_call` or `workflow_dispatch` run, since those target an
+  # already-tagged HEAD to ship a new Claude Code version or a manual release.
+  check:
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      build: ${{ steps.check.outputs.build }}
+    steps:
+      - uses: https://github.com/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-tags: true
+          fetch-depth: 0
+      - name: Set up Nix
+        uses: ./.github/actions/setup-nix
+      - name: Check whether this push's commit already shipped
+        id: check
+        env:
+          REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+        run: |
+          nix $NIX_FLAGS develop .#scripts --command bash -euo pipefail <<'SCRIPT'
+          if [ "$GITHUB_EVENT_NAME" != "push" ]; then
+            echo "$GITHUB_EVENT_NAME run, always releasing main HEAD"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          latest=$(git for-each-ref --sort=-v:refname --count=1 --format='%(refname:short)' 'refs/tags/v*')
+          if [ -z "$latest" ] || ! git merge-base --is-ancestor "$GITHUB_SHA" "$latest" 2>/dev/null; then
+            echo "$GITHUB_SHA has not shipped yet (newest tag: ${latest:-none}), releasing"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          missing=""
+          [ -n "${REGISTRY_USER:-}" ] || missing="$missing REGISTRY_USER"
+          [ -n "${REGISTRY_PASSWORD:-}" ] || missing="$missing REGISTRY_PASSWORD"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing org secret(s):$missing — needed to inspect $IMAGE on registry.home.bstjohn.net"
+            exit 1
+          fi
+          printf '%s' "$REGISTRY_PASSWORD" | docker login registry.home.bstjohn.net -u "$REGISTRY_USER" --password-stdin
+          trap 'docker logout registry.home.bstjohn.net >/dev/null 2>&1 || true' EXIT
+
+          image="$IMAGE:$latest"
+          if out=$(docker manifest inspect "$image" 2>&1 >/dev/null); then
+            msg="$GITHUB_SHA already shipped in $latest (image present); main HEAD $(git rev-parse HEAD) has nothing new from this push, skipping"
+            echo "$msg"
+            echo "$msg" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          elif echo "$out" | grep -qiE 'no such manifest|manifest unknown'; then
+            echo "$latest's image was never pushed, releasing main HEAD"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::docker manifest inspect $image failed: $out"
+            exit 1
+          fi
+          SCRIPT
+
+  release:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: [self-hosted, linux]
+    # ~2 min warm. 30 covers a cold nix closure download after a flake.lock
+    # bump plus the npm view retry loops below.
+    timeout-minutes: 30
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      claude_version: ${{ steps.claude.outputs.version }}
+      codex_version: ${{ steps.codex.outputs.version }}
+      sha: ${{ steps.head.outputs.sha }}
+    steps:
+      - uses: https://github.com/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-tags: true
+          fetch-depth: 0
+      - name: Record HEAD being released
+        id: head
+        run: |
+          sha=$(git rev-parse HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          msg="Releasing main HEAD $sha (triggered by $GITHUB_SHA)"
+          echo "$msg"
+          echo "$msg" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+      - name: Set up Nix
+        uses: ./.github/actions/setup-nix
+      # Every build installs an exact, recorded Claude Code version instead of
+      # floating on `latest` (#3088). One attempt used to be enough, but this
+      # now gates every release, so a registry blip must not lose one (#1966).
+      - name: Resolve Claude Code version
+        id: claude
+        run: |
+          v=""
+          for i in 1 2 3; do
+            v=$(nix $NIX_FLAGS develop --command npm view @anthropic-ai/claude-code@latest version) && break
+            echo "npm view attempt $i failed, retrying after 10s" >&2
+            v=""
+            sleep 10
+          done
+          if ! echo "$v" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::npm view returned an unexpected Claude Code version after 3 attempts: '$v'"
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      # Same reasoning as the Claude Code resolve step above, so Codex's
+      # baked-in version is visible and reproducible per build (#3312).
+      - name: Resolve Codex version
+        id: codex
+        run: |
+          v=""
+          for i in 1 2 3; do
+            v=$(nix $NIX_FLAGS develop --command npm view @openai/codex@latest version) && break
+            echo "npm view attempt $i failed, retrying after 10s" >&2
+            v=""
+            sleep 10
+          done
+          if ! echo "$v" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::npm view returned an unexpected Codex version after 3 attempts: '$v'"
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Compute version tag
+        id: version
+        run: |
+          today=$(date -u +%Y-%m-%d)
+          last=$(git for-each-ref --sort=-v:refname --count=1 --format='%(refname:short)' "refs/tags/v${today}.*")
+          if [ -z "$last" ]; then
+            v=1
+          else
+            v=$(( ${last##*.} + 1 ))
+          fi
+          echo "tag=v${today}.${v}" >> "$GITHUB_OUTPUT"
+
+      - name: Push tag
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          git tag "$TAG"
+          git push origin "$TAG"
+
+      # claude-code-release.yml reads the first `Claude Code CLI: ` line of the
+      # latest release body to decide whether npm has moved on (#3088), so that
+      # line must stay first.
+      - name: Generate release notes
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          CLAUDE_CODE_VERSION: ${{ steps.claude.outputs.version }}
+          CODEX_VERSION: ${{ steps.codex.outputs.version }}
+        run: |
+          PREV_TAG=""
+          for t in $(git for-each-ref --sort=-v:refname --count=2 --format='%(refname:short)' 'refs/tags/v*'); do
+            if [ "$t" != "$TAG" ]; then PREV_TAG="$t"; break; fi
+          done
+          {
+            echo "Claude Code CLI: $CLAUDE_CODE_VERSION"
+            echo "Codex CLI: $CODEX_VERSION"
+            echo ""
+            if [ -z "$PREV_TAG" ]; then
+              echo "Initial release"
+            else
+              git log --oneline --no-merges -n 20 "$PREV_TAG"..HEAD
+            fi
+          } > release-notes.txt
+
+      # Forgejo releases API directly; GitHub release actions only speak the
+      # GitHub API. `-K -` feeds the token on stdin so it never appears in
+      # curl's argv, and jq builds the JSON so no note can break the quoting.
+      - name: Create release
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+          SHA: ${{ steps.head.outputs.sha }}
+        run: |
+          nix $NIX_FLAGS develop .#scripts --command bash -euo pipefail <<'SCRIPT'
+          jq -n \
+            --arg tag "$TAG" \
+            --arg target "$SHA" \
+            --arg body "$(cat release-notes.txt)" \
+            '{tag_name: $tag, target_commitish: $target, name: $tag, body: $body, draft: false, prerelease: false}' \
+            > release.json
+          curl --fail-with-body -sS --max-time 60 -X POST -K - \
+            -H 'Content-Type: application/json' \
+            --data-binary @release.json \
+            -o /dev/null \
+            "${GITHUB_SERVER_URL}/api/v1/repos/${GITHUB_REPOSITORY}/releases" <<EOF
+          header = "Authorization: token ${TOKEN}"
+          EOF
+          echo "created Forgejo release ${TAG}"
+          rm -f release.json release-notes.txt
+          SCRIPT
+
+  docker:
+    needs: release
+    runs-on: [self-hosted, linux]
+    # A hung image build must never hold the pool (#2861). Two 25-minute build
+    # attempts plus checkout/login/nix/dispatch fit inside this.
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: https://github.com/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+      - name: Set up Nix
+        uses: ./.github/actions/setup-nix
+      - name: Validate prerequisites
+        env:
+          FORGEJO_TOKEN: ${{ secrets.FLEET_INFRA_VERSION_BUMP }}
+          REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+        run: |
+          missing=""
+          [ -n "${FORGEJO_TOKEN:-}" ] || missing="$missing FLEET_INFRA_VERSION_BUMP"
+          [ -n "${REGISTRY_USER:-}" ] || missing="$missing REGISTRY_USER"
+          [ -n "${REGISTRY_PASSWORD:-}" ] || missing="$missing REGISTRY_PASSWORD"
+          if [ -n "$missing" ]; then
+            echo "::error::Secret(s) not available to this workflow run:$missing"
+            exit 1
+          fi
+      # Do NOT add a BuildKit `cache-to`/`cache-from` export here: the gha cache
+      # leaked 6+ GB into the org-shared storage quota (#1698, #1717). Releases
+      # are infrequent; rebuilding layers each time is the intended trade-off.
+      # Docker Hub intermittently 500s when the builder resolves base-image
+      # metadata (#1966). One retry absorbs the blip rather than losing the
+      # image for an already-tagged release.
+      #
+      # Build with the Docker daemon's own builder — the same path ci.yml's
+      # docker-build job uses — not buildx's `docker-container` driver (#3251).
+      # Do NOT reintroduce buildx here.
+      #
+      # REGISTRY_USER/REGISTRY_PASSWORD are the org-level push identity; the same
+      # login also pulls claws-session-shell from the LAN registry.
+      - name: Build and push image
+        id: build
+        continue-on-error: true
+        # 25, not 15: each runner's dind cache is usually cold (docker-gc wipes
+        # it), and a cold build takes ~8–10 min. 25 still caps a genuine hang
+        # (#2862); the retry (#1966) absorbs Docker Hub 500s, not slow builds.
+        timeout-minutes: 25
+        env:
+          REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+          TAG: ${{ needs.release.outputs.tag }}
+          CLAUDE_CODE_VERSION: ${{ needs.release.outputs.claude_version }}
+          CODEX_VERSION: ${{ needs.release.outputs.codex_version }}
+        run: |
+          nix $NIX_FLAGS develop .#scripts --command bash -euo pipefail <<'SCRIPT'
+          printf '%s' "$REGISTRY_PASSWORD" | docker login registry.home.bstjohn.net -u "$REGISTRY_USER" --password-stdin
+          trap 'docker logout registry.home.bstjohn.net >/dev/null 2>&1 || true' EXIT
+          docker pull registry.home.bstjohn.net/st-john-software/claws-session-shell:latest
+          docker build \
+            --build-arg CLAWS_VERSION="$TAG" \
+            --build-arg CLAUDE_CODE_VERSION="$CLAUDE_CODE_VERSION" \
+            --build-arg CODEX_VERSION="$CODEX_VERSION" \
+            -t "$IMAGE:$TAG" -t "$IMAGE:latest" .
+          docker push "$IMAGE:$TAG"
+          docker push "$IMAGE:latest"
+          # Keep :latest for layer reuse; drop the version tag so releases don't
+          # accumulate multi-GB images on the shared self-hosted runner.
+          docker image rm "$IMAGE:$TAG" >/dev/null 2>&1 || true
+          SCRIPT
+
+      - name: Build and push image (retry)
+        id: build-retry
+        if: steps.build.outcome == 'failure'
+        timeout-minutes: 25
+        env:
+          REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+          TAG: ${{ needs.release.outputs.tag }}
+          CLAUDE_CODE_VERSION: ${{ needs.release.outputs.claude_version }}
+          CODEX_VERSION: ${{ needs.release.outputs.codex_version }}
+        run: |
+          nix $NIX_FLAGS develop .#scripts --command bash -euo pipefail <<'SCRIPT'
+          printf '%s' "$REGISTRY_PASSWORD" | docker login registry.home.bstjohn.net -u "$REGISTRY_USER" --password-stdin
+          trap 'docker logout registry.home.bstjohn.net >/dev/null 2>&1 || true' EXIT
+          docker pull registry.home.bstjohn.net/st-john-software/claws-session-shell:latest
+          docker build \
+            --build-arg CLAWS_VERSION="$TAG" \
+            --build-arg CLAUDE_CODE_VERSION="$CLAUDE_CODE_VERSION" \
+            --build-arg CODEX_VERSION="$CODEX_VERSION" \
+            -t "$IMAGE:$TAG" -t "$IMAGE:latest" .
+          docker push "$IMAGE:$TAG"
+          docker push "$IMAGE:latest"
+          # Keep :latest for layer reuse; drop the version tag so releases don't
+          # accumulate multi-GB images on the shared self-hosted runner.
+          docker image rm "$IMAGE:$TAG" >/dev/null 2>&1 || true
+          SCRIPT
+
+      - name: Dispatch fleet-infra claws bump
+        if: steps.build.outcome == 'success' || steps.build-retry.outcome == 'success'
+        env:
+          FORGEJO_TOKEN: ${{ secrets.FLEET_INFRA_VERSION_BUMP }}
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          nix $NIX_FLAGS develop .#scripts --command bash -euo pipefail <<'SCRIPT'
+          # fleet-infra is on Forgejo; `-K -` feeds the token on stdin so it
+          # never appears in curl's argv.
+          URL=https://git.home.bstjohn.net/api/v1/repos/St-John-Software/fleet-infra/actions/workflows/update-claws.yml/dispatches
+          for attempt in 1 2 3 4 5; do
+            if curl --fail-with-body -sS --max-time 30 -X POST -K - \
+                -H 'Content-Type: application/json' \
+                -d "{\"ref\":\"main\",\"inputs\":{\"tag\":\"${TAG}\"}}" \
+                "$URL" <<EOF
+          header = "Authorization: token ${FORGEJO_TOKEN}"
+          EOF
+            then
+              echo "dispatched fleet-infra update-claws.yml with tag=${TAG}"
+              exit 0
+            fi
+            if [ "$attempt" -lt 5 ]; then
+              echo "dispatch attempt ${attempt} failed, retrying in 20s" >&2
+              sleep 20
+            fi
+          done
+          echo "::error::could not dispatch fleet-infra update-claws.yml after 5 attempts (tag=${TAG}); the image is pushed, so do not rebuild: run update-claws.yml on Forgejo fleet-infra by hand with that tag"
+          exit 1
+          SCRIPT

@@ -1,0 +1,191 @@
+# Dashboard and integrations
+
+**Reference.** Read this when changing dashboard behaviour, external services, or
+operator workflows. Read [operations and safety](operations-and-safety.md) for deployment
+and alert safety constraints.
+
+## Problem
+
+The dashboard and integrations must make automation actionable without hiding important
+state behind host access or forcing users into fragile manual workflows.
+
+## Users
+
+The owner monitors work from the dashboard, working from a phone, a tablet and a
+large-monitor desktop, and connects Claws to repository, messaging, and home
+integrations.
+
+## Requirements
+
+### Keep active sessions distinct from historical sessions
+
+The sessions page shows active sessions first, retains a searchable combined history,
+and makes it possible to resume or inspect a session's history.
+**Why:** active work must be easy to find without losing useful past context.
+
+### Keep aggregate repository views actionable
+
+Cross-repository issue and pull-request views must expose real CI and review state and
+offer only actions that meet the applicable merge safety gate. The Status page's agent
+queue lists every queued or running item across every managed repo, with its issue and
+title, and a Prioritise control the operator can act on directly rather than having to
+open each repo's own queue.
+**Why:** an aggregate dashboard is useful only if it supports safe decisions.
+
+### Work on phone, tablet and large-monitor desktop
+
+Frequently used workflow views remain reachable on mobile. Mobile data entry puts the
+task before explanatory material while retaining necessary context on demand. Every
+user-facing page uses the available width on a large monitor, has no side-scrolling
+primary content on a tablet, and collapses tables to cards on a phone. The nav is one
+bar with the same layout on every device: the four most-used views (Board, Issues, PRs,
+Sessions) pinned on the left, then a More menu holding every other destination and the
+account menu on the right. Each destination appears in the nav exactly once, the current
+page is marked, and the bar never wraps, from a 360px phone upwards. At a given window
+width the bar sits in the same place on every page, whatever that page's content width.
+**Why:** operators use the dashboard away from a desktop, on whichever device is at hand.
+
+### Retain the fixed damp-reading record
+
+Damp readings use the owner-defined measurement points, save incremental entries, and
+show the points together with construction context.
+**Why:** comparisons over time are valid only when the fixed collection and partial entries survive.
+
+### Run voice transcription locally by default
+
+Voice-note transcription runs with the service or its local runtime and is enabled by default
+for the supported messaging flow.
+**Why:** remote transcription and external credit dependencies proved unreliable.
+
+### Route a voice-note issue to the repository it names
+
+A voice note that names a managed repository is transcribed with that name spelled correctly
+and the issue it creates lands in that repository, not a topically similar one.
+**Why:** voice notes are the owner's mobile intake path, and a misrouted issue is planned
+against the wrong codebase before anyone notices.
+
+### Let a repository provide its own UI guidance
+
+Repositories with a user interface should have their own design guidance rather than
+adopting a global visual prescription.
+**Why:** user-facing choices are specific to the repository and its audience.
+
+### Set lifecycle state through one control
+
+The operator sets an issue's lifecycle state by moving it between columns on the board or
+with the issue page's status buttons (including **Mark refined**), and it is stored as one
+field on the issue rather than as label checkboxes.
+**Why:** a single field cannot hold two contradictory states, and the control applies a
+complete, valid state.
+
+### Show the board as the lifecycle's stages, grouped
+
+The board's columns are the lifecycle's stages — Drafting, Requirements review,
+Planning, Awaiting plan review, Approved, Implementing, PR progressing, PR stalled, Awaiting
+merge, Closed, with Blocked and the Backlog tray — grouped as shaping, building and landing. A column where a
+human is needed is marked as such and accepts a drop; a column Claws moves
+cards through on its own is derived from the store at render time and refuses
+one. Approved and Awaiting plan review accept a drop only for an issue that has
+a plan, and a drop into Planning on an issue with a plan starts a re-plan, so no
+move leaves an issue in a state the pipeline cannot act on. Plan review and
+merge review are separate columns. An issue's open pull requests put its card in
+PR stalled when any of them cannot move on until a person acts — Manual Action,
+CI fixes exhausted, or CI blocked — and in PR progressing while automation is
+still moving them; the card moves between the two on its own as the PR's state
+changes. At every width only the columns waiting on the operator —
+Requirements review, Awaiting plan review, Blocked, PR stalled and Awaiting
+merge — start open; the rest, the Backlog tray among them, start collapsed and
+still show their name and card count, and the operator can expand or collapse
+any of them for the visit. A card can be dropped on a collapsed column that
+accepts drops. On a phone the groups stack and the folded columns Claws sets
+(Drafting and the derived ones) are counted in their group's header.
+Drafting holds an issue while Claws owes it a requirements version — none yet,
+or a person has commented on the latest one since it was stored — and every
+issue with no repository; Requirements review holds one whose latest version
+waits on the person. A card moves between the two on its own when a version is
+stored or a person comments, with no move and no edit to the issue, and an issue
+is promoted from either. A card in
+Drafting or Requirements review carries a collapsed preview of the idea — its requirements record's
+Requirement part, or the start of the issue body before a record exists — so
+the column can be triaged without opening every issue. An Awaiting merge card
+waiting on the operator previews the open operator step — its title and
+manual-action instructions — instead of the plan. A hand close — dragging
+a card into Closed, or the issue page's Close issue control — records the
+reason as not planned by default, with a way to instead mark it completed for
+work finished outside Claws; the closed card and the issue page show the
+recorded reason, so a dropped issue is told apart from a shipped one.
+Approved design: [refinements/issue-flow.md](../refinements/issue-flow.md).
+**Why:** one Ideas column hid whether an issue waits on Claws or on the
+operator, and one In progress column hides three states the operator treats
+differently — the implementer running, a pull request cycling through CI and
+review, and a pull request waiting for a person — and the same word, Ready,
+means "plan awaits review" on an issue and "merge awaits review" on a pull
+request. A single PR open column likewise hid the pull requests stuck on a person
+among the ones automation was still moving, and a large-screen board with every
+column open buried the few cards that need the operator among the many that do not.
+
+### Show how long a board card has waited in its column
+
+Every board card shows, compactly and without growing the card, how long its
+issue has been in its current column, and marks it once it has waited too long
+in a column where a person must act.
+**Why:** a card that has sat in a human-gate column for days is the one the
+operator must act on, and nothing else on the board says so.
+
+### Show native issue ids in a short form
+
+Wherever the dashboard shows a Claws-native issue id as text, it shows a short
+form that keeps the id's distinguishing characters, while every link, form and
+stored value carries the full id.
+**Why:** native ids share a long common prefix, so two full ids are
+indistinguishable at a glance, but the full id is the only safe key for data.
+
+### Show repository names in a short form
+
+Wherever the dashboard shows a repository as text it shows only the repository
+name, while every link, form value and stored value carries the full
+owner/name.
+**Why:** all managed repositories share one owner, so the prefix costs space
+and adds nothing.
+
+### Show an issue as request, current plan and discussion, and keep every plan version
+
+The issue page shows a Claws-native issue as its initial request, its current plan and its
+comments, each a collapsible block, with the plan split into its sections and every earlier
+version of the plan still viewable. Pages that list many issues offer the plan collapsed on
+each issue, and opening it shows the plan in an overlay rather than growing the row or card. See [issue-tracker.md#plans](../issue-tracker.md#plans).
+**Why:** the plan is what the operator reviews and approves; once a refinement rewrites it
+in place the reasoning it replaced is lost, and a plan buried in a flat comment thread is
+hard to find, read section by section, or compare with what came before.
+
+### Show an issue's pull requests
+
+The issue page lists every pull request associated with the issue, in any repository and
+any state, each as a link to the PR on the forge with its number, title and state.
+See [issue-tracker.md#pull-requests](../issue-tracker.md#pull-requests).
+**Why:** operators open an issue to follow its progress, and without the list they have to
+leave the page and search the PRs list or the forge to find the PR.
+
+### Keep public snapshots publishing across forge migrations
+
+A public mirror keeps publishing from its private source regardless of which forge hosts the source, and a source that cannot be found is alerted rather than skipped.
+**Why:** a mirror that stalls silently after a source migrates to Forgejo is the failure that blocks the migration batch.
+
+### Keep the primary release Latest on a public mirror
+
+Which release is Latest on a public mirror is decided by an explicit per-pair tag rule, not by the order releases were mirrored; releases from other tag families never become Latest, and a pair with no rule keeps its newest release Latest.
+**Why:** a `linux-v*` release mirrored after the app release became Latest and broke the macOS update checker for every installed app.
+
+### Publish a mirror that exists for published writing from an explicit allowlist
+
+A public mirror that exists only to support published writing publishes an explicit allowlist of paths, not "everything minus a scrub list".
+**Why:** a deny-list publishes the full inventory of what runs on the home network, far beyond what the blog posts need.
+
+## Non-goals & rejected ideas
+
+- Do not make explanatory text or multi-row dashboard chrome displace an interactive terminal on compact touch screens; a single-row nav is acceptable.
+- A native iOS client is not required where the supported web app can provide the needed access.
+
+## Open questions
+
+- Comment moderation for the blog remains proposed and is not a current integration.

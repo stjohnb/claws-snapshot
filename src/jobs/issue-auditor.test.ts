@@ -1,0 +1,823 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { mockRepo, mockIssue } from "../test-helpers.js";
+
+const mockConfig = vi.hoisted(() => ({
+  isAgentDisabled: vi.fn().mockReturnValue(false),
+  isJobDisabledForRepo: vi.fn().mockReturnValue(false),
+}));
+
+vi.mock("../config.js", async () => ({
+  isClawsIssueId: (await vi.importActual<typeof import("../issue-id.js")>("../issue-id.js")).isClawsIssueId,
+  LABELS: {
+    refined: "Refined",
+    duplicate: "Duplicate",
+    blocked: "Blocked",
+    ready: "Ready",
+    priority: "Priority",
+    problematic: "Claws Problematic",
+    manualAction: "Manual Action",
+    needsLgtm: "Needs LGTM",
+    billing: "Billing",
+    automerge: "Automerge",
+  },
+  SELF_REPO: "org/claws",
+  isAgentDisabled: mockConfig.isAgentDisabled,
+  isJobDisabledForRepo: mockConfig.isJobDisabledForRepo,
+}));
+
+const mockAlerts = vi.hoisted(() => ({
+  upsertAlertIssue: vi.fn(),
+  closeAlertIssueIfResolved: vi.fn(),
+}));
+vi.mock("../occurrence-tracking.js", () => mockAlerts);
+
+vi.mock("../log.js", () => ({
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+}));
+
+vi.mock("../error-reporter.js", () => ({
+  reportError: vi.fn(),
+}));
+
+const { mockGh } = vi.hoisted(() => ({
+  mockGh: {
+    listOpenIssues: vi.fn(),
+    getSelfLogin: vi.fn(),
+    getSelfLoginForRepo: vi.fn(),
+    getSelfLoginForIssue: vi.fn(),
+    getOpenPRForIssue: vi.fn(),
+    getCommentReactions: vi.fn(),
+    getIssueComments: vi.fn(),
+    addLabel: vi.fn(),
+    removeLabel: vi.fn(),
+    closeIssue: vi.fn(),
+    commentOnIssue: vi.fn(),
+    getIssueState: vi.fn(),
+    isClawsComment: (body: string) => /\*— Automated by Claws(?:\s*·\s*[\w\s-]+)?\s*—\*/.test(body) || body.includes("<!-- claws-automated -->"),
+    isRateLimited: vi.fn().mockReturnValue(false),
+    isItemSkipped: vi.fn().mockReturnValue(false),
+    isAllowedActor: vi.fn().mockResolvedValue(true),
+    hasIgnoreLabel: vi.fn().mockReturnValue(false),
+    isParked: vi.fn().mockReturnValue(false),
+    listMergedPRsForIssue: vi.fn(),
+    listPRs: vi.fn(),
+    invalidatePRList: vi.fn(),
+  },
+}));
+
+vi.mock("../github.js", () => mockGh);
+const mockDb = vi.hoisted(() => ({ markRepoProcessedDaily: vi.fn(), listClawsPrs: vi.fn(), setShadowLifecycle: vi.fn(), setIssueBlockedReason: vi.fn(), hasPendingIssueRefinerWork: vi.fn(), hasRunningTask: vi.fn() }));
+vi.mock("../db.js", () => mockDb);
+vi.mock("../smart-schedule.js", () => ({
+  localDateString: () => "2024-01-15",
+  withDailyRepoMarking: async (jobName: string, repoFullName: string, fn: () => Promise<unknown>, onError?: (err: unknown) => unknown) => {
+    try {
+      return await fn();
+    } catch (err) {
+      if (!onError) throw err;
+      return onError(err);
+    } finally {
+      mockDb.markRepoProcessedDaily(jobName, repoFullName, "2024-01-15");
+    }
+  },
+}));
+
+vi.mock("./triage-claws-errors.js", () => ({
+  extractFingerprint: vi.fn().mockReturnValue(null),
+  REPORT_HEADER: "## Claws Error Investigation Report",
+}));
+
+const mockFindPlanComment = vi.hoisted(() => vi.fn());
+const mockParsePlan = vi.hoisted(() => vi.fn());
+vi.mock("../plan-parser.js", async () => ({
+  findPlanComment: mockFindPlanComment,
+  parsePlan: mockParsePlan,
+  duplicateOfFromPlan: (await vi.importActual<typeof import("../plan-parser.js")>("../plan-parser.js")).duplicateOfFromPlan,
+}));
+
+const mockLoadStored = vi.hoisted(() => vi.fn());
+const mockLoadPhaseState = vi.hoisted(() => vi.fn());
+vi.mock("../planned-prs.js", () => ({
+  loadStoredPlannedPRs: mockLoadStored,
+  loadIssuePhaseState: mockLoadPhaseState,
+  resolveTrackerId: vi.fn().mockResolvedValue(null),
+}));
+
+import { run, processRepo, classifyIssue, auditIssue } from "./issue-auditor.js";
+import { reportError } from "../error-reporter.js";
+import * as db from "../db.js";
+import { extractFingerprint } from "./triage-claws-errors.js";
+import * as log from "../log.js";
+
+describe("issue-auditor", () => {
+  const repo = mockRepo();
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGh.listOpenIssues.mockResolvedValue([]);
+    mockGh.getSelfLogin.mockResolvedValue("claws-bot[bot]");
+    mockGh.getSelfLoginForRepo.mockResolvedValue("claws-bot[bot]");
+    mockGh.getSelfLoginForIssue.mockResolvedValue("claws-bot[bot]");
+    mockGh.getOpenPRForIssue.mockResolvedValue(null);
+    mockGh.getCommentReactions.mockResolvedValue([]);
+    mockGh.addLabel.mockResolvedValue(undefined);
+    mockGh.removeLabel.mockResolvedValue(undefined);
+    mockGh.closeIssue.mockResolvedValue(undefined);
+    mockGh.commentOnIssue.mockResolvedValue(undefined);
+    mockGh.getIssueState.mockResolvedValue({ state: "OPEN", stateReason: null, labels: [] });
+    mockGh.getIssueComments.mockResolvedValue([]);
+    mockGh.listMergedPRsForIssue.mockResolvedValue([]);
+    mockGh.listPRs.mockResolvedValue([]);
+    mockDb.listClawsPrs.mockResolvedValue([]);
+    mockAlerts.upsertAlertIssue.mockResolvedValue("created");
+    mockAlerts.closeAlertIssueIfResolved.mockResolvedValue(null);
+    mockGh.isRateLimited.mockReturnValue(false);
+    mockFindPlanComment.mockReturnValue(null);
+    mockParsePlan.mockReturnValue({ preamble: "", phases: [], totalPhases: 0 });
+    mockLoadStored.mockResolvedValue(null);
+    vi.mocked(extractFingerprint).mockReturnValue(null);
+  });
+
+  it("skips issues with Refined label", async () => {
+    const issue = mockIssue({ labels: [{ name: "Refined" }] });
+    mockGh.listOpenIssues.mockResolvedValueOnce([issue]);
+
+    await run([repo]);
+
+    expect(mockGh.addLabel).not.toHaveBeenCalled();
+  });
+
+  // An open PR is read from the PR store, not a label: in-progress only
+  // keeps the auditor from adding Ready.
+  it("labels nothing for an in-progress issue", async () => {
+    const issue = mockIssue();
+    mockGh.listOpenIssues.mockResolvedValueOnce([issue]);
+    mockGh.getOpenPRForIssue.mockResolvedValueOnce({ number: 10, headRefName: "claws/issue-1-ab12" });
+
+    await run([repo]);
+
+    expect(mockGh.addLabel).not.toHaveBeenCalled();
+    expect(mockGh.removeLabel).not.toHaveBeenCalled();
+  });
+
+  it("skips [claws-error] issues without investigation report", async () => {
+    const issue = mockIssue({ title: "[claws-error] something" });
+    mockGh.listOpenIssues.mockResolvedValueOnce([issue]);
+    vi.mocked(extractFingerprint).mockReturnValue("something");
+    mockGh.getIssueComments.mockResolvedValue([]);
+
+    await run([repo]);
+
+    expect(mockGh.addLabel).not.toHaveBeenCalled();
+  });
+
+  it("skips issues with no plan (needs refinement)", async () => {
+    const issue = mockIssue();
+    mockGh.listOpenIssues.mockResolvedValueOnce([issue]);
+    mockGh.getIssueComments.mockResolvedValue([]);
+
+    await run([repo]);
+
+    expect(mockGh.addLabel).not.toHaveBeenCalled();
+  });
+
+  it("skips issues with unreacted human feedback", async () => {
+    const issue = mockIssue();
+    mockGh.listOpenIssues.mockResolvedValueOnce([issue]);
+    mockGh.getIssueComments.mockResolvedValue([
+      { id: 100, body: "*— Automated by Claws —*\n\n## Implementation Plan\nDo something", login: "claws-bot[bot]" },
+      { id: 101, body: "I think we should change the approach", login: "human-user" },
+    ]);
+    mockGh.getCommentReactions.mockResolvedValue([]);
+    mockGh.listMergedPRsForIssue.mockResolvedValue([]);
+
+    await run([repo]);
+
+    expect(mockGh.addLabel).not.toHaveBeenCalled();
+  });
+
+  it("adds Ready label when plan exists, all feedback addressed, label missing", async () => {
+    const issue = mockIssue({ labels: [] });
+    mockGh.listOpenIssues.mockResolvedValueOnce([issue]);
+    mockGh.getIssueComments.mockResolvedValue([
+      { id: 100, body: "*— Automated by Claws —*\n\n## Implementation Plan\nDo something", login: "claws-bot[bot]" },
+    ]);
+    mockGh.listMergedPRsForIssue.mockResolvedValue([]);
+
+    const fixes = await processRepo(repo);
+
+    expect(mockGh.addLabel).toHaveBeenCalledWith(repo.fullName, issue.number, "Ready");
+    expect(fixes).toHaveLength(1);
+    expect(fixes).toContainEqual(expect.stringMatching(/added Ready to/));
+  });
+
+  // A backlog issue is parked (#3293): the auditor must not re-add Ready to a
+  // planned one, or it would drift back onto the board's Awaiting plan review.
+  it("skips a Backlog issue before classifying it, even with a plan", async () => {
+    const issue = mockIssue({ labels: [{ name: "Backlog" }] });
+    mockGh.listOpenIssues.mockResolvedValueOnce([issue]);
+    mockGh.isParked.mockImplementation((labels: { name: string }[]) => labels.some((l) => l.name === "Backlog"));
+    mockGh.getIssueComments.mockResolvedValue([
+      { id: 100, body: "*— Automated by Claws —*\n\n## Implementation Plan\nDo something", login: "claws-bot[bot]" },
+    ]);
+
+    await run([repo]);
+
+    expect(mockGh.getIssueComments).not.toHaveBeenCalled();
+    expect(mockGh.addLabel).not.toHaveBeenCalled();
+    mockGh.isParked.mockReturnValue(false);
+  });
+
+  it("does not add Ready when already present", async () => {
+    const issue = mockIssue({ labels: [{ name: "Ready" }] });
+    mockGh.listOpenIssues.mockResolvedValueOnce([issue]);
+    mockGh.getIssueComments.mockResolvedValue([
+      { id: 100, body: "*— Automated by Claws —*\n\n## Implementation Plan\nDo something", login: "claws-bot[bot]" },
+    ]);
+    mockGh.listMergedPRsForIssue.mockResolvedValue([]);
+
+    await run([repo]);
+
+    expect(mockGh.addLabel).not.toHaveBeenCalled();
+  });
+
+  it("adds Ready label for stuck multi-phase issues", async () => {
+    const issue = mockIssue({ labels: [] });
+    mockGh.listOpenIssues.mockResolvedValueOnce([issue]);
+    mockGh.getIssueComments.mockResolvedValue([
+      { id: 100, body: "*— Automated by Claws —*\n\n## Implementation Plan\n### PR 1: First\nDo first\n### PR 2: Second\nDo second", login: "claws-bot[bot]" },
+    ]);
+    mockGh.listMergedPRsForIssue.mockResolvedValue([
+      { number: 20, title: "fix: First (1/2)", headRefName: "claws/issue-1-ab12" },
+    ]);
+    mockFindPlanComment.mockReturnValue("## Implementation Plan\n### PR 1: First\nDo first\n### PR 2: Second\nDo second");
+    mockParsePlan.mockReturnValue({
+      preamble: "",
+      phases: [
+        { phaseNumber: 1, title: "First", description: "Do first" },
+        { phaseNumber: 2, title: "Second", description: "Do second" },
+      ],
+      totalPhases: 2,
+    });
+
+    const fixes = await processRepo(repo);
+
+    expect(mockGh.addLabel).toHaveBeenCalledWith(repo.fullName, issue.number, "Ready");
+    expect(fixes).toContainEqual(expect.stringMatching(/stuck multi-phase/));
+  });
+
+  it("closes completed multi-phase issue via content-based phase matching", async () => {
+    const issue = mockIssue({ labels: [] });
+    mockGh.listOpenIssues.mockResolvedValueOnce([issue]);
+    mockGh.getIssueComments.mockResolvedValue([
+      { id: 100, body: "*— Automated by Claws —*\n\n## Implementation Plan\n### PR 1: First\nDo first\n### PR 2: Second\nDo second", login: "claws-bot[bot]" },
+    ]);
+    mockGh.listMergedPRsForIssue.mockResolvedValue([
+      { number: 20, title: "fix: First (1/2)", headRefName: "claws/issue-1-ab12" },
+      { number: 21, title: "fix: Second (2/2)", headRefName: "claws/issue-1-cd34" },
+    ]);
+    mockFindPlanComment.mockReturnValue("## Implementation Plan\n### PR 1: First\nDo first\n### PR 2: Second\nDo second");
+    mockParsePlan.mockReturnValue({
+      preamble: "",
+      phases: [
+        { phaseNumber: 1, title: "First", description: "Do first" },
+        { phaseNumber: 2, title: "Second", description: "Do second" },
+      ],
+      totalPhases: 2,
+    });
+
+    const fixes = await processRepo(repo);
+
+    expect(mockGh.closeIssue).toHaveBeenCalledWith(repo.fullName, issue.number, "completed");
+    expect(mockGh.addLabel).not.toHaveBeenCalledWith(repo.fullName, issue.number, "Ready");
+    expect(fixes).toContainEqual(expect.stringMatching(/closed completed multi-phase/));
+  });
+
+  it("closes completed multi-phase issue with legacy ref-in-title PRs", async () => {
+    const issue = mockIssue({ labels: [] });
+    mockGh.listOpenIssues.mockResolvedValueOnce([issue]);
+    mockGh.getIssueComments.mockResolvedValue([
+      { id: 100, body: "*— Automated by Claws —*\n\n## Implementation Plan\n### PR 1: First\nDo first\n### PR 2: Second\nDo second", login: "claws-bot[bot]" },
+    ]);
+    mockGh.listMergedPRsForIssue.mockResolvedValue([
+      { number: 20, title: "fix(#1): First (1/2)", headRefName: "claws/issue-1-ab12" },
+      { number: 21, title: "fix(#1): Second (2/2)", headRefName: "claws/issue-1-cd34" },
+    ]);
+    mockFindPlanComment.mockReturnValue("## Implementation Plan\n### PR 1: First\nDo first\n### PR 2: Second\nDo second");
+    mockParsePlan.mockReturnValue({
+      preamble: "",
+      phases: [
+        { phaseNumber: 1, title: "First", description: "Do first" },
+        { phaseNumber: 2, title: "Second", description: "Do second" },
+      ],
+      totalPhases: 2,
+    });
+
+    const fixes = await processRepo(repo);
+
+    expect(mockGh.closeIssue).toHaveBeenCalledWith(repo.fullName, issue.number, "completed");
+    expect(mockGh.addLabel).not.toHaveBeenCalledWith(repo.fullName, issue.number, "Ready");
+    expect(fixes).toContainEqual(expect.stringMatching(/closed completed multi-phase/));
+  });
+
+  it("closes completed multi-phase issue via fallback counting (no phase patterns in titles)", async () => {
+    const issue = mockIssue({ labels: [] });
+    mockGh.listOpenIssues.mockResolvedValueOnce([issue]);
+    mockGh.getIssueComments.mockResolvedValue([
+      { id: 100, body: "*— Automated by Claws —*\n\n## Implementation Plan\n### PR 1: First\nDo first\n### PR 2: Second\nDo second", login: "claws-bot[bot]" },
+    ]);
+    mockGh.listMergedPRsForIssue.mockResolvedValue([
+      { number: 20, title: "fix: First phase", headRefName: "claws/issue-1-ab12" },
+      { number: 21, title: "fix: Second phase", headRefName: "claws/issue-1-cd34" },
+    ]);
+    mockFindPlanComment.mockReturnValue("## Implementation Plan\n### PR 1: First\nDo first\n### PR 2: Second\nDo second");
+    mockParsePlan.mockReturnValue({
+      preamble: "",
+      phases: [
+        { phaseNumber: 1, title: "First", description: "Do first" },
+        { phaseNumber: 2, title: "Second", description: "Do second" },
+      ],
+      totalPhases: 2,
+    });
+
+    const fixes = await processRepo(repo);
+
+    expect(mockGh.closeIssue).toHaveBeenCalledWith(repo.fullName, issue.number, "completed");
+    expect(fixes).toContainEqual(expect.stringMatching(/closed completed multi-phase/));
+  });
+
+  it("classifies no-body issues as needs-refinement (not skipped)", async () => {
+    const issue = mockIssue({ body: "" });
+    mockGh.listOpenIssues.mockResolvedValueOnce([issue]);
+    mockGh.getIssueComments.mockResolvedValue([]);
+
+    await run([repo]);
+
+    // No plan exists, so it's needs-refinement — no label added, no warning
+    expect(mockGh.addLabel).not.toHaveBeenCalled();
+  });
+
+  it("returns the applied fixes", async () => {
+    const issue = mockIssue({ labels: [] });
+    mockGh.listOpenIssues.mockResolvedValueOnce([issue]);
+    mockGh.getIssueComments.mockResolvedValue([
+      { id: 100, body: "*— Automated by Claws —*\n\n## Implementation Plan\nDo something", login: "claws-bot[bot]" },
+    ]);
+    mockGh.listMergedPRsForIssue.mockResolvedValue([]);
+
+    const fixes = await processRepo(repo);
+
+    expect(fixes.length).toBeGreaterThan(0);
+  });
+
+  it("returns no fixes when everything is clean", async () => {
+    mockGh.listOpenIssues.mockResolvedValueOnce([]);
+
+    expect(await processRepo(repo)).toEqual([]);
+  });
+
+  it("marks repo processed after run", async () => {
+    await run([repo]);
+    expect(vi.mocked(db.markRepoProcessedDaily)).toHaveBeenCalledWith(
+      "issue-auditor", repo.fullName, "2024-01-15"
+    );
+  });
+
+  it("marks repo processed even when rate-limited", async () => {
+    mockGh.isRateLimited.mockReturnValue(true);
+    await processRepo(repo);
+    expect(vi.mocked(db.markRepoProcessedDaily)).toHaveBeenCalledWith(
+      "issue-auditor", repo.fullName, "2024-01-15",
+    );
+  });
+
+  it("marks repo processed even when listOpenIssues throws", async () => {
+    mockGh.listOpenIssues.mockRejectedValueOnce(new Error("API failure"));
+    await processRepo(repo);
+    expect(vi.mocked(db.markRepoProcessedDaily)).toHaveBeenCalledWith(
+      "issue-auditor", repo.fullName, "2024-01-15",
+    );
+  });
+
+  it("per-repo error isolation — failure on one repo does not block others", async () => {
+    const repo1 = mockRepo({ fullName: "org/repo1", name: "repo1" });
+    const repo2 = mockRepo({ fullName: "org/repo2", name: "repo2" });
+    const issue2 = mockIssue({ labels: [] });
+
+    mockGh.listOpenIssues
+      .mockRejectedValueOnce(new Error("API failure"))
+      .mockResolvedValueOnce([issue2]);
+
+    mockGh.getIssueComments.mockResolvedValue([
+      { id: 100, body: "*— Automated by Claws —*\n\n## Implementation Plan\nDo something", login: "claws-bot[bot]" },
+    ]);
+    mockGh.listMergedPRsForIssue.mockResolvedValue([]);
+
+    await run([repo1, repo2]);
+
+    expect(reportError).toHaveBeenCalledWith("issue-auditor:audit-repo", "org/repo1", expect.any(Error), { repo: "org/repo1" });
+    expect(mockGh.addLabel).toHaveBeenCalledWith("org/repo2", issue2.number, "Ready");
+  });
+
+  describe("classifyIssue", () => {
+    it("returns refined for issues with Refined label", async () => {
+      const issue = mockIssue({ labels: [{ name: "Refined" }] });
+      expect(await classifyIssue(repo, issue)).toBe("refined");
+    });
+
+    it("returns in-progress for issues with open PR", async () => {
+      const issue = mockIssue();
+      mockGh.getOpenPRForIssue.mockResolvedValueOnce({ number: 10 });
+      expect(await classifyIssue(repo, issue)).toBe("in-progress");
+    });
+
+    it("returns needs-refinement for issues with no body", async () => {
+      const issue = mockIssue({ body: "" });
+      mockGh.getIssueComments.mockResolvedValue([]);
+      expect(await classifyIssue(repo, issue)).toBe("needs-refinement");
+    });
+
+    it("returns needs-triage for claws-error without report", async () => {
+      const issue = mockIssue({ title: "[claws-error] test" });
+      vi.mocked(extractFingerprint).mockReturnValue("test");
+      mockGh.getIssueComments.mockResolvedValue([]);
+      expect(await classifyIssue(repo, issue)).toBe("needs-triage");
+    });
+
+    it("returns needs-refinement for issues with no plan", async () => {
+      const issue = mockIssue();
+      mockGh.getIssueComments.mockResolvedValue([]);
+      expect(await classifyIssue(repo, issue)).toBe("needs-refinement");
+    });
+
+    it("returns ready when plan exists and no pending feedback", async () => {
+      const issue = mockIssue();
+      mockGh.getIssueComments.mockResolvedValue([
+        { id: 100, body: "*— Automated by Claws —*\n\n## Implementation Plan\nDo something", login: "claws-bot[bot]" },
+      ]);
+      mockGh.listMergedPRsForIssue.mockResolvedValue([]);
+      expect(await classifyIssue(repo, issue)).toBe("ready");
+    });
+
+    it("returns needs-refinement for a mid-flight comment posted before the plan comment lands (#2524)", async () => {
+      // Comment 150 landed while the planner was running, so GitHub orders it before
+      // the plan comment (id 500) even though it was posted after the run started —
+      // a raw "after the plan" slice would miss it and misclassify this as ready.
+      const issue = mockIssue();
+      mockGh.getIssueComments.mockResolvedValue([
+        { id: 100, body: "earlier comment", login: "reviewer" },
+        { id: 150, body: "human feedback mid-flight", login: "reviewer" },
+        {
+          id: 500,
+          body: "*— Automated by Claws —*\n\n## Implementation Plan\nDo something\n\nCLAWS_PLAN_LAST_COMMENT: 100",
+          login: "claws-bot[bot]",
+        },
+      ]);
+      mockGh.listMergedPRsForIssue.mockResolvedValue([]);
+      expect(await classifyIssue(repo, issue)).toBe("needs-refinement");
+    });
+  });
+
+  // A forge closes its own issues on `Closes #N`; a hand-merged PR leaves a
+  // native issue open, so the auditor closes it (#3215).
+  describe("native issue completion", () => {
+    const NATIVE = "clw_01JBQ7X4M2K8NV3TYRW9GZ5PDC";
+    const PLAN_COMMENT = { id: "clwc_01JBQ7X4M2K8NV3TYRW9GZ5PDC", body: "*— Automated by Claws —*\n\n## Implementation Plan\nDo something", login: "claws" };
+
+    it("closes a native issue whose claws/issue-<id> PR merged with Closes #<id>", async () => {
+      const issue = mockIssue({ number: NATIVE, labels: [] });
+      mockGh.listOpenIssues.mockResolvedValueOnce([issue]);
+      mockGh.getIssueComments.mockResolvedValue([PLAN_COMMENT]);
+      mockGh.listMergedPRsForIssue.mockResolvedValue([
+        { number: 7, headRefName: `claws/issue-${NATIVE}-thing`, body: `Closes #${NATIVE.toLowerCase()}` },
+      ]);
+
+      expect(await classifyIssue(repo, issue)).toBe("done-native");
+
+      await run([repo]);
+
+      expect(mockGh.closeIssue).toHaveBeenCalledWith(repo.fullName, NATIVE, "completed");
+      expect(mockGh.removeLabel).not.toHaveBeenCalled();
+    });
+
+    it("parks a native issue for a human, open, when its single-step PR merged without closing it", async () => {
+      const issue = mockIssue({ number: NATIVE, labels: [] });
+      mockGh.listOpenIssues.mockResolvedValueOnce([issue]);
+      mockGh.getIssueComments.mockResolvedValue([PLAN_COMMENT]);
+      mockGh.listMergedPRsForIssue.mockResolvedValue([
+        { number: 7, headRefName: `claws/issue-${NATIVE}-thing`, body: `Part of #${NATIVE}` },
+      ]);
+
+      expect(await classifyIssue(repo, issue)).toBe("needs-human");
+
+      await run([repo]);
+
+      expect(mockGh.closeIssue).not.toHaveBeenCalled();
+      expect(mockGh.addLabel).toHaveBeenCalledWith(repo.fullName, NATIVE, "Blocked");
+      expect(mockGh.addLabel).not.toHaveBeenCalledWith(repo.fullName, NATIVE, "Ready");
+    });
+
+    it("leaves a single-step issue alone while its re-plan is queued", async () => {
+      const issue = mockIssue({ number: NATIVE, labels: [] });
+      mockGh.getIssueComments.mockResolvedValue([PLAN_COMMENT]);
+      mockGh.listMergedPRsForIssue.mockResolvedValue([
+        { number: 7, headRefName: `claws/issue-${NATIVE}-thing`, body: `Part of #${NATIVE}` },
+      ]);
+      mockDb.hasPendingIssueRefinerWork.mockResolvedValueOnce(true);
+
+      expect(await classifyIssue(repo, issue)).toBe("in-progress");
+    });
+
+    it("leaves a single-step issue awaiting plan review alone even after a `Part of` PR merged", async () => {
+      // A human re-planned the remainder: the new plan is theirs to approve.
+      const issue = mockIssue({ number: NATIVE, labels: [{ name: "Ready" }] });
+      mockGh.getIssueComments.mockResolvedValue([PLAN_COMMENT]);
+      mockGh.listMergedPRsForIssue.mockResolvedValue([
+        { number: 7, headRefName: `claws/issue-${NATIVE}-thing`, body: `Part of #${NATIVE}` },
+      ]);
+
+      expect(await classifyIssue(repo, issue)).toBe("ready");
+    });
+
+    it("closes a Duplicate-labelled issue rather than labelling it Ready", async () => {
+      const issue = mockIssue({ number: 43, labels: [{ name: "Duplicate" }] });
+      mockGh.getIssueComments.mockResolvedValue([
+        PLAN_COMMENT,
+        { id: "c2", body: "Closing.\n\nclaws-duplicate-of:12", login: "claws" },
+      ]);
+      mockGh.getIssueState.mockResolvedValue({ state: "CLOSED", stateReason: "COMPLETED", labels: [] });
+
+      expect(await classifyIssue(repo, issue)).toBe("duplicate");
+      expect(await auditIssue(repo, issue)).toEqual([`closed duplicate ${repo.fullName}#43`]);
+
+      expect(mockGh.closeIssue).toHaveBeenCalledWith(repo.fullName, 43, "completed");
+      expect(mockGh.addLabel).not.toHaveBeenCalledWith(repo.fullName, 43, "Ready");
+    });
+
+    it("closes an issue whose plan is a duplicate verdict, without the label", async () => {
+      const issue = mockIssue({ number: 44, labels: [] });
+      const dupPlan = { ...PLAN_COMMENT, body: `${PLAN_COMMENT.body}\n\nCLAWS_DUPLICATE_OF: #12` };
+      mockGh.getIssueComments.mockResolvedValue([dupPlan]);
+      mockFindPlanComment.mockReturnValue(dupPlan.body);
+
+      expect(await classifyIssue(repo, issue)).toBe("duplicate");
+    });
+
+    it("classifies a duplicate-verdict issue as duplicate even with an open PR", async () => {
+      const issue = mockIssue({ number: 45, labels: [] });
+      const dupPlan = { ...PLAN_COMMENT, body: `${PLAN_COMMENT.body}\n\nCLAWS_DUPLICATE_OF: #12` };
+      mockGh.getOpenPRForIssue.mockResolvedValueOnce({ number: 10 });
+      mockGh.getIssueComments.mockResolvedValue([dupPlan]);
+      mockFindPlanComment.mockReturnValue(dupPlan.body);
+
+      expect(await classifyIssue(repo, issue)).toBe("duplicate");
+    });
+
+    it("does not close a forge issue on the same signal — the forge owns that", async () => {
+      const issue = mockIssue({ number: 42, labels: [] });
+      mockGh.listOpenIssues.mockResolvedValueOnce([issue]);
+      mockGh.getIssueComments.mockResolvedValue([PLAN_COMMENT]);
+      mockGh.listMergedPRsForIssue.mockResolvedValue([
+        { number: 7, headRefName: "claws/issue-42-thing", body: "Closes #42" },
+      ]);
+
+      await run([repo]);
+
+      expect(mockGh.closeIssue).not.toHaveBeenCalled();
+    });
+
+    it("never fires while an open PR is in flight", async () => {
+      const issue = mockIssue({ number: NATIVE, labels: [] });
+      mockGh.getOpenPRForIssue.mockResolvedValue({ number: 7 });
+      mockGh.listMergedPRsForIssue.mockResolvedValue([
+        { number: 6, headRefName: `claws/issue-${NATIVE}-thing`, body: `Closes #${NATIVE}` },
+      ]);
+
+      expect(await classifyIssue(repo, issue)).toBe("in-progress");
+    });
+
+    it("never fires from needs-refinement — unaddressed feedback wins", async () => {
+      const issue = mockIssue({ number: NATIVE, labels: [] });
+      mockGh.getIssueComments.mockResolvedValue([
+        PLAN_COMMENT,
+        { id: "clwc_01JBQ7X4M2K8NV3TYRW9GZ5PDD", body: "please also do X", login: "stjohnb" },
+      ]);
+      mockGh.getCommentReactions.mockResolvedValue([]);
+      mockGh.listMergedPRsForIssue.mockResolvedValue([
+        { number: 7, headRefName: `claws/issue-${NATIVE}-thing`, body: `Closes #${NATIVE}` },
+      ]);
+
+      expect(await classifyIssue(repo, issue)).toBe("needs-refinement");
+    });
+
+    it("never fires from stuck-multi-phase — the phase accounting owns that", async () => {
+      const issue = mockIssue({ number: NATIVE, labels: [] });
+      mockGh.getIssueComments.mockResolvedValue([PLAN_COMMENT]);
+      mockFindPlanComment.mockReturnValue("## Implementation Plan\nplan");
+      mockParsePlan.mockReturnValue({ preamble: "", phases: ["a", "b", "c"], totalPhases: 3 });
+      mockGh.listMergedPRsForIssue.mockResolvedValue([
+        { number: 7, title: "x (1/3)", headRefName: `claws/issue-${NATIVE}-thing`, body: `Closes #${NATIVE}` },
+      ]);
+
+      expect(await classifyIssue(repo, issue)).toBe("stuck-multi-phase");
+    });
+
+    it("never fires from ready — with no merged PR there is nothing to close on", async () => {
+      const issue = mockIssue({ number: NATIVE, labels: [] });
+      mockGh.getIssueComments.mockResolvedValue([PLAN_COMMENT]);
+      mockGh.listMergedPRsForIssue.mockResolvedValue([]);
+
+      expect(await classifyIssue(repo, issue)).toBe("ready");
+    });
+
+    it("auditIssue leaves a parked issue alone", async () => {
+      const issue = mockIssue({ number: NATIVE, labels: [{ name: "Blocked" }] });
+      mockGh.isParked.mockReturnValueOnce(true);
+
+      expect(await auditIssue(repo, issue)).toEqual([]);
+      expect(mockGh.addLabel).not.toHaveBeenCalled();
+    });
+
+    // A PR closed unmerged: the daily audit puts the issue back in Awaiting plan review.
+    it("auditIssue moves an issue with no open or merged PR back to Ready", async () => {
+      const issue = mockIssue({ number: NATIVE, labels: [] });
+      mockGh.getIssueComments.mockResolvedValue([PLAN_COMMENT]);
+
+      const fixes = await auditIssue(repo, issue);
+
+      expect(mockGh.addLabel).toHaveBeenCalledWith(repo.fullName, NATIVE, "Ready");
+      expect(mockGh.closeIssue).not.toHaveBeenCalled();
+      expect(fixes).toEqual([`added Ready to ${repo.fullName}#${NATIVE}`]);
+    });
+  });
+
+  // A multi-repo plan's step opens its PR in its own repo, which the issue
+  // repo's branch-prefix lookups cannot see; the stored list's coverage can.
+  describe("stored multi-repo PR list", () => {
+    const NATIVE = "clw_01JBQ7X4M2K8NV3TYRW9GZ5PDC";
+    const PLAN_COMMENT = { id: "clwc_01JBQ7X4M2K8NV3TYRW9GZ5PDC", body: "*— Automated by Claws —*\n\n## Implementation Plan\nDo something", login: "claws" };
+    const entries = [
+      { position: 1, repo: "test-org/test-repo", title: "Primary step", prNumber: 5 },
+      { position: 2, repo: "test-org/other-repo", title: "Other step", prNumber: 9 },
+    ];
+    const phaseState = (done: number[], openPhases: number[]) => ({
+      totalPhases: 2,
+      entries,
+      trackerId: NATIVE,
+      coverage: { totalPhases: 2, covered: new Set([...done, ...openPhases]), done: new Set(done), coveringPRs: new Map(), nextPhase: null, lastMergedPhase: 0, dependencies: new Map(), readyPhases: [], blockedPhases: [], openPhases, markerMismatches: [] },
+    });
+
+    beforeEach(() => {
+      mockGh.getIssueComments.mockResolvedValue([PLAN_COMMENT]);
+      mockLoadStored.mockResolvedValue({ trackerId: NATIVE, entries });
+    });
+
+    it("does not add Ready while a PR in another repo is open", async () => {
+      const issue = mockIssue({ number: NATIVE, labels: [] });
+      mockGh.listOpenIssues.mockResolvedValueOnce([issue]);
+      mockLoadPhaseState.mockResolvedValue(phaseState([], [1]));
+
+      expect(await classifyIssue(repo, issue)).toBe("in-progress");
+
+      await run([repo]);
+
+      expect(mockGh.removeLabel).not.toHaveBeenCalled();
+      expect(mockGh.addLabel).not.toHaveBeenCalled();
+    });
+
+    it("is in progress when step 1 merged and step 2's PR is open in another repo", async () => {
+      const issue = mockIssue({ number: NATIVE, labels: [] });
+      mockGh.listMergedPRsForIssue.mockResolvedValue([{ number: 5, title: "x (1/2)", body: "" }]);
+      mockLoadPhaseState.mockResolvedValue(phaseState([1], [2]));
+
+      expect(await classifyIssue(repo, issue)).toBe("in-progress");
+    });
+
+    // A parallel plan: step 2 is open while step 1 has not even started. The
+    // lowest uncovered step is below the open one, so only `openPhases` sees it.
+    it("is in progress with an open step above an uncovered one", async () => {
+      const issue = mockIssue({ number: NATIVE, labels: [] });
+      mockLoadPhaseState.mockResolvedValue({ ...phaseState([], [2]), coverage: { ...phaseState([], [2]).coverage, nextPhase: 1, readyPhases: [1] } });
+
+      expect(await classifyIssue(repo, issue)).toBe("in-progress");
+    });
+
+    it("is done when every step merged, even with nothing merged in the issue repo", async () => {
+      const issue = mockIssue({ number: NATIVE, labels: [] });
+      mockLoadPhaseState.mockResolvedValue(phaseState([1, 2], []));
+
+      expect(await classifyIssue(repo, issue)).toBe("done");
+    });
+
+    it("needs refinement, not done, when every step merged but a human comment is unanswered", async () => {
+      const issue = mockIssue({ number: NATIVE, labels: [] });
+      mockGh.getIssueComments.mockResolvedValue([
+        PLAN_COMMENT,
+        { id: "clwc_01JBQ7X4M2K8NV3TYRW9GZ5PDD", body: "this still doesn't work", login: "human" },
+      ]);
+      mockLoadPhaseState.mockResolvedValue(phaseState([1, 2], []));
+
+      expect(await classifyIssue(repo, issue)).toBe("needs-refinement");
+    });
+
+    it("leaves a single-step stored list to the done-native check", async () => {
+      const issue = mockIssue({ number: NATIVE, labels: [] });
+      mockLoadStored.mockResolvedValue({ trackerId: NATIVE, entries: [entries[0]] });
+      mockLoadPhaseState.mockResolvedValue({ ...phaseState([1], []), totalPhases: 1, entries: [entries[0]] });
+      // Merged, but its body never says it closes the issue.
+      mockGh.listMergedPRsForIssue.mockResolvedValue([{ number: 5, title: "Primary step", body: "" }]);
+
+      expect(await classifyIssue(repo, issue)).not.toMatch(/^done/);
+    });
+
+    it("skips the coverage load for a same-repo list with nothing merged", async () => {
+      const issue = mockIssue({ number: NATIVE, labels: [] });
+      mockLoadStored.mockResolvedValue({ trackerId: NATIVE, entries: [entries[0], { ...entries[1], repo: "test-org/test-repo" }] });
+
+      expect(await classifyIssue(repo, issue)).toBe("ready");
+      expect(mockLoadPhaseState).not.toHaveBeenCalled();
+    });
+
+    it("is stuck between steps when only another repo's step has merged", async () => {
+      const issue = mockIssue({ number: NATIVE, labels: [] });
+      mockLoadPhaseState.mockResolvedValue(phaseState([2], []));
+
+      expect(await classifyIssue(repo, issue)).toBe("stuck-multi-phase");
+    });
+
+    describe("with a manual (operator) step", () => {
+      const withManual = [
+        ...entries,
+        { position: 3, repo: "test-org/test-repo", title: "Manual actions (operator)", prNumber: null, dependsOn: [1, 2], kind: "manual", manualAction: null },
+      ];
+      const manualState = (done: number[]) => {
+        const state = phaseState(done, []);
+        return { ...state, totalPhases: 3, entries: withManual, coverage: { ...state.coverage, totalPhases: 3, awaitingOperator: done.length === 2 ? [3] : [] } };
+      };
+
+      beforeEach(() => {
+        mockLoadStored.mockResolvedValue({ trackerId: NATIVE, entries: withManual });
+      });
+
+      it("is awaiting the operator, and adds no Ready, once every PR step merged", async () => {
+        const issue = mockIssue({ number: NATIVE, labels: [] });
+        mockLoadPhaseState.mockResolvedValue(manualState([1, 2]));
+
+        expect(await classifyIssue(repo, issue)).toBe("awaiting-operator");
+        expect(await auditIssue(repo, issue)).toEqual([]);
+
+        expect(mockGh.addLabel).not.toHaveBeenCalled();
+        expect(mockGh.closeIssue).not.toHaveBeenCalled();
+      });
+
+      it("is done once the manual step is claimed", async () => {
+        const issue = mockIssue({ number: NATIVE, labels: [] });
+        mockLoadPhaseState.mockResolvedValue(manualState([1, 2, 3]));
+
+        expect(await classifyIssue(repo, issue)).toBe("done");
+      });
+
+      it("is still stuck between steps while a PR step has not landed", async () => {
+        const issue = mockIssue({ number: NATIVE, labels: [] });
+        mockLoadPhaseState.mockResolvedValue(manualState([1]));
+
+        expect(await classifyIssue(repo, issue)).toBe("stuck-multi-phase");
+      });
+    });
+  });
+
+});
+
+describe("issue-auditor — retired PR store comparison", () => {
+  const repo = mockRepo();
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockAlerts.upsertAlertIssue.mockResolvedValue("created");
+    mockAlerts.closeAlertIssueIfResolved.mockResolvedValue(null);
+    mockGh.listOpenIssues.mockResolvedValue([]);
+    mockGh.isRateLimited.mockReturnValue(false);
+  });
+
+  it("compares nothing and closes any leftover pr-store alert", async () => {
+    mockGh.listPRs.mockResolvedValue([{ number: 1, labels: [{ name: "Ready" }] }]);
+    expect(await processRepo(repo)).toEqual([]);
+    expect(mockGh.listPRs).not.toHaveBeenCalled();
+    expect(mockDb.listClawsPrs).not.toHaveBeenCalled();
+    expect(mockAlerts.upsertAlertIssue).not.toHaveBeenCalled();
+    expect(mockAlerts.closeAlertIssueIfResolved).toHaveBeenCalledWith({
+      repo: "org/claws",
+      title: `[pr-store] claws_prs disagrees with PR labels in ${repo.fullName}`,
+      logPrefix: "issue-auditor",
+      reason: "row-versus-label comparison retired",
+    });
+  });
+
+  it("leaves the alert alone while rate limited", async () => {
+    mockGh.isRateLimited.mockReturnValue(true);
+    await processRepo(repo);
+    expect(mockAlerts.closeAlertIssueIfResolved).not.toHaveBeenCalled();
+  });
+});
