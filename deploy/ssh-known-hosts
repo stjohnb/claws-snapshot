@@ -1,0 +1,17 @@
+# Pinned SSH host keys for the ssh:* capabilities (St-John-Software/claws).
+# Shipped by the Dockerfile to /etc/ssh/ssh_known_hosts, OpenSSH's global
+# known-hosts file, so every pod built from this image pins these hosts.
+# Not a secret: public host keys only.
+# Refresh a line after a deliberate host rebuild: ssh-keyscan -t ed25519 <address>,
+# verify the fingerprint on the host (ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub)
+# and land the change by PR. Fingerprints as of 2026-10-16:
+#   nas            SHA256:4A52jLJD9Pje0u5Jwhbc5Wy8yfkGEKzrUMbXotQgZ5A
+#   homeassistant  SHA256:Byi72ATYO8S96npHp5sEHZaJC3ruAe+PmgiJnGq/H90
+#   k3s            SHA256:bPRghAl+uFtXJ4nb1kajyr5DPvcbDSPwHXFzNss1e5Y
+#   ryzen          SHA256:8urzwTDPV/UoKRwd6zRtoE5x7uf/GXLfMLMJQGHyl+E  (matches nixos-config docs/ryzen-preflight.md)
+#   proxmox        SHA256:+wHk/Q4xeIgw4MVHygY0J60G909Z/H5x48hBFC9P5nE
+nas,k3s-nas,192.168.0.128,nas.tailc20cf.ts.net ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJLF5oy/iNP3lcoSnoM8HCNmXrVjk2qmSz3wvFftbIIc
+homeassistant,192.168.0.89,homeassistant.tailc20cf.ts.net ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHucctSCfuN5sOn0ATFd8/lP/RSnXFkyG9FUZ6EWLvEj
+k3s,192.168.0.251,k3s.tailc20cf.ts.net ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILMo0q6dDyDpP99+7IU6APzgXG7jUHLzvNxbe1Z1DG4m
+ryzen,192.168.0.69,ryzen.tailc20cf.ts.net ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHlS6dqZso38D2bvuPYmNyeTCLK2Byg520beITNQKA7Z
+proxmox,192.168.0.200 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKthSmHbFIK2FsssXIHVrVh/+m0YUI1Lj4z4S84F761S
