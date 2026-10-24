@@ -1,0 +1,237 @@
+# main-build-monitor
+
+**Deep dive.** Read this when you're changing default-branch build monitoring
+and build-failure issues. For runner-metric ingestion, read
+runner-metrics-sync.md instead.
+
+**Source**: `src/jobs/main-build-monitor.ts`
+**Trigger**: Every 5 minutes (`intervals.mainBuildMonitorMs`)
+
+Owns default-branch build monitoring for every repo, on GitHub and Forgejo, end to end: it
+detects a failing run, re-runs it once when the failure looks transient, files or bumps a
+`Build failure: <workflow name>` tracking issue when it does not (or when the retry fails
+too), and closes that issue once the workflow goes green again.
+
+## Why this job exists
+
+`St-John-Software/namey#1881` (`Build failure: Build and publish Docker image`,
+**Occurrences: 1**) was a pure transient: the Docker build's `RUN npm ci` died with
+`npm error code ECONNRESET` / `npm error network aborted` against `registry.npmjs.org`. The
+next push rebuilt `main` green with no code change. Nothing re-ran it — the repo's
+`notify-failures.yml` simply filed an issue, and a planner burned a full plan on Dockerfile
+retry hardening for a problem that had already fixed itself.
+
+Eleven repos carried a hand-copied, drifted `notify-failures.yml`: ten titled the issue
+`Build failure: <workflow name>`, `production-infra` used `[main] <workflow name> failed on
+main`, several labelled it `bug`, some closed on recovery and some did not, and none of them
+retried. Doing this centrally means one implementation to fix, one place to tune, and a
+retry step that the repo-side `on.workflow_run` trigger could never perform.
+
+## How it works
+
+1. **Resolve** — every row in `main_build_failures` with a retry still in flight
+   (`retried = 1 AND outcome IS NULL`, detected in the last 24 h) is re-read via
+   `gh.fetchWorkflowRunById` (on Forgejo, by re-listing the repo's runs — see "Forgejo
+   differences"). A `not_found` run is recorded `abandoned`; a run still in
+   progress (or an API failure) stays pending for the next pass; a green retry is recorded
+   `success` and nothing else happens — the close-on-recovery step below picks the issue up
+   when it sees the green latest run. A retry that failed again is recorded `failure` and
+   reported, with the issue body saying the retry was attempted.
+2. **Expire** — a retry can fall out of that 24h window without ever resolving (e.g. a
+   self-hosted runner pool down long enough that the re-run never completes).
+   `db.getExpiredMainBuildRetries()` finds those `retried = 1 AND outcome IS NULL` rows once
+   `detected_at` has aged past 24h and forces them to `retry-timed-out`, so the genuine
+   failure they represent still flows into the retry-report step below instead of quietly
+   disappearing until `pruneMainBuildFailures` deletes the row 30 days later.
+3. **Retry unreported failures** — a row can reach a terminal outcome (above, or in the scan
+   below) without ever getting `reported = 1`, because `ensureAlertIssue` itself can throw
+   (a transient GitHub API error while filing/bumping the issue). `db.getUnreportedMainBuildFailures()`
+   returns those rows — terminal outcome, `reported = 0`, excluding `success`/`abandoned` —
+   and `reportFailure` is retried for each, every pass, so a single API hiccup can't
+   permanently and silently drop a build-failure report.
+4. **Scan** — repos with the job disabled in the `/jobs` matrix are dropped; the rest are
+   processed four at a time via `mapWithConcurrency`.
+5. Per repo, `loadRuns()` returns the completed `push`/`schedule` runs, newest first. For a
+   GitHub repo that's `db.getDefaultBranchRuns(repo, defaultBranch, 7)`, reading what
+   `runner-metrics-sync` already synced into `workflow_runs` — the job adds no second polling
+   path of its own, so detection latency is `runner-metrics-sync`'s (up to ~20 min when a
+   repo is idle). For a `forge: "forgejo"` repo it's `forgejo.listDefaultBranchActionRuns()`
+   instead (two `?event=` filtered calls against `/repos/{repo}/actions/runs`, since Forgejo
+   Actions history is never synced into `workflow_runs`), so detection latency there is just
+   this job's own 5-minute tick. See "Forgejo differences" below.
+6. The first row per `workflow_name` is that workflow's latest run. Workflows listed in
+   `mainBuildMonitorIgnoreWorkflows[repo]` are dropped here.
+7. A latest run with `conclusion: "success"` closes any tracking issue this job filed (see
+   below). Any other non-`failure` conclusion — `cancelled`, `skipped`, `startup_failure`,
+   `null` — is left alone: neither filed nor closed, matching the `conclusion == 'failure'`
+   gate the per-repo workflows used.
+8. A `failure` already present in `main_build_failures` has been handled; otherwise the job
+   fetches the branch tip once per repo (`gh.getBranchTipCommit`, or
+   `forgejo.getBranchTipSha` on Forgejo) and decides whether to
+   retry via `isRetryCandidate()` plus a transient classification:
+   `gh.isInfrastructureOutage(jobs) || gh.isPreRepoStepFailure(jobs)` (reason `infra`), or —
+   only when exactly one job failed — `isTransientLog()` over the tail of that job's log
+   (reason `log-pattern`).
+9. Transient → `gh.rerunFailedJobs` (`forgejo.rerunFailedJobsByIndex` on Forgejo), a row with `retried = 1, outcome = NULL`, and step 1
+   picks it up on a later pass (or step 2, if it never resolves within 24h). A `already
+   running` error counts as a successful retry; a `403 Resource not accessible by
+   integration` files the shared missing-`actions: write` alert via
+   `reportActionsPermissionDenied` and then falls through to reporting; any other error
+   warns and falls through to reporting, recorded `rerun-errored` so the issue says the
+   re-run request itself errored rather than claiming the failure did not look transient.
+10. Not transient (or the re-run call failed) → the run is recorded `not-retried` (or
+    `rerun-errored`) and `ensureAlertIssue` files or bumps `Build failure: <workflow name>`.
+    The body states the actual reason no retry ran (`describeRetryOutcome`), one kind per
+    reason, checked in the retry gate's own order (`retrySkipReason`):
+    `tip-unknown`; `no-run-number` (Forgejo); `later-attempt` (names the attempt);
+    `superseded` (names the newer tip commit and says whether the log matched the transient
+    heuristic — matched means the run was *deliberately* not re-run); `too-old`;
+    `not-transient` / `multiple-failed-jobs` (the only kinds that say the failure "did not
+    match its transient-error heuristic"); `unclassified` (the log was never read — budget
+    spent, read error — so the heuristic was not applied); and `rerun-errored`. A run whose
+    retry was deferred by the rerun budget or a saturated pool (in-memory count, lost on
+    restart) gets a "deferred N time(s)" sentence appended when it is finally reported. The
+    full outcome is stored as JSON in `retry_detail`, so step 3 re-files it with the same
+    wording; a legacy row without one just says "Claws did not retry this run."
+    The issue is **unlabelled** — see [label-audit.md](../label-audit.md); `legacyTitles`
+    carries production-infra's `[main] <workflow name> failed on main`, so an issue already
+    open under the old title is *renamed* rather than duplicated. `ensureAlertIssue` writes
+    the `First seen` / `Last seen` / `Occurrences` block on creation and bumps it on
+    recurrence. The call passes `refreshBody: true`: the body carries *this* run's URL and
+    event, so a later failure of the same workflow must rewrite it rather than leave a link
+    to a run that has since rotated out of the Actions UI. A `reportFailure` call that
+    throws (e.g. a transient `ensureAlertIssue` error) is caught per workflow so it cannot
+    abort scanning the repo's remaining workflows; the row is already recorded with
+    `reported = 0`, so step 3 retries it next pass.
+11. Workflows listed in `prodAlertWorkflows[repo]` also page `notifyProdAlert`. That default
+    is deliberately non-empty (`production-infra`'s `Tofu Apply` and `Flux Bootstrap`) so
+    paging survives deleting the repo's own workflow with no ops step. Slack is wrapped in
+    its own try/catch: a Slack outage must never abort issue filing.
+12. **Close on recovery** — when the latest run of a workflow is green and this job has an
+    unclosed reported failure for it, the tracking issue is commented on and closed as
+    `completed`. The issue is found by title or filed title (the title it was created with, kept
+    across retitles), so a retitle cannot hide it. The DB rows are marked closed only once
+    the issue is closed or no open issue exists; a held or failed close leaves them open so
+    the next pass retries.
+
+## Forgejo differences
+
+- **Retry through the image's patch endpoints** — stock Forgejo has no rerun or job-log
+  API, so the retry path uses the endpoints our Forgejo image carries:
+  - the branch tip comes from `GET /repos/{repo}/branches/{branch}`
+    (`forgejo.getBranchTipSha`); an unknown tip means no retry, as on GitHub;
+  - classification first runs the same `infra` checks as GitHub over
+    `gh.getRunJobSummaries` (built by `forgejo.getRunJobSummaries` from the same patch:
+    per-job status, step count and failed-step names, #clw_01M54YZVHM34QVMEBN6AN6K7RJ). Failing
+    those, it reads `…/actions/runs/{index}/jobs` and, when exactly one job has status
+    `failure`, that job's `…/jobs/{job}/logs`. The logs of *every* failed step are joined
+    before matching: a job's later `if: always()` steps fail too, and the checkout's error
+    lines must stay in the matched text. A log endpoint that errors (e.g. missing from the
+    image) means no retry;
+  - the re-run is `POST …/actions/runs/{index}/rerun-failed`
+    (`forgejo.rerunFailedJobsByIndex`, #clw_01M4E23J0J3N03NFVS4JPHF3Y2). A 409 `action run
+    is not done` counts as already running; any other error, including a missing endpoint,
+    is `rerun-errored`, and the GitHub `actions: write` alert is never raised;
+  - all of these take the web run number (`run_number`, Forgejo's `index_in_repo`), so a
+    run without one is never retried;
+  - step 1 resolves a pending `forgejo:<id>` row by re-listing the repo's runs once per pass.
+    A re-run keeps its id; while it is running it is absent from the listing (non-terminal
+    runs are dropped), so it stays pending until it finishes or the 24h expiry fires.
+- **Retry-once rests on the DB row** — Forgejo has no `run_attempt` counter (it is always
+  `null`), so the "at most once" bound is the existing `main_build_failures` row. A wiped
+  DB could allow a second retry of the same run; that is accepted.
+- **`event` is `trigger_event`** — Forgejo records a scheduled run as `event: "push"` and
+  keeps the real trigger in `trigger_event` (bonkus run 352: `event=push,
+  trigger_event=schedule`), and `?event=schedule` lists nothing. `listDefaultBranchActionRuns`
+  maps `trigger_event` onto `event` so the issue's **Triggered by** is right, de-duplicates
+  rows across its two calls by run id, and keeps only rows whose real trigger is `push` or
+  `schedule`.
+- **Workflow name is the file name** — Forgejo's run record carries no display name, only
+  the workflow file name (`workflow_id`, e.g. `deploy.yml`), so the tracking issue reads
+  `Build failure: deploy.yml` rather than a human-readable workflow title.
+- **`status` carries the conclusion** — there is no separate `conclusion` field; Forgejo's
+  `status` (`success`/`failure`/`cancelled`/`skipped`/...) is mapped directly onto
+  `MainBuildRunRow.conclusion`.
+- **Namespaced DB keys** — `main_build_failures.run_id` is a shared TEXT primary key across
+  every repo, and Forgejo's run ids are small per-instance integers, so they are stored as
+  `forgejo:<id>` (see `runKey()`) to guarantee they never collide with a GitHub run id.
+- **Detection latency is this job's own 5-minute tick**, not `runner-metrics-sync`'s, since
+  Forgejo runs are fetched directly rather than synced.
+- **An expired or missing Forgejo token surfaces as HTTP 404**, not 401 — indistinguishable
+  from "the endpoint does not exist" at the API layer.
+
+## Safety rails
+
+- **Tip-SHA equality** (`isRetryCandidate`) — a run is only re-run when its `head_sha` still
+  equals the branch tip. Re-running a superseded run republishes a stale artefact: namey's
+  failing workflow pushes `latest` to GHCR. This is load-bearing. Never relax it, and never
+  fall back to retrying when the tip is unknown. A superseded run is still classified, but
+  only to word its issue (so a matching log is not reported as a heuristic miss), and on its
+  own per-pass log-read budget of 5, separate from the retry budget, so it never changes
+  which tip runs get retried. The result never triggers a re-run.
+- **`run_attempt <= 1`** — a hard "retry at most once" bound read from GitHub's own attempt
+  counter, so it holds even if the DB is wiped.
+- **4-hour age window** — a service restart must not resurrect and re-run day-old runs.
+- **`push`/`schedule` events only** — `workflow_dispatch` is excluded on purpose: a human
+  pressing "Run workflow" should see their own failure.
+- **Single failed job on the log path** — `gh.fetchFailedJobLog` reads only the *first*
+  failed job, so with two failures a transient one could mask a genuine one. The log
+  heuristic is therefore skipped entirely unless exactly one job failed. The job log is
+  fetched with `gh api --allow-escape-sequences` and ANSI escapes are stripped before
+  matching, because Docker build output is coloured and `gh` otherwise returns no body.
+- **Job timeouts are never transient** — a log containing `has exceeded the maximum
+  execution time of` is classified non-transient even though it also says `The operation
+  was canceled`; re-running a job that hit `timeout-minutes` repeats the hang and holds the
+  runner pool for another full window (#2861).
+- **Per-pass budgets and pool-saturation deferral** — at most 5 re-runs and 5 log fetches per
+  pass, and nothing is re-run while `isPoolSaturated()` (the shared ci-fixer queue-depth
+  check) is true. A blocked run is left untouched in the DB, so it is neither retried nor
+  reported yet and stays eligible on the next tick. Deferral is per workflow: the repo's
+  remaining workflows are still scanned, since closing a green issue or reporting a
+  non-retryable failure spends no budget. A re-run slot is reserved *synchronously* before
+  the classification `await` and handed back if the re-run does not happen, so four repos
+  running concurrently cannot each pass the check and overshoot the budget. On Forgejo the
+  `gh.getRunJobSummaries` call that runs the `infra` checks is exempt from the log-fetch
+  budget, although it reads one job log per failed or cancelled job (30 s-cached); only the
+  single-failure step-log fetch after it spends a slot.
+- **Issue-closing guards** — an issue carrying `Refined`, or with an open `claws_prs` row
+  (looked up through `resolveTrackerId`), is not closed: it is already being implemented
+  or already has an open PR. An issue with a plan (a stored native plan version, or a plan
+  comment on a forge issue) is not closed either; its normal lifecycle closes it. A parking label (`Blocked`, `Backlog`) does not block the close —
+  transient failures, which are exactly the ones that go green, may be parked.
+- **`[ci-unrelated]` close on green** — the per-repo `[ci-unrelated]` tracker is closed
+  (same guards) once every monitored workflow's latest default-branch run is `success` and
+  the newest of those runs was created after the issue's last update.
+- **Per-workflow report isolation** — `reportFailure` is called inside its own try/catch in
+  the per-repo scan, so a single workflow's `ensureAlertIssue` throwing (a transient GitHub
+  API error) cannot abort scanning the repo's remaining workflows for that pass.
+- **No retry can silently vanish** — a retry that is still in flight when its `detected_at`
+  ages past the 24h window `getPendingMainBuildRetries()` looks at is forced to a terminal
+  `retry-timed-out` outcome by `getExpiredMainBuildRetries()` rather than just dropping out
+  of that query, so it still reaches `getUnreportedMainBuildFailures()` and gets reported.
+- **Never widen `TRANSIENT_LOG_PATTERNS`** — the list is exactly the network/registry/runner
+  errors that mean the build never reached a verdict on the repo's own code. A pattern like
+  `/error/` or `/exit code 1/` would spend real CI runs on genuine failures and, worse, hide
+  a red `main` behind an automatic retry. The two forge-502 patterns added for bonkus run 352
+  are git-specific — `fatal: unable to access '…': The requested URL returned error: 502` and
+  `error: RPC failed; HTTP 502`. A bare `The requested URL returned error: 502` is excluded
+  because a step's `curl -f` smoke test prints it when the deployed app is down, a genuine
+  failure. `fatal: expected 'packfile'` is not matched alone: it can follow other git
+  errors, and in the forge-502 shape it always comes after the `RPC failed` line.
+
+## Configuration
+
+| Key | Default | Effect |
+|---|---|---|
+| `intervals.mainBuildMonitorMs` | `300000` (5 min) | How often the job runs |
+| `prodAlertWorkflows` | `{"St-John-Software/production-infra": ["Tofu Apply", "Flux Bootstrap"]}` | Repo → workflow names whose failure also pages `slackProdAlertsWebhook` |
+| `mainBuildMonitorIgnoreWorkflows` | `{}` | Repo → workflow names the job must never file issues for |
+| `slackProdAlertsWebhook` | *(empty)* | Prod-alert webhook; falls back to `slackWebhook` |
+
+Per-repo opt-out is the standard `disabledJobsByRepo` / `/jobs` matrix entry.
+
+## State
+
+`main_build_failures` in SQLite — see
+[database-schema.md](../database-schema.md#main_build_failures-table). Rows are pruned after
+30 days by the daily prune loop in `main.ts`.

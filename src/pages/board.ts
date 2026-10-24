@@ -1,0 +1,890 @@
+import { createHash } from "node:crypto";
+import { isEscalationManualAction } from "../pr-escalation.js";
+import { PREVIEW_MODAL_HTML, PREVIEW_MODAL_SCRIPT, NEW_ISSUE_MODAL_CSS, PAGE_CSS, TAILWIND_STYLESHEET, HEAD_META, escapeHtml, htmlOpenTag, buildPageHeader, THEME_SCRIPT, specLabelChip, NO_REPO_WARNING, PINNED_NAV_LINKS, navLinkCount, repoAvatar, repoShortName, formatCompactAge, formatRelativeTime } from "./layout.js";
+import type { NavCounts, Theme } from "./layout.js";
+import { BACKLOG_DESTINATION, BOARD_COLUMNS, BOARD_GROUPS, closeReasonLabel, columnFor, isRequirementsColumn, type BoardColumn, type BoardPr } from "../issue-board.js";
+import { LABELS, prUrl } from "../config.js";
+import { isStateLabel } from "../issue-lifecycle.js";
+import { ISSUE_BOARD_SCRIPT } from "../resources/issue-board.generated.js";
+import { NEW_ISSUE_MODAL_SCRIPT } from "../resources/new-issue-modal.generated.js";
+import { ISSUE_ATTACHMENTS_SCRIPT } from "../resources/issue-attachments.generated.js";
+import { isClawsIssueId, shortIssueRef, type IssueRef } from "../issue-id.js";
+import { BLOCKED_REASON_PEEK_MIN, NEW_ISSUE_BUTTON, NEW_ISSUE_FORM_CSS, buildNewIssueModal, planPreviewBlock, type PlanPreview } from "./issue.js";
+import type { CheckStatus } from "../github.js";
+
+/** The collapsed idea block on a card in Drafting or Requirements review. */
+export interface IdeaPreview {
+  /** `Requirements vN · kind — title`, or `Idea` with no record yet. */
+  summary: string;
+  /** Rendered HTML: the Requirement part, or the escaped body excerpt. */
+  html: string;
+  url: string;
+}
+
+/** The collapsed block on an Awaiting merge card waiting on the operator, in place of the plan. */
+export interface OperatorPreview {
+  /** `Operator step N · title`. */
+  summary: string;
+  /** Rendered HTML: the plan's manual-actions section. */
+  html: string;
+  url: string;
+}
+
+/** One issue on the board. The column is derived here, never stored (#3215). */
+/** Whether `card` is listed under `repo`: its primary, or any other repo a native issue names. */
+function cardNamesRepo(card: BoardCard, repo: string): boolean {
+  return card.repo === repo || (card.repos?.includes(repo) ?? false);
+}
+
+export interface BoardCard {
+  /** The issue's repository — its primary one for a multi-repo native issue — or `""` for an unassigned one. */
+  repo: string;
+  /** Every repo a native issue names, sorted; absent for forge issues and unassigned ones. */
+  repos?: string[];
+  ref: IssueRef;
+  title: string;
+  labels: string[];
+  /** Native issues closed inside the `done` window; forge issues are open-only. */
+  closed?: boolean;
+  /**
+   * Why the issue closed — `"completed"` or `"not_planned"` — shown on a
+   * closed card via {@link closeReasonLabel}. Absent for an issue closed
+   * before this shipped, or an open one.
+   */
+  stateReason?: string;
+  /**
+   * The stored lifecycle — a native issue's field, or a forge issue's shadow —
+   * which tells the requirements columns from Planning; absent reads as
+   * `ideas`.
+   */
+  lifecycle?: string;
+  /**
+   * The latest requirements version, or null when the writer has produced
+   * none yet; a card in Requirements review shows it as a chip. Absent when
+   * unknown.
+   */
+  requirementsVersion?: number | null;
+  /**
+   * The latest requirements version exists with no human feedback left on it
+   * since — the card sits in Requirements review rather than Drafting (see
+   * `BoardIssue.requirementsReview`).
+   */
+  requirementsReview?: boolean;
+  /** Where the ref links to — the forge for a forge issue, `/issues/<id>` for a native one. */
+  url: string;
+  /**
+   * One line summarising the issue's operator-set model-plan cells
+   * (`plan: claude/fable · impl: codex/sonnet`), or absent when it has none.
+   */
+  modelPlan?: string;
+  /** Id of the issue's live board-started session (native issues only); the card then links to it instead of offering Start session. */
+  activeSession?: string;
+  /**
+   * The issue's latest plan, shown as a collapsed block on the card. Native
+   * issues only: a forge issue's plan lives in forge comments.
+   */
+  plan?: PlanPreview;
+  /**
+   * Whether the issue has a plan, as the board can tell cheaply: a stored plan
+   * version for a native issue; `Ready`/`Refined` or a stored PR list for a
+   * forge one. Approved and Awaiting plan review are offered only when it is
+   * set (`planRefusal`); the move route re-checks against the real plan.
+   */
+  hasPlan?: boolean;
+  /**
+   * A preview of the idea itself — the latest requirements record's
+   * Requirement part, or an excerpt of the issue body when it has none. Shown
+   * in place of `plan` on a card in Drafting or Requirements review only.
+   */
+  idea?: IdeaPreview;
+  /** ISO 8601; absent when the source did not report one. */
+  updatedAt?: string;
+  /**
+   * The issue's running implementer and open PR rows (`issue-flight.ts`),
+   * which the derived columns read. Absent for a card not in flight, and for
+   * every closed card.
+   */
+  flight?: BoardCardFlight;
+  /** Every PR step has merged and the plan's operator step is open (`BoardIssue.awaitingOperator`). */
+  awaitingOperator?: boolean;
+  /** A design change waits for the operator's re-approval (`BoardIssue.reapprovalPending`). */
+  reapprovalPending?: boolean;
+  /** The open operator step, shown in place of the plan on an awaiting-operator card. */
+  operatorStep?: OperatorPreview;
+  /**
+   * Why Claws parked the issue in Blocked for a human (`db.getIssueBlockedReasons`),
+   * shown on a Blocked card under a "Needs a human" chip. Absent otherwise.
+   */
+  blockedReason?: string;
+  /**
+   * ISO 8601: when the issue entered its current column — the moment it closed
+   * for a Done card. Native issues only; a forge card leaves it absent and its
+   * age chip falls back to `updatedAt` as an approximation.
+   */
+  stageSince?: string;
+  /**
+   * A forge issue `issue-importer` has not moved into the native tracker yet
+   * (`BoardIssue.awaitingImport`): no gate column, no Approve button, and a
+   * "Waiting for import" chip.
+   */
+  awaitingImport?: boolean;
+  /** Why the importer's last pass left the issue on the forge, if it did (`importHoldReason`). */
+  importHold?: string;
+}
+
+/** The part of an open `claws_prs` row a card reads; a `ClawsPrRecord` satisfies it. */
+export interface BoardCardPr extends BoardPr {
+  repo: string;
+  prNumber: number;
+  title?: string | null;
+  mergeApprovedAt: string | null;
+  /**
+   * The PR's check status from the cached bulk `listPRStatuses` fetch the
+   * repo page and All PRs read, so the chips agree with them. Absent when the
+   * fetch failed or does not list the PR; the chips then read `stage`.
+   */
+  liveCheckStatus?: CheckStatus;
+  /** `CONFLICTING` for a PR in conflict with its base branch. */
+  mergeableState?: string | null;
+  /** The auto-merger last declined this PR (`getMergeBlockReason`). */
+  mergeBlocked?: boolean;
+  /** The PR's recorded hold reason, if any. */
+  manualActionReason?: string | null;
+}
+
+export interface BoardCardFlight {
+  implementing: boolean;
+  openPrs: readonly BoardCardPr[];
+}
+
+export interface BoardPageView {
+  cards: BoardCard[];
+  /**
+   * Every repository Claws manages, for the Repository filter. Passed in rather
+   * than derived from `cards`, which are cut by `?repo=` and by the Done
+   * column's row cap before they get here: a repository whose only board cards
+   * were dropped by either would vanish from its own dropdown and could not be
+   * widened back out of without "All repositories".
+   */
+  repoOptions: string[];
+  /** `?repo=` — `""` means every repository. */
+  repoFilter: string;
+  /**
+   * How many distinct *sources* came back incomplete: each repository counts
+   * once however many of its fetches failed or hit the open-issue cap, plus the
+   * unassigned list. The board is best-effort — a failed fetch drops only the
+   * cards it would have produced — so the count is rendered in its own
+   * `#board-warning`, which only the page's poller writes, rather than letting a
+   * short board read as an empty backlog.
+   */
+  incompleteSources: number;
+  /**
+   * How many open issues under the current `?repo=` filter sit in the backlog,
+   * shown on the collapsed Backlog tray. The cards themselves are not on the
+   * board, so the route counts them rather than this page.
+   */
+  backlogCount: number;
+  /**
+   * The nearest return day (`YYYY-MM-DD`) among those backlog issues parked
+   * until a date, appended to the tray label; absent or null when none is.
+   */
+  backlogNextReturn?: string | null;
+}
+
+const BOARD_CSS = `
+  .board-filters { display: flex; gap: 0.5rem; flex: 0 1 auto; min-width: 0; max-width: 100%; margin: 0; }
+  .board-filters .form-select { width: auto; flex: 0 1 auto; min-width: 10rem; max-width: min(20rem, 100%); }
+  .board-status { min-height: 1.2rem; font-size: 0.8rem; color: var(--danger); margin-bottom: 0.5rem; overflow-wrap: anywhere; }
+  /* Not the same kind of message as a failed move: the board is incomplete,
+     which is a warning about the render rather than about what the operator
+     just did — and only the poller writes into this one. */
+  .board-warning { color: var(--warning); }
+  .board-status.board-ok { color: var(--success); }
+  .board-ok a { color: inherit; }
+  .board { display: flex; flex-direction: column; gap: 0.6rem; }
+  .board-group { display: flex; flex-direction: column; gap: 0.4rem; min-width: 0; }
+  .board-group-head { font-family: var(--font-display); font-size: 0.8rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text); margin: 0; display: flex; gap: 0.4rem; align-items: baseline; }
+  .board-group-count, .board-group-derived { color: var(--text-subtle); font-weight: 400; }
+  .board-group-cols { display: flex; flex-direction: column; gap: 0.6rem; }
+  .board-group-solo > .board-group-head { display: none; }
+  .board-col { width: 100%; display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-secondary); }
+  .board-col-head { font-family: var(--font-display); font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-secondary); margin: 0; padding: 0.55rem 0.6rem; border-bottom: 1px solid var(--border); display: flex; gap: 0.4rem; align-items: baseline; cursor: pointer; list-style: none; position: sticky; top: 0; z-index: 1; background: var(--bg-secondary); }
+  .board-col-head::-webkit-details-marker { display: none; }
+  .board-col-head::after { content: "▾"; transition: none; }
+  .board-col[open] > .board-col-head::after { content: "▴"; }
+  .board-col-title { font-family: var(--font-display); font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; margin: 0 auto 0 0; }
+  .board-col-count { color: var(--text-subtle); font-weight: 400; }
+  .board-col-derived .board-col-head { color: var(--text-subtle); }
+  /* A human gate: where the operator acts, marked apart from the derived
+     columns Claws sets. */
+  .board-col-gate .board-col-title::before { content: "◆"; color: var(--accent); margin-right: 0.35rem; }
+  .board-col-body { display: flex; flex-direction: column; gap: 0.5rem; padding: 0.5rem; min-height: 4rem; }
+  .board-col-body.drag-over { outline: 2px dashed var(--accent); outline-offset: -4px; }
+  .board-card { min-width: 0; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); padding: 0.5rem; display: flex; flex-direction: column; gap: 0.35rem; cursor: grab; user-select: none; -webkit-user-select: none; }
+  .board-card[data-busy="true"] { opacity: 0.6; }
+  .board-card.dragging { border-color: var(--accent); cursor: grabbing; }
+  /* The card is the drag source, so the whole of it reads as grabbable — but a
+     link inside it is still a link, and its text still selectable. */
+  .board-card a, .board-plan { cursor: pointer; user-select: text; -webkit-user-select: text; }
+  .board-plan { font-size: 0.75rem; color: var(--text-secondary); overflow-wrap: anywhere; }
+  .board-plan > summary { cursor: pointer; font-family: var(--font-display); }
+  .board-operator > summary { color: var(--warning); }
+  .board-plan[open] > .markdown { color: var(--text); margin: 0.35rem 0; cursor: auto; }
+  .board-plan .markdown p, .board-plan .markdown ul { margin: 0.25rem 0; }
+  /* Rendered markdown must wrap inside the card, never widen it at phone width. */
+  .board-plan .markdown pre { white-space: pre-wrap; }
+  .board-plan .markdown img, .board-plan .markdown table { max-width: 100%; }
+  .board-card-head { display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; font-size: 0.75rem; }
+  .board-ref { font-family: var(--font-display); overflow-wrap: anywhere; }
+  /* Inline in the head row, so the card gains no height for it. */
+  .board-age { font-family: var(--font-display); font-size: 0.65rem; line-height: 1.3; padding: 0 0.35rem; border: 1px solid var(--border); border-radius: 10px; color: var(--text-subtle); white-space: nowrap; }
+  .board-age[data-stale="true"] { color: var(--warning); border-color: var(--warning); }
+  .board-priority { color: var(--accent); font-weight: 600; }
+  .board-automerge { display: inline-flex; align-items: center; justify-content: center; min-width: 36px; min-height: 36px; box-sizing: border-box; border-radius: 4px; border: 1px solid var(--border-hover); background: var(--btn-bg); color: var(--text-subtle); font-family: var(--font-display); font-weight: 600; font-size: 0.75rem; cursor: pointer; }
+  .board-automerge[data-on="true"] { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+  .board-automerge:disabled { opacity: 0.6; }
+  .board-title { color: var(--text); font-size: 0.85rem; overflow-wrap: anywhere; }
+  .board-title:hover { color: var(--accent); }
+  .board-chips { display: flex; flex-wrap: wrap; gap: 0.25rem; }
+  .board-model-plan { font-family: var(--font-display); font-size: 0.7rem; color: var(--text-secondary); overflow-wrap: anywhere; }
+  .board-repos { display: inline-flex; flex-wrap: wrap; gap: 0.25rem; margin-left: auto; align-items: center; }
+  .board-repo > summary { list-style: none; display: inline-flex; align-items: center; gap: 0.3rem; cursor: pointer; }
+  .board-repo > summary::-webkit-details-marker { display: none; }
+  .board-repo .repo-avatar { width: 36px; height: 36px; margin: 0; box-sizing: border-box; border: 1px solid var(--border); font-size: 0.85rem; }
+  .board-repo-also .repo-avatar { border-style: dashed; }
+  .board-repo:not([open]) .board-repo-name { display: none; }
+  .board-repo-name { font-size: 0.7rem; color: var(--text-secondary); white-space: nowrap; }
+  .board-repo > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .board-repo-unassigned { display: inline-block; padding: 0.1rem 0.45rem; border: 1px solid var(--warning); border-radius: 12px; font-size: 0.7rem; white-space: nowrap; color: var(--warning); }
+  .board-card .label-chip { font-size: 0.7rem; padding: 0.1rem 0.45rem; border-radius: 12px; display: inline-block; }
+  .board-actions { display: flex; flex-wrap: wrap; gap: 0.35rem; align-items: stretch; min-width: 0; }
+  .board-actions > .board-icon-btn { flex: none; width: 36px; min-width: 36px; min-height: 36px; padding: 0; display: inline-flex; align-items: center; justify-content: center; box-sizing: border-box; }
+  .board-actions > .board-icon-btn[hidden] { display: none; }
+  .board-approve { color: var(--success); }
+  .board-icon-tick { width: 18px; height: 18px; }
+  .board-icon-goto { width: 18px; height: 18px; }
+  .board-icon-terminal { font-family: var(--font-display); font-weight: 700; font-size: 0.85rem; line-height: 1; }
+  .board-actions > .board-move { flex: 1 1 auto; min-width: 5.5rem; width: auto; max-width: 100%; box-sizing: border-box; background: var(--btn-bg); color: var(--text); border: 1px solid var(--border-hover); border-radius: 4px; padding: 0.25rem 0.4rem; font-family: inherit; font-size: 0.75rem; min-height: 36px; cursor: pointer; }
+  .board-actions > .board-move:only-child { flex: 1 1 100%; width: 100%; }
+  .board-move option { background: var(--bg-secondary); color: var(--text); }
+  .board-toolbar { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-bottom: 0.5rem; }
+  .board-toolbar h2 { margin: 0; }
+  .board-toolbar .trigger-btn { min-height: 36px; }
+  .board-tray { margin-top: 0.6rem; border: 1px dashed var(--border-hover); border-radius: 6px; background: var(--bg-secondary); }
+  .board-tray-head { font-family: var(--font-display); font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-secondary); margin: 0; padding: 0.55rem 0.6rem; border-bottom: 1px dashed var(--border); display: flex; gap: 0.4rem; align-items: baseline; cursor: pointer; list-style: none; }
+  .board-tray-head::-webkit-details-marker { display: none; }
+  .board-tray-head::after { content: "▾"; margin-left: auto; transition: none; }
+  .board-tray[open] > .board-tray-head::after { content: "▴"; }
+  .board-tray-body { color: var(--text-subtle); font-size: 0.8rem; }
+  .board-chip-ci { font-size: 0.7rem; padding: 0.1rem 0.45rem; border-radius: 12px; display: inline-block; border: 1px solid var(--danger); color: var(--danger); }
+  .board-chip-req { font-size: 0.7rem; padding: 0.1rem 0.45rem; border-radius: 12px; display: inline-block; border: 1px solid var(--border); color: var(--text-secondary); }
+  .board-chip-operator { font-size: 0.7rem; padding: 0.1rem 0.45rem; border-radius: 12px; display: inline-block; border: 1px solid var(--warning); color: var(--warning); }
+  .board-chip-reason { font-size: 0.7rem; padding: 0.1rem 0.45rem; border-radius: 12px; display: inline-block; border: 1px solid var(--border); color: var(--text-secondary); }
+  .board-blocked-reason { font-size: 0.75rem; color: var(--text-secondary); margin: 0.3rem 0 0; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; }
+  .board-prs { list-style: none; margin: 0.3rem 0 0; padding: 0; display: flex; flex-direction: column; gap: 0.3rem; font-size: 0.75rem; }
+  .board-prs li { display: flex; flex-wrap: wrap; column-gap: 0.3rem; align-items: baseline; min-width: 0; }
+  .board-prs a { font-family: var(--font-display); color: var(--text); overflow-wrap: anywhere; }
+  .board-prs a:hover { color: var(--accent); }
+  .board-pr-title { color: var(--text-secondary); overflow-wrap: anywhere; }
+  .board-pr-hold { flex-basis: 100%; margin: 0; color: var(--warning); display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; }
+  .board-prs .board-blocked-peek { flex-basis: 100%; }
+  .board-blocked-peek[open] > summary .board-pr-hold { display: none; }
+  .board-blocked-peek > summary { list-style: none; }
+  .board-blocked-peek > summary::-webkit-details-marker { display: none; }
+  .board-blocked-peek > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .board-blocked-peek .board-blocked-reason { text-decoration: underline dotted; cursor: pointer; }
+  .board-blocked-peek[open] > summary .board-blocked-reason { display: none; }
+  /* Tablet: the groups still stack, but each group's columns sit side by
+     side, so nothing side-scrolls: a collapsed column shrinks to its header
+     and the open ones take the room. An open column's card area scrolls
+     within itself, capped at the viewport height. */
+  @media (min-width: 768px) {
+    .board-group-cols { flex-direction: row; align-items: flex-start; }
+    .board-group-cols > .board-col { flex: 1 1 0; min-width: 0; width: auto; }
+    .board-group-cols > .board-col:not([open]) { flex: 0 1 auto; min-width: 0; }
+    .board-group-cols > .board-col > .board-col-body { max-height: calc(100vh - 6rem); max-height: calc(100dvh - 6rem); overflow-y: auto; overscroll-behavior: contain; }
+    .board-group-solo > .board-group-head { display: flex; }
+    .board-group-derived { display: none; }
+    .board-actions > .board-icon-btn { width: 30px; min-width: 30px; min-height: 30px; }
+    .board-actions > .board-move { min-height: 30px; }
+    .board-automerge { min-width: 30px; min-height: 30px; }
+    .board-repo .repo-avatar { width: 30px; height: 30px; }
+  }
+  /* Desktop: the groups, Blocked's among them, sit in one horizontally
+     scrolling row. Groups shrink only until their columns reach their
+     minimum width; from there the row scrolls instead of columns spilling
+     under the next group. Collapsed columns have a fixed width so the
+     group's min-content matches what is drawn. The card area is sized to the
+     viewport (the client sets --board-body-top) so the page itself stays put
+     and only a long column scrolls. */
+  @media (min-width: 1024px) {
+    .board { flex-direction: row; overflow-x: auto; -webkit-overflow-scrolling: touch; padding-bottom: 0.5rem; align-items: flex-start; }
+    .board-group { flex: 1 1 auto; min-width: min-content; }
+    .board-group-cols > .board-col { flex: 1 1 0; min-width: 13rem; max-width: 22rem; }
+    .board-group-cols > .board-col:not([open]) { flex: 0 0 9rem; width: 9rem; min-width: 9rem; }
+    .board-group-cols > .board-col > .board-col-body { max-height: calc(100vh - var(--board-body-top, 14rem) - 1.5rem); max-height: calc(100dvh - var(--board-body-top, 14rem) - 1.5rem); }
+  }
+`;
+
+/**
+ * The labels rendered as chips: Priority and Automerge already have their own
+ * mark on the card, and the lifecycle labels are what the column already shows.
+ */
+function chipLabels(card: BoardCard): string[] {
+  return card.labels.filter((l) => l !== LABELS.priority && l !== LABELS.automerge && !isStateLabel(l));
+}
+
+/**
+ * A forge card waiting for `issue-importer` says so: no agent acts on it until
+ * it is native, so its column alone would read as stalled. The tooltip names
+ * the importer's skip reason when it has one.
+ */
+function importChip(card: BoardCard): string {
+  if (!card.awaitingImport) return "";
+  const title = card.importHold
+    ?? "Claws imports forge issues into its own tracker before planning them; the next issue-dispatcher tick imports this one";
+  return `<span class="board-chip-operator" title="${escapeHtml(title)}">Waiting for import</span>`;
+}
+
+/** A Blocked card Claws parked for a human says so; its reason follows under the chips. */
+function needsHumanChip(card: BoardCard, column: BoardColumn): string {
+  if (column !== "blocked" || !card.blockedReason) return "";
+  return `<span class="board-chip-operator">Needs a human</span>`;
+}
+
+export { BLOCKED_REASON_PEEK_MIN };
+
+/**
+ * The parked reason. A short one is a plain line; a longer one is a preview peek whose summary shows the clamped text
+ * and opens the full reason in the page's preview modal.
+ */
+function blockedReasonLine(card: BoardCard, column: BoardColumn): string {
+  if (column !== "blocked" || !card.blockedReason) return "";
+  const reason = escapeHtml(card.blockedReason);
+  if (card.blockedReason.length <= BLOCKED_REASON_PEEK_MIN) {
+    return `
+      <p class="board-blocked-reason" title="${reason}">${reason}</p>`;
+  }
+  return `
+      <details class="preview-peek board-plan board-blocked-peek" data-preview-title="Blocked reason"><summary><span class="board-blocked-reason">${reason}</span></summary><div class="markdown"><p>${reason}</p></div><a href="${escapeHtml(card.url)}">Open issue</a></details>`;
+}
+
+/**
+ * The chips an In progress card, or a Blocked one parked for its PR, carries from its open rows, so the PRs that need a
+ * person do not hide among the ones mid-review: `Claws Problematic` and
+ * `Needs LGTM` as the label chips they mirror, and plain
+ * "CI failing", "Conflicts" and "Merge blocked" chips. "CI failing" follows the
+ * live check status when there is one, so a stale `ci-failing` stage does not
+ * contradict the passing checks the repo page and All PRs show. Each at most
+ * once, however many rows carry it.
+ */
+function prChips(card: BoardCard): string {
+  const prs = card.flight?.openPrs ?? [];
+  const chips: string[] = [];
+  if (prs.some((pr) => pr.stage === "problematic")) chips.push(specLabelChip(LABELS.problematic));
+  const ciFailing = (pr: BoardCardPr) => pr.liveCheckStatus === undefined ? pr.stage === "ci-failing" : pr.liveCheckStatus === "failing";
+  if (prs.some(ciFailing)) chips.push(`<span class="board-chip-ci">CI failing</span>`);
+  if (prs.some((pr) => pr.mergeableState === "CONFLICTING")) chips.push(`<span class="board-chip-ci">Conflicts</span>`);
+  if (prs.some((pr) => pr.mergeBlocked)) chips.push(`<span class="board-chip-ci">Merge blocked</span>`);
+  if (prs.some((pr) => pr.needsHumanReview)) chips.push(specLabelChip(LABELS.needsLgtm));
+  return chips.join("");
+}
+
+/**
+ * What the card's flight allows, as the client reads it off `data-in-flight`:
+ * `task` for a running implementer, `pr` for open PR rows and no running
+ * implementer, or absent. The implementer wins because it outranks `Refined`
+ * in `columnFor`, which leaves such a card fewer reachable columns.
+ */
+function inFlight(card: BoardCard): "task" | "pr" | undefined {
+  if (card.flight?.implementing) return "task";
+  if ((card.flight?.openPrs.length ?? 0) > 0) return "pr";
+  return undefined;
+}
+
+/**
+ * The board's compact Automerge toggle — `M` for "merge"; `A` would read as
+ * the Approved column the card may sit in. Omitted for an unassigned card (no
+ * repository to label) and in Done (nothing left to merge). Optimistic on the
+ * client (`src/client/issue-board.ts`): `data-on` flips immediately and reverts
+ * only if the server refuses.
+ */
+function automergeToggle(card: BoardCard, column: BoardColumn): string {
+  if (!card.repo || column === "done") return "";
+  const openPrs = card.flight?.openPrs ?? [];
+  // Every open PR, not any: a session's single-PR approval (`claws_approve_pr_merge`)
+  // must not show the whole issue as approved.
+  const on = card.labels.includes(LABELS.automerge) || (openPrs.length > 0 && openPrs.every((pr) => !!pr.mergeApprovedAt));
+  const shortRef = shortIssueRef(card.ref);
+  // With an open PR, `POST /board/automerge` approves that PR's merge; with
+  // none, labelling the issue only decides the *next* PR Claws opens for it.
+  const scope = openPrs.length === 0 ? " (applies to the next PR Claws opens)" : "";
+  const title = on
+    ? `Automerge on${scope} — Claws merges the PR on green CI and a clean review; click to turn off`
+    : `Automerge off${scope} — click to apply`;
+  const note = openPrs.some((pr) => isEscalationManualAction(pr))
+    ? " — a reviewer escalation is recorded, so the PR won't merge until a clean review round clears it"
+    : "";
+  return `<button type="button" class="board-automerge" draggable="false" data-on="${on}" aria-pressed="${on}" aria-label="Automerge for #${escapeHtml(shortRef)}" title="${escapeHtml(title + note)}">M</button>`;
+}
+
+/**
+ * How long a card may sit in a column before its age chip turns to the warning
+ * colour. Blocked and Done never go stale: waiting is what they are for.
+ */
+const HOUR_MS = 60 * 60 * 1000;
+const STALE_AFTER_MS: Partial<Record<BoardColumn, number>> = {
+  "drafting": 3 * 24 * HOUR_MS,
+  "requirements-review": 3 * 24 * HOUR_MS,
+  "planning": 24 * HOUR_MS,
+  "awaiting-plan-review": 24 * HOUR_MS,
+  "approved": 24 * HOUR_MS,
+  "in-progress": 3 * 24 * HOUR_MS,
+  "awaiting-merge": 3 * 24 * HOUR_MS,
+};
+
+/**
+ * How long the card has been in its column, as a small chip in the head row.
+ * A forge card has no stored column timestamp, so it shows the age of its last
+ * activity instead, prefixed `~` and titled to say so. Nothing when the card
+ * has neither timestamp.
+ */
+function ageChip(card: BoardCard, column: BoardColumn): string {
+  const approx = !card.stageSince;
+  const since = card.stageSince ?? card.updatedAt;
+  const text = since ? formatCompactAge(since) : "";
+  if (!since || !text) return "";
+  const threshold = STALE_AFTER_MS[column];
+  const stale = threshold !== undefined && Date.now() - Date.parse(since) > threshold;
+  const relative = formatRelativeTime(since);
+  const columnTitle = BOARD_COLUMNS.find((col) => col.id === column)!.title;
+  const title = approx
+    ? `Last activity ${relative}; Claws does not record when a forge issue entered this column`
+    : `In ${columnTitle} for ${relative.replace(/ ago$/, "")} (since ${since})`;
+  return `<span class="board-age" data-stale="${stale}" title="${escapeHtml(title)}">${approx ? "~" : ""}${escapeHtml(text)}</span>`;
+}
+
+function unassignedChip(card: BoardCard): string {
+  if (card.repo) return "";
+  return `<span class="board-repo-unassigned" title="${escapeHtml(NO_REPO_WARNING)}">unassigned</span>`;
+}
+
+function repoAvatars(card: BoardCard): string {
+  if (!card.repo) return "";
+  const others = (card.repos ?? []).filter((r) => r !== card.repo);
+  const primaryTitle = others.length > 0 ? `Primary repository: owns planning and labels (${card.repo})` : card.repo;
+  const one = (r: string, title: string, also: boolean): string =>
+    `<details class="board-repo${also ? " board-repo-also" : ""}"><summary title="${escapeHtml(title)}" aria-label="Repository ${escapeHtml(r)}">${repoAvatar(r)}<span class="board-repo-name">${escapeHtml(repoShortName(r))}</span></summary></details>`;
+  return `<span class="board-repos">${one(card.repo, primaryTitle, false)}${others.map((r) => one(r, `Also names ${r}`, true)).join("")}</span>`;
+}
+
+/**
+ * "Start session" on every native card, in every column: the server starts an
+ * interactive session for the issue with all its repos and the agent, model and
+ * capabilities the New session form would pre-select (`POST /board/start-session`).
+ * A forge card gets none — a forge issue cannot be dedicated to a session.
+ * While the issue's board-started session is live (`card.activeSession`) the
+ * same slot holds an icon-only "Go to session" link to it instead.
+ */
+function startSessionButton(card: BoardCard): string {
+  if (!isClawsIssueId(card.ref)) return "";
+  if (card.activeSession) {
+    const label = `Go to session for #${escapeHtml(shortIssueRef(card.ref))}`;
+    return `<a class="trigger-btn board-icon-btn board-go-to-session" href="/sessions/${encodeURIComponent(card.activeSession)}" draggable="false" aria-label="${label}" title="${label}"><svg class="board-icon-goto" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></svg></a>`;
+  }
+  return `<button type="button" class="trigger-btn board-icon-btn board-start-session" draggable="false" aria-label="Start session for #${escapeHtml(shortIssueRef(card.ref))}" title="Start session for #${escapeHtml(shortIssueRef(card.ref))}"><span class="board-icon-terminal" aria-hidden="true">&gt;_</span></button>`;
+}
+
+/**
+ * The one-click approval on a card: "Approve requirements" in Requirements
+ * review, "Approve plan" in Awaiting plan review (only for a card with a plan,
+ * as with no plan the move is a guaranteed 409). It posts the move the operator
+ * would otherwise pick from the board — Planning, or Approved — so the server
+ * rules are unchanged. No other column renders one.
+ */
+function approveButton(card: BoardCard, column: BoardColumn): string {
+  if (card.awaitingImport) return "";
+  const ref = escapeHtml(shortIssueRef(card.ref));
+  if (column === "requirements-review") {
+    return `<button type="button" class="trigger-btn board-icon-btn board-approve" draggable="false" data-approve-from="${column}" data-approve-to="planning" aria-label="Approve requirements for #${ref}" title="Approve requirements for #${ref}"><svg class="board-icon-tick" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7"/></svg></button>`;
+  }
+  if (column === "awaiting-plan-review" && card.hasPlan) {
+    return `<button type="button" class="trigger-btn board-icon-btn board-approve" draggable="false" data-approve-from="${column}" data-approve-to="approved" aria-label="Approve plan for #${ref}" title="Approve plan for #${ref}"><svg class="board-icon-tick" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7"/></svg></button>`;
+  }
+  return "";
+}
+
+/**
+ * The "Move to…" select: Closed and Backlog only. Lifecycle columns are not
+ * destinations here — comments move requirements and plans on their own, the
+ * approve buttons cover approval, and a hand-made move to Blocked carries no
+ * reason. Drag and drop is unchanged.
+ *
+ * Backlog (#3293) is offered only to a card with a repository and no work in
+ * flight (an unassigned card takes the label and stays in Drafting; a card in
+ * flight is refused by `backlogRefusal`). Closed is offered to every card.
+ *
+ * Closed is rendered but `hidden` when the card is already there, rather than
+ * omitted, so a card the client script has since moved out of Closed still has
+ * an option to go back to. When every option would be hidden no select is
+ * rendered at all.
+ */
+function moveSelect(card: BoardCard, column: BoardColumn, flight: "task" | "pr" | undefined): string {
+  const backlog = !!card.repo && !flight;
+  if (column === "done" && !backlog) return "";
+  const options = `<option value="done"${column === "done" ? " hidden" : ""}>Closed</option>`
+    + (backlog ? `<option value="${BACKLOG_DESTINATION}">Backlog</option>` : "");
+  // `draggable="false"`: the card around it is the drag source, and a form
+  // control inside a draggable ancestor is historically unreliable in Firefox —
+  // the drag gesture pre-empts the control's own pointer handling.
+  return `<select class="board-move" draggable="false" aria-label="Move #${escapeHtml(shortIssueRef(card.ref))} to another column">
+        <option value="" selected>Move to…</option>${options}
+      </select>`;
+}
+
+function boardCard(card: BoardCard, column: BoardColumn): string {
+  const priority = card.labels.includes(LABELS.priority)
+    ? `<span class="board-priority" title="${escapeHtml(LABELS.priority)}">${escapeHtml(LABELS.priority)}</span>`
+    : "";
+  const flight = inFlight(card);
+  // `data-closed` outlives the render: the client refuses to drag a closed
+  // *forge* card back out of Done, since the façade has no forge reopen.
+  // `data-in-flight` likewise carries server state onto the card for the
+  // client's pre-flight: an open PR can sit outside the derived columns
+  // (Refined/Blocked outrank it), so the client can't derive it from `column`.
+  // `data-has-plan` is the plan rule's input: Approved and Awaiting plan
+  // review need a plan. `data-awaiting-import` keeps an un-imported forge
+  // card out of every gate column.
+  const shortRef = shortIssueRef(card.ref);
+  const fullRef = String(card.ref);
+  const approve = approveButton(card, column);
+  const move = moveSelect(card, column, flight);
+  const start = startSessionButton(card);
+  const actions = approve || start || move ? `<div class="board-actions">${approve}${start}${move}</div>` : "";
+  const refTitle = shortRef !== fullRef ? ` title="${escapeHtml(fullRef)}"` : "";
+  return `<article class="board-card" draggable="true" data-repo="${escapeHtml(card.repo)}" data-ref="${escapeHtml(fullRef)}" data-column="${column}"${card.closed ? ` data-closed="true"` : ""}${flight ? ` data-in-flight="${flight}"` : ""}${card.hasPlan ? ` data-has-plan="true"` : ""}${card.awaitingImport ? ` data-awaiting-import="true"` : ""}>
+      <div class="board-card-head">
+        ${automergeToggle(card, column)}<a class="board-ref" href="${escapeHtml(card.url)}"${refTitle}>#${escapeHtml(shortRef)}</a>${ageChip(card, column)}
+        ${priority}${repoAvatars(card)}
+      </div>
+      <a class="board-title" href="${escapeHtml(card.url)}">${escapeHtml(card.title)}</a>
+      <div class="board-chips">${importChip(card)}${unassignedChip(card)}${requirementsChip(card, column)}${reasonChip(card, column)}${operatorChip(card, column)}${needsYouChip(card, column)}${reapprovalChip(card, column)}${needsHumanChip(card, column)}${column === "in-progress" || column === "blocked" ? prChips(card) : ""}${chipLabels(card).map(specLabelChip).join("")}</div>${blockedReasonLine(card, column)}${previewBlock(card, column)}${card.modelPlan ? `
+      <div class="board-model-plan" title="Model plan set by an operator">${escapeHtml(card.modelPlan)}</div>` : ""}
+      ${actions}
+    </article>`;
+}
+
+/**
+ * The card's collapsed preview: the idea on a card in Drafting or Requirements
+ * review, the plan everywhere else. Never both — such a card rarely has a plan, and two
+ * stacked blocks would crowd the card. Awaiting merge shows the operator step
+ * (when awaiting one) and the open PRs in place of the already-approved plan,
+ * falling back to the plan when it has neither.
+ */
+function previewBlock(card: BoardCard, column: BoardColumn): string {
+  if (isRequirementsColumn(column) && card.idea) return `
+      ${ideaPreviewBlock(card.idea)}`;
+  if (column === "awaiting-merge") {
+    const operator = card.awaitingOperator && card.operatorStep ? `
+      ${operatorPreviewBlock(card.operatorStep)}` : "";
+    const prs = prLinksBlock(card);
+    if (operator || prs) return `${operator}${prs}`;
+  }
+  return card.plan ? `
+      ${planPreviewBlock(card.plan, "board-plan")}` : "";
+}
+
+/** The hold line under a PR link: "Waiting on operator: <first line>", full text on hover or expanded. */
+function prHoldLine(pr: BoardCardPr): string {
+  const full = pr.manualActionReason?.trim();
+  if (!full) return "";
+  const first = full.split("\n").map((l) => l.trim()).find((l) => l) ?? full;
+  const summary = escapeHtml(`Waiting on operator: ${first}`);
+  const text = escapeHtml(full);
+  if (full.length <= BLOCKED_REASON_PEEK_MIN) return `<p class="board-pr-hold" title="${text}">${summary}</p>`;
+  return `<details class="preview-peek board-plan board-blocked-peek" data-preview-title="Operator step"><summary><span class="board-pr-hold">${summary}</span></summary><div class="markdown"><p>${text}</p></div></details>`;
+}
+
+/** The open PRs of an Awaiting merge card, as forge links sorted by repo then number. */
+function prLinksBlock(card: BoardCard): string {
+  const rows = [...(card.flight?.openPrs ?? [])].sort((a, b) => a.repo.localeCompare(b.repo) || a.prNumber - b.prNumber);
+  if (rows.length === 0) return "";
+  const items = rows.map((pr) => {
+    const title = pr.title ? ` <span class="board-pr-title">${escapeHtml(pr.title)}</span>` : "";
+    return `<li><a href="${escapeHtml(prUrl(pr.repo, pr.prNumber))}">${escapeHtml(`${repoShortName(pr.repo)}#${pr.prNumber}`)}</a>${title}${prHoldLine(pr)}</li>`;
+  });
+  return `
+      <ul class="board-prs">${items.join("")}</ul>`;
+}
+
+/**
+ * Awaiting merge, every open PR on an operator hold: the operator is the only
+ * thing holding the issue up. A hold never moves the issue to Blocked.
+ */
+function needsYouChip(card: BoardCard, column: BoardColumn): string {
+  if (column !== "awaiting-merge") return "";
+  const rows = card.flight?.openPrs ?? [];
+  if (rows.length === 0 || !rows.every((pr) => pr.manualActionReason?.trim())) return "";
+  return `<span class="board-chip-operator" title="Every open PR waits on an operator step — press Clear manual action for each on /prs once its step is done">Needs you</span>`;
+}
+
+/** The operator-step block, styled and closed by default like the plan block. */
+export function operatorPreviewBlock(step: OperatorPreview): string {
+  return `<details class="preview-peek board-plan board-operator"><summary>${escapeHtml(step.summary)}</summary><div class="markdown">${step.html}</div><a href="${escapeHtml(step.url)}">Open issue</a></details>`;
+}
+
+/** The idea block, styled and closed by default like the plan block. */
+export function ideaPreviewBlock(idea: IdeaPreview): string {
+  return `<details class="preview-peek board-plan board-idea"><summary>${escapeHtml(idea.summary)}</summary><div class="markdown">${idea.html}</div><a href="${escapeHtml(idea.url)}">Open issue</a></details>`;
+}
+
+/**
+ * The start of an issue body for a Drafting card with no requirements record:
+ * whitespace collapsed, cut at the last word boundary within `max`
+ * characters and marked with `…`. Plain text; the caller escapes it.
+ */
+export function ideaExcerpt(body: string, max = 280): string {
+  const text = body.trim().replace(/\s+/g, " ");
+  if (!text) return "(No description provided)";
+  if (text.length <= max) return text;
+  const cut = text.slice(0, max);
+  const space = cut.lastIndexOf(" ");
+  return `${(space > 0 ? cut.slice(0, space) : cut).trimEnd()}…`;
+}
+
+/**
+ * A card in Requirements review says which requirements version is up for
+ * review — what the operator reads before promoting it. Drafting needs no
+ * chip: the column already says the writer owes a version.
+ */
+function requirementsChip(card: BoardCard, column: BoardColumn): string {
+  if (column !== "requirements-review" || card.requirementsVersion == null) return "";
+  return `<span class="board-chip-req">${escapeHtml(`requirements v${card.requirementsVersion}`)}</span>`;
+}
+
+/**
+ * A closed card says why: "Completed" or "Not planned", so a dropped issue is
+ * told apart from a shipped one at a glance. Absent for an issue closed
+ * before this shipped, which keeps whatever reason (or none) it already had.
+ */
+function reasonChip(card: BoardCard, column: BoardColumn): string {
+  if (column !== "done") return "";
+  const text = closeReasonLabel(card.stateReason);
+  return text ? `<span class="board-chip-reason">${escapeHtml(text)}</span>` : "";
+}
+
+/**
+ * A card whose PRs have all merged but whose plan's operator step is open says
+ * so in Awaiting merge, where it would otherwise read as a merge to approve.
+ */
+function operatorChip(card: BoardCard, column: BoardColumn): string {
+  if (column !== "awaiting-merge" || !card.awaitingOperator) return "";
+  return `<span class="board-chip-operator" title="Comment claws-phase-done on the issue when the operator steps are done">Awaiting operator</span>`;
+}
+
+/**
+ * A card whose design change waits for re-approval says so in Awaiting plan
+ * review, where it would otherwise read as an ordinary plan to approve.
+ */
+function reapprovalChip(card: BoardCard, column: BoardColumn): string {
+  if (column !== "awaiting-plan-review" || !card.reapprovalPending) return "";
+  return `<span class="board-chip-operator" title="Promote the new requirements or apply ${escapeHtml(LABELS.refined)} to approve the revised plan">Needs decision · design change</span>`;
+}
+
+/** The Repository filter: no visible caption, so "All repositories" names it. */
+function repoSelect(options: string[], selected: string): string {
+  const opts = options
+    .map((v) => `<option value="${escapeHtml(v)}"${v === selected ? " selected" : ""}>${escapeHtml(repoShortName(v))}</option>`)
+    .join("");
+  return `<select class="form-select" name="repo" aria-label="Repository">
+        <option value=""${selected === "" ? " selected" : ""}>All repositories</option>${opts}
+      </select>`;
+}
+
+function sortedUnique(values: string[]): string[] {
+  return [...new Set(values.filter(Boolean))].sort((a, b) => a.localeCompare(b));
+}
+
+/**
+ * The options the Repository select offers: every managed repository, so the
+ * filter can always be widened again from the page it produced — plus the
+ * active value even when nothing matches it, or a `?repo=` naming a quiet
+ * repository would render as "All repositories" and hide that the board is
+ * filtered at all.
+ */
+function filterOptions(values: string[], active: string): string[] {
+  const options = sortedUnique(values);
+  if (active && !options.includes(active)) options.push(active);
+  return options;
+}
+
+/** What the Board page's poller swaps in: the surface's inner HTML, the toolbar count and the incomplete-sources sentence. */
+export interface BoardSurface {
+  /** The inner HTML of `#issue-board-surface`: the columns and the Backlog tray. */
+  surface: string;
+  /** How many cards the board shows under the current `?repo=` filter. */
+  total: number;
+  /** The incomplete-sources sentence, or `""` when every source loaded. */
+  warning: string;
+  /**
+   * A digest of `surface`, also rendered as `#issue-board-surface`'s
+   * `data-surface-hash`, so the poller can tell an unchanged render from the
+   * page's first one without comparing against the browser's re-serialised markup.
+   */
+  hash: string;
+}
+
+/** `GET /api/board` — the surface plus each pinned nav link's count, for the Board page's poller. */
+export interface BoardRefresh extends BoardSurface {
+  /** One entry per pinned nav link; an empty `text` means the link shows no badge and `name` is its plain label. */
+  nav: Array<{ href: string; text: string; name: string }>;
+}
+
+/** The board's columns and Backlog tray, rendered once for the page and again on every poll. */
+export function renderBoardSurface(view: BoardPageView): BoardSurface {
+  const visible = view.cards.filter((c) => !view.repoFilter || cardNamesRepo(c, view.repoFilter));
+
+  // Priority to the top of every column: the server hands cards over in repo
+  // order, so without this the mark on the card means nothing on a column
+  // taller than the viewport. Within each group — Priority, then ordinary —
+  // the most recently updated card leads; a card with no `updatedAt` sorts to
+  // the bottom of its group. The sort is stable, so ties keep arrival order.
+  const ordered = [...visible].sort((a, b) =>
+    Number(b.labels.includes(LABELS.priority)) - Number(a.labels.includes(LABELS.priority))
+    || (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""));
+
+  const byColumn = new Map<BoardColumn, string[]>(BOARD_COLUMNS.map((col) => [col.id, []]));
+  for (const card of ordered) {
+    const column = columnFor({
+      labels: card.labels,
+      closed: card.closed,
+      unassigned: !card.repo,
+      lifecycle: card.lifecycle,
+      requirementsReview: card.requirementsReview,
+      implementing: card.flight?.implementing,
+      openPrs: card.flight?.openPrs,
+      awaitingOperator: card.awaitingOperator,
+      reapprovalPending: card.reapprovalPending,
+      awaitingImport: card.awaitingImport,
+    });
+    // The route leaves backlog cards out already; this is defensive.
+    if (column === BACKLOG_DESTINATION) continue;
+    byColumn.get(column)!.push(boardCard(card, column));
+  }
+
+  // A repo-filtered board holds few cards, so no column folds.
+  const expandAll = !!view.repoFilter;
+  type Column = (typeof BOARD_COLUMNS)[number];
+  const columnHtml = (col: Column): string => {
+    const cards = byColumn.get(col.id)!;
+    const kind = col.claws ? " board-col-derived" : col.gate ? " board-col-gate" : "";
+    return `<details class="board-col${kind}" data-column="${col.id}"${col.waits ? ' data-waits="true"' : ""}${col.waits || expandAll ? " open" : ""} aria-label="${escapeHtml(col.title)}">
+      <summary class="board-col-head" title="${escapeHtml(col.hint)}"><h3 class="board-col-title">${escapeHtml(col.title)}</h3> <span class="board-col-count" data-count="${col.id}">${cards.length}</span></summary>
+      <div class="board-col-body" data-column="${col.id}">${cards.join("\n")}</div>
+    </details>`;
+  };
+  // Only the columns that wait on the operator start open, at every width —
+  // unless the board is filtered to one repo, when every column and the Backlog
+  // tray start open; the rest render folded, so no-JS and first paint agree. A group's header counts
+  // its cards, and — on a phone — how many sit in the folded columns Claws sets
+  // (the derived ones and Drafting).
+  const groupHtml = (group: { id: string; title: string }, members: Column[], solo = false): string => {
+    const count = members.reduce((n, col) => n + byColumn.get(col.id)!.length, 0);
+    const derived = members.filter((col) => col.claws && !col.waits);
+    const derivedCount = derived.reduce((n, col) => n + byColumn.get(col.id)!.length, 0);
+    return `<section class="board-group${solo ? " board-group-solo" : ""}" data-group="${group.id}" aria-label="${escapeHtml(group.title)}">
+    <h2 class="board-group-head">${escapeHtml(group.title)} <span class="board-group-count" data-group-count="${group.id}">${count}</span>${derived.length > 0 && !expandAll
+      ? ` <span class="board-group-derived">· <span data-group-derived="${group.id}">${derivedCount}</span> set by Claws</span>`
+      : ""}</h2>
+    <div class="board-group-cols">
+    ${members.map(columnHtml).join("\n")}
+    </div>
+    </section>`;
+  };
+  // Consecutive columns of one group share a section; a column in no group —
+  // Blocked, between Building and Landing — gets a group of its own, so it lines
+  // up with its neighbours.
+  const sections: string[] = [];
+  for (let i = 0; i < BOARD_COLUMNS.length;) {
+    const groupId = BOARD_COLUMNS[i].group;
+    const group = BOARD_GROUPS.find((g) => g.id === groupId);
+    if (!group) {
+      const col = BOARD_COLUMNS[i++];
+      sections.push(groupHtml({ id: col.id, title: col.title }, [col], true));
+      continue;
+    }
+    const members: Column[] = [];
+    while (i < BOARD_COLUMNS.length && BOARD_COLUMNS[i].group === groupId) members.push(BOARD_COLUMNS[i++]);
+    sections.push(groupHtml(group, members));
+  }
+  const columns = sections.join("\n");
+
+  const surface = `<div class="board" id="issue-board">${columns}</div>
+      <details class="board-tray"${expandAll ? " open" : ""} aria-label="Backlog">
+        <summary class="board-tray-head">Backlog <span class="board-col-count" data-count="${BACKLOG_DESTINATION}">${view.backlogCount}</span>${view.backlogNextReturn ? ` <span class="board-tray-next">· next returns ${escapeHtml(view.backlogNextReturn)}</span>` : ""}</summary>
+        <div class="board-col-body board-tray-body" data-column="${BACKLOG_DESTINATION}" aria-label="Send to backlog">Drop a card here to send it to the backlog.</div>
+      </details>`;
+  const warning = view.incompleteSources
+    ? `${view.incompleteSources} of the board's sources loaded incompletely — some cards are missing.`
+    : "";
+  // Age chips change with the clock, not the board; hashing them would make every tick a swap.
+  const hash = createHash("sha256").update(surface.replace(/<span class="board-age"[^>]*>.*?<\/span>/g, "")).digest("base64url").slice(0, 22);
+  return { surface, total: visible.length, warning, hash };
+}
+
+/** The poller's JSON: `renderBoardSurface` plus the three pinned nav links' counts and accessible names. */
+export function renderBoardRefresh(view: BoardPageView, navCounts?: NavCounts): BoardRefresh {
+  const nav = PINNED_NAV_LINKS.map(([href, label]) => {
+    const badge = navLinkCount(href, navCounts);
+    return { href, text: badge?.text ?? "", name: badge?.name ?? label };
+  });
+  return { ...renderBoardSurface(view), nav };
+}
+
+/** `GET /board` — every open issue across every managed repository, by column. */
+export function buildBoardPage(view: BoardPageView, theme: Theme, navCounts?: NavCounts): string {
+  const repoOptions = filterOptions(view.repoOptions, view.repoFilter);
+  const { surface, total, warning, hash } = renderBoardSurface(view);
+
+  // `#board-warning` always renders, hidden when every source loaded, so the
+  // poller only toggles its text and `hidden`.
+  const body = `
+  <div class="section">
+    <div class="board-toolbar">
+      <h2>Board <span id="board-total">${total}</span></h2>
+      <form class="board-filters" method="GET" action="/board">
+        ${repoSelect(repoOptions, view.repoFilter)}
+        <button class="trigger-btn" type="submit" id="board-filter-submit">Filter</button>
+      </form>
+      ${NEW_ISSUE_BUTTON(view.repoFilter ? `/issues/new?repo=${encodeURIComponent(view.repoFilter)}` : "/issues/new")}
+    </div>
+    <div class="board-status board-warning" id="board-warning" role="status"${warning ? "" : " hidden"}>${escapeHtml(warning)}</div>
+    <div class="board-status" id="board-status" role="status" aria-live="polite"></div>
+    <div id="issue-board-surface" data-surface-hash="${hash}">
+      ${surface}
+    </div>
+  </div>`;
+
+  return `<!DOCTYPE html>
+${htmlOpenTag(theme, "full")}
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  ${HEAD_META}
+  <title>claws — Board</title>
+  ${TAILWIND_STYLESHEET}
+  <style>${PAGE_CSS}${BOARD_CSS}${NEW_ISSUE_FORM_CSS}${NEW_ISSUE_MODAL_CSS}</style>
+</head>
+<body>
+  ${buildPageHeader(null, theme, { current: "/board", navCounts })}
+  ${THEME_SCRIPT}
+  ${body}
+  ${PREVIEW_MODAL_HTML}
+  ${buildNewIssueModal(view.repoOptions, view.repoFilter)}
+  ${ISSUE_BOARD_SCRIPT}
+  ${PREVIEW_MODAL_SCRIPT}
+  ${NEW_ISSUE_MODAL_SCRIPT}
+  ${ISSUE_ATTACHMENTS_SCRIPT}
+</body>
+</html>`;
+}

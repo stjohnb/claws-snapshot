@@ -1,0 +1,14 @@
+# Pinned SSH host keys for the ssh:* capabilities (St-John-Software/claws).
+# Shipped by the Dockerfile to /etc/ssh/ssh_known_hosts, OpenSSH's global
+# known-hosts file, so every pod built from this image pins these hosts.
+# Not a secret: public host keys only.
+# Refresh a line after a deliberate host rebuild: ssh-keyscan -t ed25519 <address>,
+# verify the fingerprint on the host (ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub)
+# and land the change by PR. Fingerprints as of 2026-10-21:
+#   nas            SHA256:4A52jLJD9Pje0u5Jwhbc5Wy8yfkGEKzrUMbXotQgZ5A
+#   thinkcentre    SHA256:qkizXpnEr5HNl/Sn0enej37jg/GWzZ0k0sroA6kzryw  (pre-seeded, see nixos-config docs/thinkcentre-preflight.md)
+#                  serves the LAN alias thinkcentre (192.168.0.251) and the tailnet name thinkcentre
+#   ryzen          SHA256:8urzwTDPV/UoKRwd6zRtoE5x7uf/GXLfMLMJQGHyl+E  (matches nixos-config docs/ryzen-preflight.md)
+nas,k3s-nas,192.168.0.128,nas.tailc20cf.ts.net ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJLF5oy/iNP3lcoSnoM8HCNmXrVjk2qmSz3wvFftbIIc
+thinkcentre,192.168.0.251,thinkcentre.tailc20cf.ts.net ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAh+1lJMEpGDvwu6cxXOO5QCP7dKgQ0pVrFH6HZQ1FdM
+ryzen,192.168.0.69,ryzen.tailc20cf.ts.net ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHlS6dqZso38D2bvuPYmNyeTCLK2Byg520beITNQKA7Z

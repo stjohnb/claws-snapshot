@@ -1,0 +1,48 @@
+---
+name: Set up Nix
+description: >-
+  Put the self-hosted runner's Nix on PATH, failing loudly if the runner has
+  no Nix at all, and printing the runner name and /nix diagnostics when it
+  fails. Same action nixos-config carries — the org's runners are NixOS, and
+  every CI dependency beyond nix itself comes from this repo's flake.nix via
+  `nix develop`, not from the runner.
+
+# The failure-branch diagnostics block originated in this repo's copy; other
+# repos' copies of this action (nixos-config, fleet-infra, ...) can adopt it
+# later.
+runs:
+  using: composite
+  steps:
+    - name: Put Nix on PATH
+      shell: bash
+      env:
+        RUNNER_NAME_CTX: ${{ runner.name }}
+      run: |
+        if [ -x /nix/var/nix/profiles/default/bin/nix ]; then
+          echo "/nix/var/nix/profiles/default/bin" >> "$GITHUB_PATH"
+        elif command -v nix >/dev/null 2>&1; then
+          echo "nix already on PATH: $(command -v nix)"
+        else
+          echo "::error::Nix is not installed on this runner."
+          echo "Install it, or label a Nix-capable runner and target that label."
+          # Diagnostics only: the subshell runs with set +e and its status is
+          # discarded, so nothing here can change how this step fails.
+          (
+            set +e +o pipefail
+            echo "--- runner name"
+            echo "${RUNNER_NAME_CTX:-unknown}"
+            echo "--- hostname"
+            hostname 2>/dev/null || echo "${HOSTNAME:-$(cat /etc/hostname 2>&1)}"
+            echo "--- runner env"
+            env | grep -E '^(RUNNER_|FORGEJO_|GITHUB_RUNNER)' | sort
+            echo "--- ls -la /nix /nix/var/nix/profiles /nix/var/nix/profiles/default"
+            ls -la /nix /nix/var/nix/profiles /nix/var/nix/profiles/default 2>&1
+            echo "--- /nix mount entry"
+            grep ' /nix ' /proc/self/mountinfo 2>&1 || echo "no /nix mount entry"
+            echo "--- df -h /nix"
+            df -h /nix 2>&1
+            echo "--- /nix/store entries"
+            ls /nix/store 2>&1 | wc -l
+          ) 2>&1 || true
+          exit 1
+        fi
