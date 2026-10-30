@@ -1,0 +1,797 @@
+# Configuration
+
+**Reference.** Exhaustive config key / env var / default table. For the dozen
+keys you actually touch, OVERVIEW's Configuration section is enough.
+
+Product requirements: [product/operations-and-safety.md](product/operations-and-safety.md)
+
+Configuration is resolved per-field: env vars > `~/.claws/config.json` >
+defaults. The file is a materialised copy of the config stored in the
+database — see [Where config is stored](#where-config-is-stored).
+
+| Config key | Env variable | Default |
+|---|---|---|
+| `slackWebhook` | `CLAWS_SLACK_WEBHOOK` | *(empty — must be set)* |
+| `slackProdAlertsWebhook` | `CLAWS_SLACK_PROD_ALERTS_WEBHOOK` | *(empty — falls back to `slackWebhook`; used by `notifyProdAlert` for prod-down pages; never rendered on the config page)* |
+| `slackBotToken` | `CLAWS_SLACK_BOT_TOKEN` | *(empty — needed for idea threads)* |
+| `slackIdeasChannel` | `CLAWS_SLACK_IDEAS_CHANNEL` | *(empty — needed for idea threads)* |
+| `selfRepo` | `CLAWS_SELF_REPO` | `St-John-Software/claws` **Stays on the host** (#2898): a role assignment read at server start, before discovery has populated the `claws.json` cache — and `selfRepo` gates discovery itself, so a repo-side `role` would be unreadable at the moment it is needed. |
+| *(none — discovered)* | `CLAWS_FORGEJO_REPOS` | Forgejo discovery (`GET /user/repos` as the bot account) is the only source; there is no checked-in list and no config.json key (#2952). `CLAWS_FORGEJO_REPOS` is an emergency additive override: it adds repos discovery can't currently see (or fetches a name directly when discovery is down); it does not replace or disable discovery. **Stays on the host** (#2898). |
+| `forgejoBaseUrl` | `CLAWS_FORGEJO_BASE_URL` | `https://git.home.bstjohn.net` |
+| `forgejoToken` | `CLAWS_FORGEJO_TOKEN` | *(empty — Forgejo API access token; never rendered on the config page)* |
+| `forgejoReadToken` | `CLAWS_FORGEJO_READ_TOKEN` | *(empty — least-privilege Forgejo code-read + issue-write token for the implicit `cross-repo` capability; env var wins over the config-file key; never rendered on the config page; exposed to agents only as `CLAWS_FORGEJO_READ_TOKEN`)* |
+| `forgejoAdminToken` | `CLAWS_FORGEJO_ADMIN_TOKEN` | *(empty — optional org-Owner token for the opt-in `forgejo-admin` session capability; env var wins over the config-file key; never rendered on the config page, never given to a headless agent. The service also uses it in-process, read-only, for the Actions runner registry and waiting-jobs endpoints on behalf of `mac-runner-waker` — without it, Forgejo repos are never woken (#3099). With `forgejoWebhookSecret` and `dashboardUrl` also set, the controller uses it at boot to create or update the org webhook below)* |
+| `forgejoWebhookSecret` | `CLAWS_FORGEJO_WEBHOOK_SECRET` | *(empty — receiver off. HMAC-SHA256 key for signed Forgejo webhook deliveries to `POST /webhooks/forgejo`, which turn CI results and human comments, labels, PR pushes, reviews, merges and closes into the `ci-status` and `forge-*` events `claws_wait_for_change` reports (`src/forgejo-webhook.ts`); a delivery whose `X-Forgejo-Signature` does not match is refused with 401, and with no secret the route answers 404. Env var wins; never rendered on the config page, never given to an agent or session pod. Both the controller and the web tier read it: the web tier receives deliveries, and the controller, when `forgejoAdminToken` and `dashboardUrl` are set, registers one Forgejo-type webhook per Forgejo org at boot (`<dashboardUrl>/webhooks/forgejo`, JSON, the secret, and the events in `FORGEJO_WEBHOOK_EVENTS`), warning with the manual steps on a 403. Forgejo never returns a hook's secret, so to rotate it delete the org hook and restart the controller after changing the value. Forgejo must also allow the dashboard host in `[webhook] ALLOWED_HOST_LIST`)* |
+| *(none — env only)* | `CLAWS_GIT_AUTHOR_NAME` | `clawsstjohn[bot]` — author/committer identity for every git commit Claws or its agents make, because the service host has no global git identity (#3206). |
+| *(none — env only)* | `CLAWS_GIT_AUTHOR_EMAIL` | `276932287+clawsstjohn[bot]@users.noreply.github.com` — see `CLAWS_GIT_AUTHOR_NAME` above. |
+| `port` | `PORT` | `3000` |
+| *(none — env only)* | `CLAWS_METRICS_PORT` | `9464` — port of the separate Prometheus `GET /metrics` listener (bound to `CLAWS_BIND_HOST`); never served on the dashboard port. `0` disables it; an invalid value falls back to `9464`. Requires a restart. See [metrics.md](metrics.md). |
+| `intervals.issueDispatcherMs` | — | `300000` (5 min) |
+| `intervals.prDispatcherMs` | — | `300000` (5 min) |
+| `intervals.autoMergerMs` | — | `180000` (3 min) |
+| `intervals.triageClawsErrorsMs` | — | `600000` (10 min) |
+| `intervals.issueShadowSyncMs` | — | `300000` (5 min) |
+| `intervals.issuePreviewSyncMs` | — | `300000` (5 min) — the [issue-preview-sync](jobs/issue-preview-sync.md) timer |
+| `intervals.issueImporterMs` | — | `1800000` (30 min) — the [issue-importer](jobs/issue-importer.md) timer |
+| `intervals.runnerMonitorMs` | — | `600000` (10 min) |
+| `intervals.contentModeratorMs` | — | `600000` (10 min) — the [content-moderator](jobs/content-moderator.md) timer |
+| `intervals.hostDiskMonitorMs` | — | `600000` (10 min) |
+| `intervals.emailMonitorMs` | — | `300000` (5 min) |
+| `intervals.mainBuildMonitorMs` | — | `300000` (5 min) |
+| `intervals.publicSnapshotSyncMs` | — | `604800000` (7 days) |
+| `intervals.claudeMemoryBackupMs` | — | `3600000` (1 hour) |
+| `intervals.authSecretSyncMs` | — | `600000` (10 min) |
+| `schedules.repoStandardsHour` | — | `2` (2 AM local time) |
+| `schedules.reminderMonitorHour` | — | `8` (8 AM local time) |
+| `schedules.upstreamWatcherHour` | — | `10` (10 AM local time) |
+| `schedules.blogDraftScannerHour` | — | `9` (9 AM local time) |
+| `intervals.dampReminderMs` | — | `900000` (15 min; `damp-reminder` still only creates the issue on alternate Mondays ≥ 9 AM local) |
+| `smartScheduling.enabled` | — | `true` |
+| `smartScheduling.quietHourStart` | — | `19` (accepted but unused — off-hours gating was removed) |
+| `smartScheduling.quietHourEnd` | — | `7` (accepted but unused — off-hours gating was removed) |
+| `smartScheduling.tickIntervalMs` | — | `3600000` (1 hour) |
+| `smartScheduling.jobs` | — | `{ "improvement-identifier": {}, "doc-maintainer": {}, "issue-auditor": {}, "scanner-dispatcher": {}, "stale-branch-cleaner": {} }` — set of jobs that use smart scheduling |
+| `smartScheduling.targetStalenessMs` | — | `86400000` (24h — repos not processed within this window are "due") |
+| `smartScheduling.sloStalenessMs` | — | `172800000` (48h — repos past this threshold force processing even when Claws is busy) |
+| `smartScheduling.maxConcurrentJobTasks` | — | `4` (max concurrent repo processing slots via `withSmartJobSlot`) |
+| `smartScheduling.ignoreBusyKinds` | — | `["ci-fixer", "ci-fixer:conflict", "ci-fixer:rerun", "ci-fixer:problematic", "review-addresser", "pr-reviewer", "auto-merger:sweep", "doc-maintainer", "improvement-identifier", "issue-auditor"]` — agent kinds excluded from the busy check |
+| `runners` | — | No default runner hosts (empty array) since `hetzner-beefy-actions` was decommissioned (#2770). Each entry is either an svc runner (`actionsDir`) or a NixOS systemd runner (`serviceUnit` + `workDir` + `toolDir`) — see `docs/jobs/runner-monitor.md`. Forgejo runners are not configured here: `runner-monitor` discovers them from the Forgejo org runner registry (#2863) |
+| `macRunners` | — | Two default `MacRunner` entries (`{name, host, user?, port?, identityFile?, labels, enabled?}`): `Brendans-MacBook-Pro` (`brendans-macbook-pro.local`, labels `macos`+`tempo`) and `Brendans-MacBook-Pro-3` (`brendans-macbook-pro-3.local`, `user: "brendanstjohn"`, labels `macos`+`xcode26`) — woken by `mac-runner-waker`; kept separate from `runners`/`RUNNER_HOSTS` since `runner-monitor` cannot manage macOS hosts. `enabled` (optional, default `true`) is togglable per-Mac from the config UI (#1984) — set `false` to stop `mac-runner-waker` from SSHing to a Mac that's been taken off the LAN. Each enabled entry also becomes an `ssh:<slug>` session capability (#3138) — not pre-ticked for any repo, listed unticked (not pre-ticked) on the create form for the Mac-runner repos, otherwise reachable via "Show all capabilities" or the live-grant dropdown like `forgejo-admin`; disabling or removing a Mac here hides its capability immediately, but a Mac *added* here only gets one once the service restarts |
+| `macRunnerRepos` | — | `["St-John-Software/bonkus", "St-John-Software/namey", "St-John-Software/TempoStatusBar"]` (repos `mac-runner-waker` polls for queued macOS jobs) **Operator override** — unioned with each repo's `claws.json`; see [repo-config.md](repo-config.md). A repo can enrol itself with `"runners": ["macos"]` in its own `claws.json` (#2898). Pruned on every config Save: an entry for an enabled repo whose `claws.json` declares `runners: ["macos"]` is redundant and is removed (#2936). |
+| `intervals.macRunnerWakerMs` | — | `60000` (1 min) |
+| `publicSnapshots` | — | (`source` is a managed Forgejo repo, `target` must be a GitHub repo — the only GitHub repos Claws writes to — and a source Forgejo discovery does not find is alerted as `[snapshot] Source repo … not found`.) Four `{ source, target, mirrorReleases?, scrubPaths?, publishPaths?, releaseAssetUrl?, latestTagPattern? }` pairs (#1826): `St-John-Software/claws` → `stjohnb/claws-snapshot` (`scrubPaths: [".forgejo/workflows/history-cleanup.yml", "src/config.ts", "src/jobs/runner-monitor.test.ts"]` — the history-cleanup workflow came first (#2009, leaked a personal email into the public mirror; its `.github/workflows/` copy was dropped once the repo moved to Forgejo, #clw_01M45RQ4Q5W61CGKQ3XC6YBPG4), then `src/config.ts` (#2094 — the file embeds infra-specific config, including these very `publicSnapshots` entries), then `src/jobs/runner-monitor.test.ts` (#2716 — a fixture in that test file hard-coded a real runner host IP and SSH username; there is no line-level scrub, so the whole file is excluded)), `St-John-Software/3d-models` → `stjohnb/3d-models` (`scrubPaths: ["power-workshop/images/photos/IMG_2823.jpg", "power-workshop/images/photos/IMG_2824.jpg", "power-workshop/images/photos/IMG_2825.jpg", "power-workshop/images/photos/IMG_2826.jpg", "power-workshop/images/photos/IMG_2827.jpg"]` — #3118, GPS EXIF coordinates in workshop reference photos; only these five of the nineteen photos in that directory carry GPS, and the rest are embedded in `docs/blog-post.md`, so the directory is not scrubbed wholesale), `St-John-Software/TempoStatusBar` → `stjohnb/TempoStatusBar` (`mirrorReleases: true` — the only pair with release mirroring enabled, #1851 — `latestTagPattern: "^v\\d+\\.\\d+\\.\\d+$"` (only plain `vX.Y.Z` releases may become Latest on GitHub, so a `linux-v*` release cannot break the macOS update checker; requires `mirrorReleases`, unset keeps GitHub's newest-wins default), and `releaseAssetUrl: "https://tempo-statusbar-releases.s3.us-east-1.amazonaws.com/releases/TempoStatusBarApp-{version}.dmg"`, an HTTPS fallback the mirror fetches only for semver tags carrying no `.dmg` asset; `{version}` is the tag with a leading `v` stripped, #2115, #2813), `St-John-Software/fleet-infra` → `stjohnb/homelab` (`scrubPaths: ["apps/authentik/configmap-blueprints.yaml", "clusters/my-cluster/config/certificates/letsencrypt-production.yaml", "clusters/my-cluster/config/certificates/letsencrypt-staging.yaml"]` — #1962; the two Let's Encrypt ClusterIssuers were added under #clw_01M5E9WBYZQF6FK0CGFS35WVXK because their `spec.acme.email` is a personal address, and the allowlist's `clusters/my-cluster/config/certificates/` directory entry still publishes the rest of that directory; plus a `publishPaths` allowlist of the files the three bstjohn.net posts reference, so only those paths are published and history is squashed to a force-pushed root commit). Any pair with a non-empty `scrubPaths` or `publishPaths` republishes as a squashed, force-pushed single-commit history every sync (there is no way to remove a path from ancestor commits without discarding history) and is mutually exclusive with `mirrorReleases` (enforced by a zod refinement in `config.ts`) **Stays on the host** (#2898): `claws.json` is published verbatim into the public target, so a repo-side `scrubPaths` would publish the very inventory of paths judged too sensitive to publish; a pair is also joint state about two repos, and the target is not Claws-managed. |
+| `logRetentionDays` | — | `14` |
+| `logRetentionPerJob` | — | `20` |
+| `emailEnabled` | `CLAWS_EMAIL_ENABLED` | `true` |
+| `emailUser` | `CLAWS_EMAIL_USER` | `""` (empty — must be set in env or config) |
+| `emailAppPassword` | `BRENDAN_SERVER_GMAIL_APP_PASSWORD` | *(empty)* |
+| `emailRecipient` | `CLAWS_EMAIL_RECIPIENT` | `""` (empty — must be set in env or config) |
+| `emailAllowedSenders` | `CLAWS_EMAIL_ALLOWED_SENDERS` | `[]` (comma-separated in env, lower-cased; empty = allow all senders. When non-empty, `email-monitor` skips messages whose `From` address isn't in the list — #2068) |
+| `dmarcBlockedSenders` | `CLAWS_DMARC_BLOCKED_SENDERS` | `[]` (comma-separated in env, lower-cased; an entry with `@` matches a full address, an entry without matches a domain and its subdomains. `dmarc-monitor` drops matching messages before parsing or storing — #2838) |
+| `whatsappEnabled` | `WHATSAPP_ENABLED` | `false` |
+| `whatsappAllowedNumbers` | `WHATSAPP_ALLOWED_NUMBERS` | `[]` |
+| `openaiApiKey` | `OPENAI_API_KEY` | *(empty)* |
+| `maxWorkWorkers` | `CLAWS_MAX_WORK_WORKERS` | `2` (`maxClaudeWorkers` / `CLAWS_MAX_CLAUDE_WORKERS` are deprecated aliases). Under `CLAWS_WORK_BACKEND=in-process` it is the fixed worker fiber count. Under `k8s-pod` it is the hard maximum of the ceiling Claws derives from live node capacity (see [Headless work backend](#headless-work-backend)). One extra priority-only express fiber always runs on top. Read live, so a config-file edit applies at the next capacity tick. |
+| `minWorkWorkers` | `CLAWS_MIN_WORK_WORKERS` | `2`. Under `k8s-pod`, the floor of the derived ceiling and the fallback when the node read fails; ignored under `in-process`. A value above `maxWorkWorkers` is held at it with a one-time `[config]` warning. |
+| `claudeTimeoutMs` | `CLAWS_CLAUDE_TIMEOUT_MS` | `21600000` (6 hours, minimum 60s) |
+| `claudeLivenessTimeoutMs` | `CLAWS_CLAUDE_LIVENESS_TIMEOUT_MS` | `21600000` (6 hours, minimum 60s) |
+| `agentWorkerMemoryMaxBytes` | `CLAWS_AGENT_WORKER_MEMORY_MAX_BYTES` | `2147483648` (2 GiB; 0 disables the watchdog and derived admission). Deprecated aliases: `claudeWorkerMemoryMaxBytes` / `CLAWS_CLAUDE_WORKER_MEMORY_MAX_BYTES`. The neutral name wins at the same precedence level (env vs env, file vs file), but env still beats the config file — so a `CLAWS_CLAUDE_WORKER_MEMORY_MAX_BYTES` env var overrides a neutral `agentWorkerMemoryMaxBytes` config-file key. Claws logs a one-time `[config]` warning when the cap comes from a deprecated name, so that migration is visible. The deployed StatefulSet sets a 4 GiB cap with `CLAWS_MAX_WORK_WORKERS=4` and `CLAWS_WORK_BACKEND=k8s-pod` under a 10 GiB service container; with that backend, queue workers run as separate agent pods in `claws-sessions` (2Gi request / 6Gi limit each; see `CLAWS_AGENT_POD_MEMORY_*`), so the worker count follows the ceiling derived from node memory (see [Headless work backend](#headless-work-backend)) rather than this container's limit. Shared memory admission therefore applies only to scheduler jobs that spawn agents in-process (e.g. email-monitor), where the derived 8960 MiB budget admits two overlapping full-cap 4 GiB runs plus the auxiliary lane and a third waits. The cap is *per run*, and a run that declares the auxiliary workload class is capped at that smaller slice instead — the reservation and the watchdog cap are always the same number. A run is auxiliary when it passes a positive `admissionBytes`, or when it sets no `mcpConfig` and either runs under a 10-minute own timeout or denies the whole text-only tool set; an MCP-driving run is therefore always agent-scale. The smaller cap is applied only while shared admission is active. This setting, and the other two `agentWorkerMemory*` keys below, apply to the service process only — an agent pod's launcher strips them from both its env and its shipped `config.json` and derives its own watchdog cap from `CLAWS_AGENT_POD_MEMORY_LIMIT` instead; see that row. |
+| `agentWorkerMemoryHeadroomBytes` | `CLAWS_AGENT_WORKER_MEMORY_HEADROOM_BYTES` | `1342177280` (1.25 GiB). Bytes withheld from the cgroup memory limit for the Claws service itself (dashboard, scheduler, pollers, page cache) — everything that never passes through admission. The shared headless-agent budget is `containerLimit - headroom`, and the auxiliary lane is carved out of that budget, not out of this headroom. Size it by how many concurrent full-cap runs the budget should admit: `budget >= n * cap + AUXILIARY_AGENT_ADMISSION_BYTES` admits `n` overlapping agent runs plus a bookkeeping call. At the deployed 10 GiB container / 4 GiB cap the default leaves 8960 MiB, i.e. `n = 2`. A headroom at or above the container limit no longer disables admission: the derived budget is clamped to the cap (strict one-at-a-time) and a `[claws]` warning says so. |
+| `agentWorkerMemorySharedBudgetBytes` | `CLAWS_AGENT_WORKER_MEMORY_SHARED_BUDGET_BYTES` | *(unset)*. Explicit shared budget for headless-agent admission. Unset derives from the cgroup limit. An invalid value (unparseable, negative, or below the 64 MiB floor) is rejected with a `[config]` warning and falls back to the *derived* budget, never to `0` — only an operator literally writing `0` disables admission. An explicit budget keeps admission active even when `agentWorkerMemoryMaxBytes=0` — uncapped runs then reserve the whole budget and run one at a time; otherwise `0` disables both the watchdog and derived admission. All three `agentWorkerMemory*` keys are plain byte counts with **no unit suffixes**: `parseInt` stops at the first non-digit, so `4.5GiB` would parse as `4` bytes. An unparseable, negative, or non-zero-below-64-MiB value is rejected with a `[config]` warning; `agentWorkerMemoryMaxBytes` and `agentWorkerMemoryHeadroomBytes` then use their defaults, and `agentWorkerMemorySharedBudgetBytes` falls back to the derived budget. |
+| `worktreeStaleMs` | — | `604800000` (7 days — worktrees older than this are pruned by worktree-cleaner) |
+| `reviewModelTier` | `CLAWS_REVIEW_MODEL_TIER` | `"sonnet"` (global default model tier for PR reviews, used when neither the plan nor the PR body names one). Accepts any tier — `"fable"`, `"opus"`, `"sonnet"`, `"haiku"` — plus the legacy `"cheap"`, which reads as `"haiku"`; an unrecognised value falls back to `"sonnet"`. Editable on `/config` — see [model-selection.md](model-selection.md) |
+| `anthropicApiKey` | `CLAWS_ANTHROPIC_API_KEY` | *(empty)* — the Anthropic API key OpenCode's `anthropic/…` models (the defaults) run on; set it in the `claws-auth` Secret, or the "Anthropic API Key" config-page field. Sensitive: masked on `/config`, never logged. Only the OpenCode child receives it, as `ANTHROPIC_API_KEY`; every other child, the Claude CLI and pi included, has it stripped and keeps the subscription token. See [OpenCode credentials](#opencode-credentials) |
+| `openrouterApiKey` | `CLAWS_OPENROUTER_API_KEY` | *(empty — optional; OpenCode and pi use it for `openrouter/…` models)* |
+| `opencodeSpendWarnUsd` | `CLAWS_OPENCODE_SPEND_WARN_USD` | `150` — reported all-time OpenCode spend on `anthropic/` models (USD) that raises one Slack warning; the controller checks hourly and warns once per threshold value, again only after the threshold is raised and passed. `0` disables it. The Usage page shows the spend against it |
+| `aiProviders` | `CLAWS_CLAUDE_ENABLED`, `CLAWS_CODEX_ENABLED`, `CLAWS_OPENCODE_ENABLED`, `CLAWS_PI_ENABLED`, `CLAWS_CLAUDE_WEIGHT`, `CLAWS_CODEX_WEIGHT`, `CLAWS_OPENCODE_WEIGHT`, `CLAWS_PI_WEIGHT` | `{ claude: { enabled: true, weight: 4 }, codex: { enabled: true, weight: 2 }, opencode: { enabled: true, weight: 0 }, pi: { enabled: true, weight: 0 } }` (enabled providers are selected randomly per eligible task using positive finite weights. Weight 0 is pin-only: the provider is out of the random draw but a `Use *` label or model-plan cell can still pin it, which is how pi and OpenCode ship — OpenCode spends Anthropic API credit, so only work pinned to it runs on it. A one-time boot migration moves a saved `opencode.weight` of exactly 1, the old default, to 0 and records `providerDefaultsRevision: 2`; any other saved weight is kept. Negative, `NaN`, or infinite weights are excluded with a warning; a saved config with no `pi` entry gets the weight-0 default). Existing `providerFallbackOrder` / `toolUseProviderFallbackOrder` are read only as migration inputs when `aiProviders` is absent: valid providers in the old array are treated as preference order for descending weights, and omitted providers remain enabled unless explicitly disabled by `aiProviders` or env. |
+| `providerRateLimitCooldownMs` | `CLAWS_PROVIDER_RATE_LIMIT_COOLDOWN_MS` | `300000` (5 min — the fixed cooldown a provider, or for Claude one account, is held for after a classified rate-limit error, applied by provider reselection in `claude.ts`). It is the fallback: when a usage-limit message prints a reset time (`resets 2am (Europe/London)`), the hold runs until that time plus a minute, even when that is sooner than this cooldown (see [model-selection.md](model-selection.md#when-a-tiers-allowance-runs-out)). Holds are shared through the `provider_holds` table, so agent pods and the controller see the same ones. A hold already in effect ends early on a successful web re-auth on `/reauth` (for Claude, that account's holds only), or when an operator clicks "Clear cooldown" — per account in each Claude account's section, or for the whole provider (every Claude account) in the Provider cooldowns section — both assume the rate-limited credential has been replaced or the limit has reset, so Claws tries it again on the next dispatch |
+| `codexDefaultModel` | `CLAWS_CODEX_DEFAULT_MODEL` | `"gpt-5.5"` (Codex opus-tier and deep-planning default). Non-empty Codex IDs are validated against `codex debug models` when available; stale non-mini aliases are repaired to `gpt-5.5`, stale mini/cheap aliases are repaired to `gpt-5.6-luna`, and repairs emit a `[model-selector]` warning |
+| `codexLightModel` | `CLAWS_CODEX_LIGHT_MODEL` | `"gpt-5.6-terra"` (balanced everyday Codex model for sonnet-tier tasks; set to `""` for the Codex CLI account-supported default) |
+| `codexCheapModel` | `CLAWS_CODEX_CHEAP_MODEL` | `"gpt-5.6-luna"` (fast, affordable Codex model for cheap-tier tasks; set to `""` for the Codex CLI account-supported default) |
+| `claudeCheapModel` | `CLAWS_CLAUDE_CHEAP_MODEL` | `"claude-haiku-4-5-20251001"` (the haiku tier for Claude; `""` falls back to the `haiku` CLI alias) |
+| `claudeFableModel` | `CLAWS_CLAUDE_FABLE_MODEL` | `"fable"` — the Claude CLI *alias*, not a pinned ID, so the fable tier tracks the newest model in it with no code change; `""` falls back to the same alias |
+| `codexFableModel` | `CLAWS_CODEX_FABLE_MODEL` | defaults to whatever `codexDefaultModel` resolves to (`"gpt-5.5"` out of the box). Same stale-alias repair and `codex debug models` validation as the other Codex keys |
+| `opencodeFableModel` | `CLAWS_OPENCODE_FABLE_MODEL` | `"anthropic/claude-fable-5-1"`; same provider-prefix rule as the other `opencode*Model` keys |
+| `opencodeBestModel` / `opencodeAdequateModel` / `opencodeCheapModel` | `CLAWS_OPENCODE_BEST_MODEL` / `CLAWS_OPENCODE_ADEQUATE_MODEL` / `CLAWS_OPENCODE_CHEAP_MODEL` | `"anthropic/claude-opus-5-5"` / `"anthropic/claude-sonnet-5-5"` / `"anthropic/claude-haiku-5-5"` — model IDs carry opencode's provider prefix (`anthropic/` or `openrouter/`, see [OpenCode credentials](#opencode-credentials)) and must match opencode's own model registry, not the raw provider catalog names (#905, #907) |
+| `piFableModel` | `CLAWS_PI_FABLE_MODEL` | defaults to whatever `piBestModel` resolves to (`"anthropic/claude-opus-5-5"` out of the box) |
+| `piBestModel` / `piAdequateModel` / `piCheapModel` | `CLAWS_PI_BEST_MODEL` / `CLAWS_PI_ADEQUATE_MODEL` / `CLAWS_PI_CHEAP_MODEL` | `"anthropic/claude-opus-5-5"` / `"anthropic/claude-sonnet-5-5"` / `"anthropic/claude-haiku-4-5"` — `provider/id` in pi's own catalog: the prefix up to the first `/` is pi's `--provider` (`anthropic`, `openai-codex`, `openai` or `openrouter`) and the rest its `--model`, so an OpenRouter model is `openrouter/anthropic/claude-opus-4`. See [pi credentials](#pi-credentials) |
+| `improvementIdentifierModel` | `CLAWS_IMPROVEMENT_IDENTIFIER_MODEL` | `"anthropic/claude-sonnet-5-5"` (OpenCode model ID used for improvement-identifier's whole-repo analysis phase: 1M context and a 128k output ceiling; same provider-prefix rule as the `opencode*Model` keys above, so an `openrouter/` id works while an OpenRouter key is set) |
+| `ollamaBaseUrl` | `CLAWS_OLLAMA_BASE_URL` | Local Ollama instance used by `ollama-rate-limit-classifier.ts` to classify Claude/Codex/OpenCode usage-limit errors, with a regex fallback when Ollama is unreachable |
+| `ollamaTimeoutMs` | `CLAWS_OLLAMA_TIMEOUT_MS` | `60000` (1 min — generous to tolerate a cold-started local Ollama) |
+| `ollamaConsecutiveFailuresBeforeDisable` | `CLAWS_OLLAMA_CONSECUTIVE_FAILURES_BEFORE_DISABLE` | `3` (consecutive Ollama failures before a 5-minute circuit breaker falls back to regex-only classification) |
+| `whisperBaseUrl` / `whisperLocalUrl` | `CLAWS_WHISPER_BASE_URL` / `CLAWS_WHISPER_LOCAL_URL` | Self-hosted faster-whisper transcription server endpoints — see [Voice-note transcription](whatsapp-setup.md#step-2--voice-note-transcription-on-by-default) |
+| `whisperModel` | `CLAWS_WHISPER_MODEL` | `"Systran/faster-whisper-base"` |
+| `bindHost` | `CLAWS_BIND_HOST` | `"0.0.0.0"` |
+| `activationState` | `CLAWS_ACTIVATION_STATE` | `"active"` (use `"verify-only"` for the dashboard and its `/config` connectivity checks with no jobs, or `"staging"` for only the `Claws Staging` issue/PR pipeline — see [Kubernetes Deployment](OVERVIEW.md#kubernetes-deployment) in OVERVIEW.md) |
+| `oidcClientId` | `CLAWS_OIDC_CLIENT_ID` | *(empty)* |
+| `oidcClientSecret` | `CLAWS_OIDC_CLIENT_SECRET` | *(empty)* |
+| `oidcBaseUrl` | `CLAWS_OIDC_BASE_URL` | *(empty — e.g. `https://auth.example.com`)* |
+| `oidcApplicationSlug` | `CLAWS_OIDC_APPLICATION_SLUG` | *(empty — authentik application slug)* |
+| `oidcRedirectUri` | `CLAWS_OIDC_REDIRECT_URI` | *(empty — defaults to `http://localhost:<port>/auth/callback`)* |
+| `oidcHostMap` | `CLAWS_OIDC_HOST_MAP` | *(empty — comma-separated `host=authBaseUrl` pairs, e.g. `claws.example.net=https://auth.example.net`; when the request's `X-Forwarded-Host`/`Host` matches a key, `/login` and `/logout` use that Authentik base URL and derive `redirect_uri` as `https://<host>/auth/callback`, so an externally-reached dashboard doesn't bounce to an internal-only auth host — #2841. Set it alongside the other `CLAWS_OIDC_*` values: an unmapped host that isn't the `oidcRedirectUri` host logs a once-per-host `[oidc]` warning and falls back to `oidcBaseUrl`)* |
+| `dashboardUrl` | `CLAWS_DASHBOARD_URL` | *(derived from `oidcRedirectUri`'s origin — public base URL used for dashboard links in Slack alerts)* |
+| `githubAppId` | `CLAWS_GITHUB_APP_ID` | `0` (disabled) |
+| `githubAppPrivateKeyPath` | `CLAWS_GITHUB_APP_PRIVATE_KEY_PATH` | *(empty)* |
+| `githubAppInstallationIds` | — | `{}` (owner → installation ID overrides) |
+| `githubOwnerAppCredentials` | — | `{}` (per-owner App credentials — `Record<string, {appId, privateKeyPath, installationId?}>` — overrides global credentials per owner; also listed in `SENSITIVE_KEYS`) |
+| `pausedJobs` | — | `[]` (job names to pause on startup) |
+| `disabledJobsByRepo` | — | `{}` (map of repo full name → array of job names to disable for that repo) **Operator override** — unioned with each repo's `claws.json`; see [repo-config.md](repo-config.md). Pruned on every `/jobs` Save: entries for unmonitored repos, job names that are neither a matrix column nor a registered job, and jobs the repo's own `claws.json` already locks (#2936). |
+| `prodAlertWorkflows` | — | `{"St-John-Software/production-infra": ["Tofu Apply", "Flux Bootstrap"]}` (map of repo full name → workflow names whose default-branch failure also pages `slackProdAlertsWebhook`; deliberately non-empty so paging survives deleting the repo's own `notify-failures.yml`) **Operator override** — unioned with each repo's `claws.json`; see [repo-config.md](repo-config.md). |
+| `mainBuildMonitorIgnoreWorkflows` | — | `{}` (map of repo full name → workflow names `main-build-monitor` must never file issues for) **Operator override** — unioned with each repo's `claws.json`; see [repo-config.md](repo-config.md). |
+| `disabledAgents` | — | `[]` (agent names to disable: `planner`, `implementer`, `ci-fixer`, `review-addresser`, `reviewer`, `merger`, `empty-pr-closer`) |
+| `skippedItems` | — | `[]` (array of `{repo, number}` excluded from processing; `number` is an issue *reference* — a forge number, or a Claws-native `clw_…` id) **Stays on the host** (#2898): per-item operator state, mutated live by the dashboard and MCP — a PR round-trip per skip is the wrong loop. |
+| `prioritizedItems` | — | `[]` (array of `{repo, number}` processed first; `number` is an issue reference, as for `skippedItems`) **Stays on the host** (#2898): per-item operator state, mutated live by the dashboard and MCP. |
+| `itemTimeoutOverrides` | — | `[]` (array of `{repo, number, timeoutMs}` — auto-managed by timeout escalation; `number` is an issue reference, as for `skippedItems`) **Stays on the host** (#2898): per-item, and auto-written by timeout escalation at runtime. |
+| `homeAssistantBaseUrl` | `CLAWS_HOME_ASSISTANT_BASE_URL` | *(empty — HA REST API integration disabled)* |
+| `homeAssistantToken` | `CLAWS_HOME_ASSISTANT_TOKEN` | *(empty — required when homeAssistantBaseUrl is set)* |
+| `homeAssistantConfigRepo` | — | *(empty — e.g. `St-John-Software/home-assistant-config`)* **Stays on the host** (#2898): a role assignment read at server start, before discovery has populated the `claws.json` cache — and `selfRepo` gates discovery itself, so a repo-side `role` would be unreadable at the moment it is needed. |
+| `allowedActors` | — | `["stjohnb"]` (human issue authors and approvers — never add bots: `github-actions[bot]` and `forgejo-actions` are trusted as CI-alert issue authors in code; issue authors whose issues are dispatched into the refine/implement pipeline; see [Content-Based State Machine](#content-based-state-machine)) |
+| `fleetInfraRepo` | `CLAWS_FLEET_INFRA_REPO` | `St-John-Software/fleet-infra` (fallback repo for Home Assistant monitor alert issues when `homeAssistantConfigRepo` is unset) **Stays on the host** (#2898): a role assignment read at server start, before discovery has populated the `claws.json` cache — and `selfRepo` gates discovery itself, so a repo-side `role` would be unreadable at the moment it is needed. |
+| `prodGrafanaUrl` | `CLAWS_PROD_GRAFANA_URL` | `"https://grafana.bstjohn.net"` (production Grafana base URL for the `prod-observability` capability; trailing `/` stripped; exposed to agents as `CLAWS_PROD_GRAFANA_URL`) |
+| `fleetGrafanaUrl` | `CLAWS_FLEET_GRAFANA_URL` | `"https://grafana.home.bstjohn.net"` (fleet Grafana base URL for the `fleet-observability` capability; trailing `/` stripped; exposed to agents as `CLAWS_FLEET_GRAFANA_URL`) |
+| `grafanaJwtSigningKey` | — | *(generated — PKCS8 PEM of the RSA-2048 key Claws signs Grafana observability JWTs with; written to the config store on first start; config store only, no env var; sensitive, masked on the config page; its public half is served at `/.well-known/claws-jwks.json`; the observability capabilities mint a fresh JWT from it as `CLAWS_{PROD,FLEET}_GRAFANA_TOKEN`; replacing it invalidates outstanding tokens; see [observability-access.md](observability-access.md))* |
+| — | `CLAWS_PAGES_S3_ENDPOINT` | *(empty)* Fleet pages host (Garage) S3 API, e.g. `http://garage.default.svc.cluster.local:3900`; path-style addressing only. **Env only**, set by fleet-infra on the StatefulSet. The pages host is configured only when all six `CLAWS_PAGES_*` variables are non-empty; it then backs the default `issuePreviewSummaryUrl` ([repo-config.md](repo-config.md)) and the `pages` session capability, which is otherwise unavailable. |
+| — | `CLAWS_PAGES_S3_REGION` | *(empty)* SigV4 region for the pages host, `garage`. **Env only.** |
+| — | `CLAWS_PAGES_S3_BUCKET` | *(empty)* Pages bucket, `pages`. **Env only.** |
+| — | `CLAWS_PAGES_BASE_URL` | *(empty)* Public web root of the pages host, `https://pages.home.bstjohn.net`. **Env only.** |
+| — | `CLAWS_PAGES_S3_ACCESS_KEY_ID` | *(empty)* Pages host S3 access key, from Secret `pages-s3-credentials`. **Env only**; never rendered on the config page and stripped from every session not granted `pages`. |
+| — | `CLAWS_PAGES_S3_SECRET_ACCESS_KEY` | *(empty)* Pages host S3 secret key, from Secret `pages-s3-credentials`. **Env only**; never rendered on the config page and stripped from every session not granted `pages`. |
+| — | `CLAWS_ATTACHMENTS_S3_ENDPOINT` | *(empty)* Garage S3 API for the native issue attachments bucket, e.g. `http://garage.default.svc.cluster.local:3900`; path-style addressing only. **Env only**, set by fleet-infra from Secret `claws-attachments-s3-credentials`. Attachments go to the bucket only when all five `CLAWS_ATTACHMENTS_S3_*` variables are non-empty — a partial set logs a warning and is ignored — and otherwise stay on the filesystem under `~/.claws/issue-attachments/`. Once set, every boot moves remaining filesystem attachments into the bucket ([issue-tracker.md](issue-tracker.md#attachments)). |
+| — | `CLAWS_ATTACHMENTS_S3_REGION` | *(empty)* SigV4 region for the attachments bucket, `garage`. **Env only.** |
+| — | `CLAWS_ATTACHMENTS_S3_BUCKET` | *(empty)* Attachments bucket, `claws-attachments`. **Env only.** |
+| — | `CLAWS_ATTACHMENTS_S3_ACCESS_KEY_ID` | *(empty)* Attachments bucket access key. **Env only**; never rendered on the config page and stripped from every session and agent. |
+| — | `CLAWS_ATTACHMENTS_S3_SECRET_ACCESS_KEY` | *(empty)* Attachments bucket secret key. **Env only**; never rendered on the config page and stripped from every session and agent. |
+| — | `CLAWS_PRINT_SERVER` | *(empty)* Fleet CUPS service `host:port`, `cups.default.svc.cluster.local:631` on the fleet. **Env only**, set by fleet-infra on the StatefulSet. Backs the `print` session capability, which injects it as `CUPS_SERVER`; when empty, `print` is unavailable. Never passed to headless agent pods. |
+| `prodClusterTailnetHost` | `CLAWS_PROD_CLUSTER_TAILNET_HOST` | `prod-cluster-11`. Tailnet name of the production control-plane node, used in the `ssh:prod-cluster` capability's `tailscale ssh` command. Tailscale suffixes the name on every node rebuild, so update this after a rebuild; the capability text tells sessions how to find the current name meanwhile. Read at startup (restart to apply). |
+| `prodDataTailnetHost` | `CLAWS_PROD_DATA_TAILNET_HOST` | `prod-data-14`. Same for the `ssh:prod-data` capability and the data node. |
+| `ciFixerCircuitBreaker.maxAttempts` | — | `5` (max CI fix attempts per PR within window) |
+| `ciFixerCircuitBreaker.windowMs` | — | `86400000` (24h window for attempt counting) |
+| `ciFixerCircuitBreaker.maxConsecutiveFailures` | — | `3` (consecutive failures before tripping) |
+| `ciFixerCircuitBreaker.maxConflictAttempts` | — | `3` (unproductive conflict-resolution attempts that actually reached the agent before leaving for manual resolution — attempts that failed before the agent ran, e.g. a provider outage, don't count, #2977) |
+| `ciFixerCircuitBreaker.maxCommitGrants` | — | `3` (lifetime fresh-budget grants per PR for commits pushed after the breaker tripped) |
+| *(retired)* | — | `githubOwners` (and its env var), `dependabotIgnoredAdvisories`, `dependabotAutoDismissStale`, `dependabotAutoRemediate` / `CLAWS_DEPENDABOT_AUTO_REMEDIATE`, `dependencyScheduleCheckEnabled`, `intervals.dependabotTofuUnblockerMs` and `schedules.publicRepoScannerHour` were removed in October 2026 with GitHub discovery and the Dependabot jobs (#clw_01M5VW1FVEPCYG33BN268PWTWZ): Claws manages only Forgejo repos, and Renovate covers dependency updates. `intervals.runnerMetricsSyncMs` went with the `runner-metrics-sync` job, which fed the GitHub-only `workflow_runs` table. A config that still sets them is ignored, and the next save drops the top-level keys. The former `thirdPartyUpdateWindow` key is also retired: Claws processes third-party update PRs at any hour, and a config file still carrying it logs `[config] Retired config keys (will be discarded on next save): thirdPartyUpdateWindow` at load |
+| *(retired)* | — | The Home Assistant monitoring keys (`homeAssistantDeployWatcherEnabled`, `homeAssistantGitPullAddonSlug`, `homeAssistantBinDayMonitorEnabled`, `homeAssistantBinDaySensorPrefix`, `homeAssistantBatteryMonitorEnabled`, `homeAssistantBatteryThresholdPercent`, `homeAssistantBackupMonitorEnabled`, `homeAssistantDeployStallMonitorEnabled`, `homeAssistantRepairsMonitorEnabled`, `homeAssistantRepairsIgnore` and the matching `intervals.*` keys) and their `CLAWS_HOME_ASSISTANT_*` env overrides were removed with the monitoring jobs (#clw_01M504VV1NB5YB9QNP4KAMQKK7). A config file still carrying them loads and logs one `Retired config keys` warning naming the top-level keys, and the next save drops those. The `intervals.*` keys are ignored on load without a warning and stay in `config.json` after a save; delete them by hand if you want them gone |
+| *(retired)* | — | `homeAssistantAreaReconcilerEnabled`, `homeAssistantEnergyReconcilerEnabled`, `intervals.haAreaReconcilerMs`, `intervals.haEnergyReconcilerMs` and their `CLAWS_HOME_ASSISTANT_*_RECONCILER_ENABLED` env overrides were removed with the registry reconciler jobs, which now run in home-assistant-config's own deploy (#clw_01M504V87DDSKQFN9694J0H0SF). A config file still carrying them loads and logs one `Retired config keys` warning naming the top-level keys, and the next save drops those. The `intervals.*` keys are ignored on load without a warning and stay in `config.json` after a save; delete them by hand if you want them gone |
+| *(retired)* | — | `intervals.githubStatusMs` was removed in October 2026 (Claws no longer monitors GitHub's service status); a config that still sets it is ignored |
+
+## Where config is stored
+
+The source of truth is the database's single-row `config_store` table
+([database-schema.md](database-schema.md#config_store-table)), not the file.
+`~/.claws/config.json` is a per-process materialised copy: `dist/boot.js`
+writes it from the database before the service loads its config, every
+dashboard save publishes to the database first and then rewrites the file,
+and every 5 s the process picks up a version another process published and
+reloads, firing the same `onConfigChange` listeners a dashboard save does.
+**Hand edits to `config.json` are overwritten** at the next boot or the next
+published change — change config on the dashboard's Config page.
+
+On the first boot that finds no stored config, an existing `config.json` is
+imported as version 1 (or `{}` is stored when there is none). A file that is not
+valid JSON is not imported, and boot retries next time. On a SQLite host with no
+`claws.db` yet the file stays authoritative until the service creates the
+database, which keeps a fresh install's `verify-only` default (see
+`activationState` row above). A save whose database write fails changes nothing
+and reports the error.
+
+The web tier (`CLAWS_ROLE=web`, below) never creates the table or imports a
+file: until the controller has stored a config it uses its local file as is,
+and applies the stored one on its next 5 s poll.
+
+## Process role
+
+Which half of Claws a process runs (#clw_01M5APX7YF3AGWHV1S1WMHJDR6) is set by
+env-only variables; neither has a `config.json` key, and both need a restart.
+
+| Env variable | Default |
+|---|---|
+| `CLAWS_ROLE` | `all`: one process runs everything — the scheduler, work queue, WhatsApp gateway, session timers, migrations and the dashboard. This is the host and SQLite mode. `controller` runs the same process as the single background controller of a split deployment. `web` serves only the dashboard, `/api`, agent-pod callbacks and session terminals, with no PID lock, startup recovery, scheduler, worker, WhatsApp gateway, memory backup or migrations; it reads and changes background processing through the database and waits for the controller to record the schema version before it listens. Any other value fails config load. See [k8s-cutover.md](k8s-cutover.md#webcontroller-split). |
+| `CLAWS_CONTROLLER_URL` | *(empty)*. The controller's internal base URL, e.g. `http://claws-controller.default.svc.cluster.local:3000`; a trailing `/` is stripped. Read only when `CLAWS_ROLE=web`, where it is required: the web tier forwards `/whatsapp`, `/whatsapp/*`, `/api/claude-auth/*`, `/api/codex-auth/*` and `/api/pi-auth/*` to it with the caller's cookies and body, and `POST /api/completion/:owner/:name` with its `Authorization` header too and answers 503 "Background processing is restarting" while it is unreachable (504 when it is reachable but sends nothing for 90 s, or 150 s on the completion route, [completion-api.md](completion-api.md)). |
+
+## Interactive session backend
+
+Interactive sessions run only as Kubernetes pods, one per session (#3026). Their
+settings are env-only variables. None of
+them has a `config.json` key, and all of them need a restart. Runbook and
+fleet-infra dependencies:
+[k8s-cutover.md § Cutover prerequisite](k8s-cutover.md#cutover-prerequisite-pod-per-session-interactive-sessions-3026).
+
+| Env variable | Default |
+|---|---|
+| `CLAWS_SESSION_BACKEND` | `k8s-pod`, the only supported value. Unset or empty means `k8s-pod`; any other value, including the removed host-tmux `local-tmux`, fails config load with `Invalid CLAWS_SESSION_BACKEND "<value>" — the only supported value is k8s-pod (host tmux sessions were removed)`. |
+| `CLAWS_SESSION_NAMESPACE` | `claws-sessions` |
+| `CLAWS_SESSION_IMAGE` | `registry.home.bstjohn.net/st-john-software/claws:<VERSION>` — the LAN registry image `.forgejo/workflows/release.yml` pushes for each Forgejo release. Empty on a `dev` build (one not produced by that workflow, which passes the release tag as the `CLAWS_VERSION` build arg), where creating a pod session returns 503. |
+| `CLAWS_SESSION_IMAGE_PULL_SECRETS` | `registry-pull` (comma-separated; fleet-infra mints it in `claws-sessions` for `registry.home.bstjohn.net`). |
+| `CLAWS_SESSION_STORAGE_CLASS` | `local-path` |
+| `CLAWS_SESSION_STORAGE_SIZE` | `20Gi` |
+| `CLAWS_SESSION_NODE_SELECTOR` | *(empty)*; `k=v[,k=v]`, malformed entries fail config load |
+| `CLAWS_SESSION_PRIORITY_CLASS` | *(empty)* |
+| `CLAWS_SESSION_CPU_REQUEST` | `250m` |
+| `CLAWS_SESSION_MEMORY_REQUEST` | `1Gi` |
+| `CLAWS_SESSION_MEMORY_LIMIT` | `6Gi` |
+| `CLAWS_SESSION_CLAUDE_THEME` | `auto`. Claude Code `theme` written to a new Claude pod session's `~/.claude/settings.json` when it has none, so the first-run wizard is skipped (#3131). A theme changed inside a session is kept on resume. |
+| `CLAWS_SESSION_MCP_URL` | *(empty)*. The Claws base URL as session pods reach it, e.g. `http://claws.default.svc.cluster.local:3000`; a trailing `/` is stripped. When set, Kubernetes agent pods get the `claws-state` MCP server at `<url>/mcp/sessions/<id>`, authenticated by a per-session token, and every session pod reports its process's exit code and last output to `<url>/session-pods/<id>/exit` (#3311). Empty means they get neither. |
+| `CLAWS_SESSION_AUTO_COMPACT_IDLE_MINUTES` | `30`. Minutes a Claude session whose last turn used at least 100k context tokens sits idle before Claws types `/compact` into it (#3090). `0` disables; an invalid value warns and uses `30`. |
+
+The `/config` connectivity checks' `session-backend` row checks the session
+image and the namespaced RBAC session pods need. New sessions use the image of
+the Claws version that created them; running pods keep theirs.
+
+Sessions that ended on the removed host tmux backend (`backend` NULL or
+`local-tmux` on their row) stay in the sessions history, but cannot be resumed:
+the list has no Resume for them, their page says so, and `POST
+/sessions/:id/resume` answers 409.
+
+Five provider-auth capabilities appear on the create form: `claude-auth`,
+`codex-auth`, `openrouter-auth`, `anthropic-api-auth` and `pi-auth`. Each copies the
+service's own credentials into that session's pod: one Claude account's token
+(read from the database at launch: the next account with a token that is not
+held or auth-expired, else the next with a token, written as
+`CLAUDE_CODE_OAUTH_TOKEN`; the same account backs the session's `pi-auth`
+Anthropic credential; see [Claude accounts](#claude-accounts)),
+the Codex `auth.json` (`$CODEX_HOME`, else `~/.codex`), `OPENROUTER_API_KEY`,
+`ANTHROPIC_API_KEY` (OpenCode's `anthropic/` models; never part of `pi-auth`),
+or pi's [four credential sources](#pi-credentials). Each is available only when
+its source credential exists (for `pi-auth`, any one of pi's four) (the Codex copy
+is not written back if refreshed inside the pod; see [pi credentials](#pi-credentials)
+for the same caveat). The chosen agent's logins are pre-ticked (both of OpenCode's). They own no env
+keys: the pod launcher gathers the material itself. The former `github-auth`
+(`GitHub (gh + git)`) capability is retired: sessions get no GitHub credential,
+and a stored grant naming it is dropped. A pod launched before the retirement
+keeps running; its `github-token` slot is simply never refreshed again.
+
+The create-form checkboxes and the live-grant dropdown group capabilities into
+labelled sections in a fixed order — Agent logins, Forge access,
+Infrastructure, SSH hosts, Tools (#3138). This is presentation only: it does
+not change what is granted, validated or pre-ticked.
+
+## Headless work backend
+
+Where claimed work-queue rows run (#clw_01M34R5RECDPPXVXBJZS1DA6C1) is set by
+env-only variables. None of them has a `config.json` key, and all of them need
+a restart.
+
+| Env variable | Default |
+|---|---|
+| `CLAWS_WORK_BACKEND` | `in-process`: each row runs in a worker fiber of the service, so a service restart interrupts it and the next boot re-queues it. Set `k8s-pod` to run each row in its own pod, `claws-agent-<rowId>`, which a restart leaves running; the pod holds no database credentials and records everything through the service's agent-pod ops API. Any other value fails config load, and so does `k8s-pod` with no image (a `dev` build without `CLAWS_SESSION_IMAGE`) or no `CLAWS_SESSION_MCP_URL`. |
+| `CLAWS_AGENT_POD_CPU_REQUEST` | `500m` |
+| `CLAWS_AGENT_POD_MEMORY_REQUEST` | `2Gi` |
+| `CLAWS_AGENT_POD_MEMORY_LIMIT` | `6Gi`. On `k8s-pod` this per-pod limit is the run's memory bound. The pod's own in-pod watchdog cap is derived from this limit minus a 2 GiB margin (floor 2 GiB) — `agentPodWatchdogCapBytes()` in `agent-memory-budget.ts` — and set as `CLAWS_AGENT_WORKER_MEMORY_MAX_BYTES` in the pod's own env; the service's `agentWorkerMemory*` settings do not reach pods. |
+| `CLAWS_AGENT_POD_EPHEMERAL_STORAGE_REQUEST` | `4Gi`. The node disk the scheduler reserves per pod, so pods pack by what a run needs. Without it Kubernetes would reserve the whole limit. A pod that cannot be placed for lack of room waits for capacity instead of failing. |
+| `CLAWS_AGENT_POD_EPHEMERAL_STORAGE_LIMIT` | `24Gi`. The disk cap at which a runaway pod is evicted. It is separate from the reservation above. |
+| `CLAWS_AGENT_POD_HOME_SIZE` | `20Gi`. `sizeLimit` of the pod's `emptyDir` HOME; a run's clone and caches go when the pod ends. |
+| `CLAWS_AGENT_POD_OFFNODE_SELECTOR` | Unset. `k=v[,k=v]` node selector for agent pods of every kind, push-capable ones (issue-worker, ci-fixer, review-addresser, auto-merger sweep) included; when present — even empty, which drops the selector — it replaces `CLAWS_SESSION_NODE_SELECTOR` for agent pods only, never for interactive sessions. A malformed entry fails config load. |
+| `CLAWS_AGENT_POD_OFFNODE_TOLERATIONS` | Unset. `key[=value]:Effect[,…]` tolerations for agent pods, so they can use tainted part-time nodes; `key=value` maps to `Equal`, a bare key to `Exists`, and `Effect` must be `NoSchedule`, `PreferNoSchedule` or `NoExecute`. A malformed entry fails config load. |
+| `CLAWS_AGENT_POD_PREFERRED_NODES` | Unset. Comma list of node hostnames agent pods prefer (preferred node affinity, weight 100, on `kubernetes.io/hostname`); they fall back to any other node they may use when none is Ready. Interactive sessions keep the session placement. A pod lost to a node that powered off is force-deleted 60s past its taint-manager deletion and retried once for every kind but the repo-scoped sweeps; a retried implementer resumes on the lost attempt's branch and PR. |
+
+Agent pods reuse the [session backend](#interactive-session-backend)'s
+namespace, image, pull secrets, node selector and priority class
+(`CLAWS_SESSION_NAMESPACE`, `CLAWS_SESSION_IMAGE`, …). Inside the pod,
+`CLAWS_SESSION_MCP_URL` is the base URL the `claws-state` MCP server and the
+agent-pod ops API client (`db-remote.ts`) use to reach the service; neither
+`CLAWS_DATABASE_URL` nor `CLAWS_DATABASE_PASSWORD` is copied into the pod. It authenticates with the pod's own token from the
+`mcp-token` key of its Secret, not the service's per-boot internal token, and
+the service accepts it while the row is running, across service restarts.
+Claude memories a run writes in the pod's HOME are not backed up. Scheduler
+jobs that spawn agents themselves stay in-process on both settings.
+The `/config` connectivity checks' `work-backend` row FAILs `in-process` inside
+a container, and checks the image, `CLAWS_SESSION_MCP_URL` and the Pod/Secret
+RBAC on `k8s-pod`. On `k8s-pod` it also reviews the cluster-scoped `list nodes`
+and `list pods` the capacity monitor needs, and FAILs naming the
+`claws-node-capacity` ClusterRole when they are denied, since the ceiling would
+then stay at the minimum. See `docs/k8s-cutover.md` for the pod's objects and lifecycle.
+
+### Derived headless ceiling
+
+On `k8s-pod` the number of rows Claws claims at once is not a fixed count.
+Every 60 s (`WORK_CAPACITY_INTERVAL_MS` in `src/work-capacity.ts`, not
+configurable) the controller lists the cluster's nodes and every non-terminal
+pod, and for each Ready, schedulable node computes
+`slots = floor((allocatable − requested) / CLAWS_AGENT_POD_MEMORY_REQUEST)`,
+where *requested* is the memory requests (plus pod overhead) of every pod on it
+except Claws' own `claws-workload=agent` pods. Nodes split into two lanes:
+
+- **session**: matches every `CLAWS_SESSION_NODE_SELECTOR` pair and has no
+  `NoSchedule`/`NoExecute` taint. Its slots size the *any-kind* fibers:
+  `clamp(sessionSlots, minWorkWorkers, maxWorkWorkers)`. With the part-time
+  nodes down, every kind is bounded by this lane alone.
+- **off-node**: matches `CLAWS_AGENT_POD_OFFNODE_SELECTOR` (empty matches every
+  node), is not a session node, and every hard taint is covered by
+  `CLAWS_AGENT_POD_OFFNODE_TOLERATIONS`. Its slots size *off-node-only* fibers,
+  `clamp(offNodeSlots, 0, maxWorkWorkers − anyKind)`, which claim and adopt
+  every kind, since every agent pod may leave the session node. No off-node
+  settings means no lane.
+
+The ceiling is the sum of the two lanes; the express fiber runs on top. A node
+going NotReady or powering off lowers it at the next tick; surplus fibers stop
+claiming after their current row, so no running pod is killed. A failed node or
+pod read holds the ceiling at `minWorkWorkers` (any-kind only) and logs a
+warning at most every 15 minutes. The ceiling, the min/max, the lanes and the
+per-node Ready state, allocatable and requested memory and slots show in
+`/api/runtime/status` (`workQueue.capacity`, also `claws_runtime_status`) and
+on `/status`. Under `in-process` the fiber count stays `maxWorkWorkers`.
+
+## Database backend
+
+Claws runs on SQLite or PostgreSQL from the same schema, selected by two
+env-only variables. Neither has a `config.json` key: the password must never be
+written to disk or rendered on the config page, and both are pod environment on
+the Kubernetes deployment. Both are in `SENSITIVE_ENV_KEYS`, so neither reaches
+an agent or interactive session.
+
+| Env variable | Default |
+|---|---|
+| `CLAWS_DATABASE_URL` | *(empty — SQLite at `~/.claws/claws.db`)* |
+| `CLAWS_DATABASE_PASSWORD` | *(empty — supply out-of-band when the URL carries no password)* |
+
+Set `CLAWS_DATABASE_URL` and Claws connects to Postgres instead: pool of 10
+connections, 30 s idle timeout, 10 s connect timeout. The **first** connection
+is retried with backoff for about 63 s (1 s→32 s, six attempts), because k3s
+admits a new pod's IP to the NetworkPolicy roughly a second after the pod
+starts and the first connect is expected to be refused. The chosen backend is
+logged at startup and named in the `/config` connectivity checks as host/database (`PostgreSQL (host:port/dbname)`) — never the URL, which carries the password. `CLAWS_DATABASE_PASSWORD` is merged into the URL before the
+pool is built and takes precedence over any password the URL already carries;
+passing it to `pg` as a separate option cannot work, because `pg` overwrites
+it with the empty password parsed out of the URL (#2974).
+
+The MCP server is a separate process that reads the database directly, so
+`writeClawsMcpConfig()` forwards both variables into its environment when they
+are set; without them a Postgres-backed pod's MCP child would look for a
+`claws.db` that does not exist.
+
+Selection keys on the variables, never on `isContainer()` — a container without
+`CLAWS_DATABASE_URL` still runs on its own SQLite file. `CLAWS_TEST_PGLITE=1`
+selects the in-process PGlite backend and is for the test lane only.
+
+### Shared browser service
+
+| Env variable | Default |
+|---|---|
+| `CLAWS_BROWSER_CDP_ENDPOINT` | *(empty — every Playwright MCP server launches a local headless Chromium)* |
+
+A `ws://` or `wss://` URL for the shared in-cluster browserless service
+(fleet-infra#1383), with the browserless token in its query string. It is
+env-only (no `config.json` key) and in `SENSITIVE_ENV_KEYS`, so strict-mode
+agents never inherit it. A value that is not a `ws://`/`wss://` URL is ignored
+with a warning that does not echo it.
+
+When set, every Playwright MCP server Claws builds connects to that endpoint
+instead of spawning Chromium (#3102): `browser` session pods. The URL reaches
+`@playwright/mcp` as `PLAYWRIGHT_MCP_CDP_ENDPOINT` in the sourced-then-deleted
+session env file in a session pod, and never on argv, in a Pod spec or in a
+log line. On this path there is no `--headless` and no `--user-data-dir`
+profile. The `/config` connectivity checks'
+`browser-service` row reports whether the endpoint is configured and, when it
+is, its running and queued counts (host, port and path only).
+
+### Provider parity
+
+Codex runs are not identical to Claude runs. `runClaude` invokes
+`codex exec --json`, so the agent's answer is the final `agent_message` event
+rather than the human transcript, and the `turn.completed` usage event is
+recorded via `onTokensUsed` — but Codex reports no price, so the cost column on
+`/usage` is **0** for every Codex run while the token counts are real.
+`/usage` can be filtered by repo, job, provider and model via query params.
+By default Claws omits `-m` for Codex and lets the CLI choose the authenticated
+account's supported default. If a Codex model key is set, Claws validates it
+against `codex debug models` when that catalogue is available, repairs stale
+aliases onto the shipped Codex family, follows visible upgrade mappings, and
+falls back to the CLI default for hidden IDs.
+Automated Codex runs receive MCP tools through a private per-run `CODEX_HOME`
+whose `config.toml` is generated from `mcpConfig`, with MCP env values kept out
+of argv. Codex has no `--append-system-prompt`, so the
+repo's `.agents/<role>.md` document is inlined into the prompt inside an
+`<agent-role>` block. The repo's own instructions are inlined the same way
+inside `<repository-instructions>`, read from `AGENTS.md` — the repo's only root
+instructions file, with no `CLAUDE.md` fallback (#3224) — capped at 32 KiB.
+
+Automated OpenCode runs receive MCP tools through `OPENCODE_CONFIG_CONTENT`,
+merged with the full-permission config Claws already supplies. Automated pi
+runs get theirs from `mcp.json` in a throwaway 0700 `PI_CODING_AGENT_DIR` under the
+worktree's agent-mcp dir, and always pass `--no-session --no-approve
+--no-extensions` so a managed repo's `.pi/` directory cannot add extensions,
+settings or MCP servers. Each pi run's provider comes from its model's
+`provider/` prefix; see [pi credentials](#pi-credentials). Interactive
+Codex/OpenCode sessions also receive the read-only `claws-state`
+diagnostics server by default. In session pods, Codex CLI `0.154.0` was verified
+to support remote MCP through `url` plus `bearer_token_env_var`; Claws writes
+the per-session endpoint to `~/.codex/config.toml` and puts only the
+session-scoped `CLAWS_SESSION_MCP_TOKEN` in `session.env`. OpenCode `1.18.31`
+was verified to support remote MCP through `type: "remote"`, `url`, and
+`headers`; Claws writes the per-session bearer header into the 0600
+session-owned OpenCode config. Neither path injects service database
+credentials or `INTERNAL_MCP_TOKEN` into the pod.
+
+Interactive sessions differ too. Plain Claude sessions run with a Claws-owned
+`--mcp-config --strict-mcp-config`, so ambient user-level MCP/plugins are
+ignored and the built-in `claws-state` server is present. Claude sessions with
+the `browser` capability get the Playwright server alongside `claws-state`
+(the operator accepted the prompt-injection risk of browsed pages reaching its
+tools), and `browser` can be granted to a running Claude session, which
+restarts the agent with its conversation kept. With `CLAWS_BROWSER_CDP_ENDPOINT` set, that
+Playwright server uses the shared browser service: the per-session
+`browser-profile` directory is dropped, so browser login state does not persist
+between sessions (the service gives each connection a fresh browser). Codex
+sessions run inside a per-session `CODEX_HOME` seeded with minimal config, the
+read-only `claws-state` MCP server, and `~/.codex/auth.json` when present, so
+ambient `~/.codex/config.toml` plugins/MCP servers do not leak into Claws
+sessions; that private config also carries Claws workflow/capability guidance
+as Codex `developer_instructions`. The session-local config also sets
+`check_for_update_on_startup = false`: the image's Codex install is
+root-owned, so its self-update prompt can never succeed and used to crash
+the session (#3312).
+
+**OpenCode credentials**: <a id="opencode-credentials"></a>an OpenCode model's provider prefix picks the key
+Claws injects into the opencode child, which is the only child to receive it:
+
+| Prefix | Provider | Key |
+|---|---|---|
+| `anthropic/` | Anthropic API, directly (spends API credit) | `anthropicApiKey` (`CLAWS_ANTHROPIC_API_KEY`), passed as `ANTHROPIC_API_KEY` |
+| `openrouter/` | OpenRouter | `openrouterApiKey` (`CLAWS_OPENROUTER_API_KEY`), passed as `OPENROUTER_API_KEY` |
+
+A run whose prefix has no key fails before spawning with `No API key found for
+anthropic` (or `openrouter`). That, Anthropic's 401 (`invalid x-api-key`) and
+OpenRouter's 401 (`User not found.`) latch the `agent-auth-expired-opencode`
+alert, whose instruction names the key to replace; it clears itself on the next
+successful OpenCode run. The `anthropic-api` connectivity check calls
+`GET https://api.anthropic.com/v1/models` with the key; the `openrouter` check
+reports "not configured (optional)" when no OpenRouter key is set.
+
+**Claude accounts**: <a id="claude-accounts"></a>The Claude Max accounts Claws runs Claude work on, and each one's OAuth
+token, are Claws database state (the `claude_accounts` table, see
+[database-schema.md](database-schema.md#claude_accounts-table)), managed on
+`/reauth`: **Add account** (an id matching `^[a-z0-9][a-z0-9-]{0,31}$` and an
+optional label, defaulting to the id), rename the label, and remove an account.
+Each account's Start login stores that account's token in the table; no
+config key, env var, env file or Secret is involved, so a new account or a
+fresh login needs no rollout or restart. Every process reads the table at most
+every 5 s (agent pods through the ops API), and a session pod launched from the
+web tier reads it at launch, so the new token reaches the next run or session.
+Tokens are never rendered on a page or returned by an API; pages show only
+whether one is present. Removing an account deletes its token, its holds and
+its auth-expired latch; past tasks keep their recorded `account_used`.
+Removing the last account is allowed: Claude is then skipped like a provider
+with no token.
+
+Each Claude attempt runs on an account with a token that is not held,
+tier-held or auth-expired (least recently limited first, then round-robin; an
+agent pod seeds its cursor from its work row id, so consecutive rows alternate
+accounts), and an account-wide usage limit or expired login on one account
+moves the run to the next account before any other provider. The token is
+passed to the CLI child as `CLAUDE_CODE_OAUTH_TOKEN`, and no child inherits any
+other `CLAUDE_CODE_OAUTH_TOKEN*` key. The serving account is recorded on the
+task (`tasks.account_used`) and shown in the Usage page's Account column.
+
+*Upgrading:* the controller's first boot of this release imports the accounts
+that the retired `claudeAccounts` config key or `CLAWS_CLAUDE_ACCOUNTS` env var
+named (default one `primary`), each one's `CLAUDE_CODE_OAUTH_TOKEN_<ID>` env
+key, and the legacy bare `CLAUDE_CODE_OAUTH_TOKEN` as the first account's
+token, then records `claude_accounts_imported` in `controller_status` and never
+reads those settings again. The `CLAUDE_CODE_OAUTH_TOKEN*` lines in
+`~/.claws/env` and the `claws-auth` Secret are ignored from then on and may be
+deleted.
+
+**pi credentials**: <a id="pi-credentials"></a>pi has no login of its own in Claws. It reuses the credentials Claws already
+holds, and each pi model's `provider/` prefix picks one:
+
+| Prefix | Account | Where the credential comes from |
+|---|---|---|
+| `anthropic/` | Claude account | The token of the Claude account chosen for the run (stored by that account's `/reauth` login; see [Claude accounts](#claude-accounts)), passed to pi as `ANTHROPIC_OAUTH_TOKEN`. A pi run makes one attempt on that account, with no retry on another |
+| `openai-codex/` | ChatGPT account | The Codex login, `$CODEX_HOME/auth.json` else `~/.codex/auth.json` (the `/reauth` Codex login), translated into an `openai-codex` entry in the run's own `auth.json` |
+| `openai/` | OpenAI API | `openaiApiKey` (`OPENAI_API_KEY`) |
+| `openrouter/` | OpenRouter | `openrouterApiKey` (`CLAWS_OPENROUTER_API_KEY`) |
+
+Credentials reach pi through its environment and the throwaway agent dir's
+0600 `auth.json`, never argv. A successful Claude or Codex login on `/reauth`
+also clears pi's auth latch and rate-limit cooldown. `/reauth` shows each
+provider's readiness from `pi auth check --no-refresh`, so checking never
+rotates a token; the `pi-auth` connectivity check reports the Pi Best Model's
+provider the same way. The config page counts pi available when the `pi`
+binary is installed and at least one of the four sources exists.
+
+The Anthropic token has no refresh step. The ChatGPT entry is a **copy**: when
+pi refreshes an expired access token inside it, the refreshed token is not
+written back to `~/.codex/auth.json`, the same caveat every other copy of the
+Codex login carries (the `codex-auth` session capability's copy, for one).
+The Codex CLI keeps refreshing its own file, and the next pi run copies it again.
+
+The Config page enables or disables each AI provider and sets its selection weight. Eligible unpinned agent runs choose randomly among enabled providers with positive finite weights. On an individual GitHub issue or PR, apply **Use Claude**, **Use Codex**, **Use OpenCode** or **Use Pi** to pin that provider when it is enabled; conflicting provider labels are ignored and weighted selection is used. Weight 0 keeps a provider out of the random draw; it then runs only when a Use label or model-plan cell pins it. A label naming a disabled provider, or one with a negative or non-finite weight, is ignored with an attribution note. Automated MCP-required prompts use the same provider-label and weighted-selection semantics because all automated backends receive `mcpConfig`.
+
+Config changes made via the web UI (`POST /config`) take effect immediately
+at runtime — no restart required. The config module uses ESM live bindings
+(`export let`) so all consumers see updated values on their next access.
+Interval and schedule changes are propagated to the scheduler via
+`onConfigChange()` listeners that call `updateInterval()` /
+`updateScheduledHour()`. The only exceptions are `port` (requires socket
+re-bind), `whatsappEnabled` (requires QR pairing), and `emailEnabled`
+(requires restart), which are shown as read-only in the UI.
+
+Env vars always take priority over `config.json`. Fields set via env var
+are shown as disabled in the config UI with a note indicating the override.
+
+External tools `claude` and `codex` must be authenticated separately — Claws does
+not manage their credentials. `gh` is used only by `github-external.ts` (public
+snapshot sync and upstream reads), with the controller's GitHub App token.
+
+When `homeAssistantBaseUrl` and `homeAssistantToken` are configured, and the
+call site opts in via `includeHomeAssistant: true`, the MCP server exposes two
+HA tools: `ha_list_entities` (discovers entity IDs, current state, and
+friendly names, filterable by domain or search substring) and
+`ha_api_request` (generic GET/POST passthrough to any `/api/…` endpoint, able
+to invoke any HA service). Every fleet call site gates that opt-in on
+`isHomeAssistantConfigRepo(fullName)` (default-deny since #2064), so these
+tools are only wired in when the agent is working on the
+`home-assistant-config` repo — see [MCP Server Context](#mcp-server-context)
+above. See [Home Assistant Integration](home-assistant.md) for the manual
+HA-side setup runbook (what can/can't be GitOps'd, initial repo and token
+setup) that is a prerequisite for this integration.
+
+The WhatsApp gateway requires a one-time QR-code pairing step. See
+[WhatsApp Setup](whatsapp-setup.md) for the full walkthrough.
+
+
+## Forgejo repos
+
+Forgejo repos are **discovered**, not listed: at each repo-cache refresh Claws
+enumerates `GET /user/repos` as its bot account and automates every repo it can
+write to (non-archived, not a pull mirror, non-empty, private or internal, not
+bot-owned) against `forgejoBaseUrl`'s Gitea-compatible API. Discovery is the
+only source of managed repos; there is no GitHub discovery.
+
+The set is discovered from the bot account's accessible repos, so onboarding a
+Forgejo repo is an org `bots`-team grant plus a root `claws.json` — no edit to
+this repo, no config edit, no restart. Repo mirroring to GitHub has been
+decommissioned, so there is no longer a checked-in exclusion floor; a GitHub
+copy of a migrated repo should be archived, and `fetchRepos()` already skips
+archived repos. `CLAWS_FORGEJO_REPOS` remains as an emergency additive
+override, and a name in it that the bot cannot see on Forgejo (404/403) is
+logged once and skipped rather than filing a `[claws-error]` (#2921).
+
+Discovery is not sufficient on its own: a repo also needs a
+[`claws.json`](repo-config.md) at the root of its default branch, or it is not
+monitored.
+
+The token is used both for the API (`Authorization: token <tok>`) and for git
+over HTTPS, where `buildEnvForForgejoGit` injects it via an inline credential
+helper keyed on the Forgejo host with username `oauth2`. It is never rendered
+on the config page and never written inside a worktree. Without it, every
+Forgejo call throws and the repo is skipped at discovery, so Claws degrades to
+doing nothing on that repo rather than automating a stale mirror.
+
+### The bot account (`clawsstjohn`)
+
+Claws authenticates to `git.home.bstjohn.net` as the dedicated bot user
+**`clawsstjohn`** (created 2026-08-28). As of 2026-09-10 it is a member of the
+org-level `bots` team with write permission on all `St-John-Software` repos on
+Forgejo — `perudo`, `bin-scraper`, `whyrr` and the `forgejo` fork — so newly
+created repos are discovered automatically.
+
+A dedicated bot account is **mandatory, not a convenience**. The token *is* the
+account: whichever account holds it, every prompt-injectable agent that reaches
+the token inherits that account's reach. On the owner's personal account that
+means repo deletion, team membership and every org secret — far more than any
+Claws flow needs — and #2672 already tracks unrevokable leftovers there, with
+Forgejo token deletion being UI-only. A purpose-made bot in the `bots` team
+carries only the write access the automation actually uses.
+
+The 👍 gate on Claws' own suggestions (`isAllowedHumanActor` in
+`src/forgejo.ts` and `src/github.ts`) now requires an `allowedActors` login
+that is neither Claws' own account nor a bot (#3225 Forgejo,
+#3232 GitHub), so a session holding the service token can no longer
+thumbs-up a Claws suggestion into review-addresser work by itself.
+
+Note this is *not* about `isAllowedActor`: that gate already returns true for
+Claws' own login by design (#2650, so Claws' Forgejo comments are not read as
+untrusted), and Claws' own comments are excluded from the instruction stream by
+the `isClawsComment()` marker rather than by login — they never come back as a
+human's instruction either way.
+
+Separately, confirm the owner's *Forgejo* login is in `allowedActors` — actor
+gating on these repos compares Forgejo logins, not GitHub ones. Today
+`allowedActors` contains `brendan` (the Forgejo login) alongside `stjohnb` (the
+GitHub login).
+
+### The token
+
+Name `claws-service`, scopes `write:repository,write:issue,read:user`. That is
+the minimum: every Claws call is under `/repos/...` except
+`forgejoSelfLogin()`'s `GET /user`, which needs `read:user` and which
+`isAllowedActor` depends on. Store it as `forgejoToken`
+in `~/.claws/config.json` (or export `CLAWS_FORGEJO_TOKEN`).
+
+### The read/issue token (implicit cross-repo access)
+
+The implicit `cross-repo` capability uses a separate Forgejo account/token for
+agents that only need to inspect another managed repo or file a companion
+issue there (#3152). Provision the account as a non-site-admin bot such as
+`claws-reader`; do not put it in `allowedActors`. Its team units are code read,
+issues write, pull requests read and Actions read (fleet-infra migrations
+0037, 0068 and 0069), with token scopes `read:repository,write:issue,read:user`.
+It must not have `write:repository`, `write:organization`, owner, admin or git
+push access, and it must not be used as a git credential-helper token.
+
+Store the token as `forgejoReadToken` or `CLAWS_FORGEJO_READ_TOKEN`. Sessions
+and shell-capable headless runs receive it only under that env var name, plus
+`CLAWS_FORGEJO_BASE_URL`; they never receive `CLAWS_FORGEJO_TOKEN`,
+`CLAWS_FORGEJO_GIT_TOKEN` or `GIT_CONFIG_*` from this capability. Until it is
+configured, cross-repo reads/issues fail closed instead of widening the
+push-capable service token.
+
+Claws resolves this account's own login from the token (`GET /user`, cached for
+the process lifetime) and treats it as Claws' own login for issue/comment
+authorship on Forgejo repos, exactly like the service account — so a companion
+issue or comment an agent files with this token is dispatched and read as
+trusted input, not skipped as an untrusted actor. It is never treated as a
+human approver: the 👍 human-approval gate checks `allowedActors` membership
+only, which this account must never have. The same holds for `github-actions[bot]` and `forgejo-actions`: trusted as CI-alert issue authors in code, never listed in `allowedActors`. The token's scopes must include
+`read:user` for this lookup to succeed; without it `GET /user` returns
+401/403, Claws logs one warning and keeps treating the account's issues and
+comments as untrusted (fail closed) until the scope is fixed.
+
+### The admin token (opt-in, Actions secrets)
+
+**Why a second credential.** `clawsstjohn` has push, not admin
+(`permissions.admin: false`). Forgejo's `reqOwner()` middleware answers
+`GET/PUT /repos/St-John-Software/<repo>/actions/secrets[/{name}]` with 403
+`user should be the owner of the repo`, and `GET /orgs/St-John-Software/actions/secrets`
+with 403 `token does not have at least one of required scope(s): [read:organization]`.
+Only an org-Owners member or a site admin can write Actions secrets/variables;
+there is no narrower Forgejo role.
+
+**Why not promote `clawsstjohn`.** Its token is implicit in every Forgejo
+session and reaches headless agents through the git credential helper while
+they process untrusted issue/PR content; as an owner, a prompt-injected agent
+could delete repos, rewrite team membership or read every org secret.
+
+**Why not a token on `brendan`.** It is the owner account, so its reach over
+the org and its repos is far wider than any Claws flow needs. #2672 already
+tracks unrevokable leftovers on that account and token deletion is UI-only.
+
+**Provisioning — gitops (primary).** Migration `0034-claws-forgejo-accounts.sh`
+in `St-John-Software/fleet-infra` (fleet-infra#1289) creates `claws-admin` (not
+a site admin), adds it to the `St-John-Software` **Owners** team, mints a
+`write:repository,write:organization` token and stores it in the Secret
+`claws-forgejo-tokens` under key `admin-token` (with `clawsstjohn`'s token
+under `service-token`). The claws StatefulSets inject them as
+`CLAWS_FORGEJO_ADMIN_TOKEN` and `CLAWS_FORGEJO_TOKEN` via `secretKeyRef`, the
+same shape as `CLAWS_DATABASE_PASSWORD`; `claws-config` is not involved. A
+from-scratch cluster needs **no** hand step — the migration is the whole
+provisioning path.
+
+**Fallback — non-cluster host.** For a host running from
+`~/.claws/config.json`, the same account and token can be made by hand:
+
+```bash
+kubectl exec -n default deploy/forgejo -- \
+  forgejo admin user create --username claws-admin \
+    --email claws-admin@home.bstjohn.net --password '<generated>' \
+    --must-change-password false
+# Then in the Forgejo web UI: add claws-admin to the St-John-Software "Owners" team.
+kubectl exec -n default deploy/forgejo -- \
+  forgejo admin user generate-access-token \
+    -u claws-admin -t claws-admin \
+    --scopes write:repository,write:organization --raw
+```
+
+`write:repository` is needed as well as `write:organization`: the repo secret
+routes sit under the repository scope category. Then export
+`CLAWS_FORGEJO_ADMIN_TOKEN` (preferred — the env var takes precedence) or set
+`forgejoAdminToken` in `~/.claws/config.json`, and
+`sudo systemctl restart claws.service` — safe for in-flight sessions because
+the unit sets `KillMode=process`.
+
+**Security invariants.** `claws-admin` must **not** be a site admin and must
+**never** appear in `allowedActors`, so its comments and reviews can never
+drive Claws. See the "tokens can only be revoked in the web UI" gotcha
+below — the same applies to this token.
+
+### Interactive sessions
+
+Pi is a session agent alongside Claude, Codex and OpenCode, on the single-repo
+New session form only. Its model select lists `piBestModel`, `piAdequateModel`,
+`piCheapModel` and `piFableModel` (`provider/id`; "Other…" takes any pi
+catalogue id), passed as `--provider`/`--model` with `--no-approve`, and
+`--continue` on resume. Locally each session gets a 0700 `PI_CODING_AGENT_DIR`
+under its session MCP dir holding `mcp.json` (`claws-state`), `APPEND_SYSTEM.md`
+(the role prompt) and the translated Codex login as `auth.json`; the other
+[pi credentials](#pi-credentials) ride in the session's 0600 env file. A
+`k8s-pod` session uses `~/.pi/agent` on its PVC instead, with `claws-state`
+reached over HTTP, and gets credentials only through the `pi-auth` capability;
+its `auth.json` is copied only if absent, so a refresh inside the pod survives
+resume. Project trust stays off, so a repo's `.pi/APPEND_SYSTEM.md` cannot
+replace the role prompt. pi has no `--add-dir`, so multi-repo pi sessions and
+the `browser` capability are rejected.
+
+The `cross-repo` capability is implicit for every session. It tells agents they
+may read any Claws-managed repo and file companion issues when the task depends
+on another repo's manifests, CI or conventions. It grants only
+`CLAWS_FORGEJO_READ_TOKEN` and `CLAWS_FORGEJO_BASE_URL` when
+`forgejoReadToken` is configured.
+
+Sessions are default-deny for secrets, but the `forgejo` capability
+(`capabilities.ts`) is granted **automatically** to any session — single-repo,
+multi-repo, or resumed — that includes a repo, since every managed repo is on
+Forgejo. It grants
+`CLAWS_FORGEJO_TOKEN`, `CLAWS_FORGEJO_BASE_URL` and the `GIT_CONFIG_*`
+credential-helper vars for the Forgejo host. On the session-create form it
+renders as a checked, disabled checkbox — "auto: Forgejo-hosted repo" —
+whenever the selected repo(s) force it, so an operator can see the grant
+before creating the session; a disabled checkbox never posts, so the union in
+`capabilities.ts` is what actually grants it. For a selection that doesn't
+force it (a home session with no repo), it's an ordinary opt-in checkbox
+instead. It is silently absent when `forgejoToken` is unset, in which case the
+session gets no half-working credential. Inside a granted session, read and
+write issues/PRs/comments with
+`curl -H "Authorization: token $CLAWS_FORGEJO_TOKEN" "$CLAWS_FORGEJO_BASE_URL/api/v1/..."`
+— never `gh`: Claws manages no work on GitHub.
+
+`forgejo-admin` is a normal opt-in capability — a create-form checkbox, off by
+default, absent entirely when no admin token is configured. On the single-repo
+form it is revealed by ticking "Show all capabilities" (it is deliberately
+absent from `REPO_CAPABILITY_DEFAULTS`, because that map also pre-ticks), until
+the operator has submitted it for a repo (the Mac SSH hosts and the production nodes `ssh:prod-cluster` / `ssh:prod-data` use a separate suggestions layer instead: shown unticked for their relevant repos, never pre-ticked), after which it is remembered and pre-ticked
+for that repo like any other capability; on the multi-repo form it is always listed. When granted, use it only for
+`/actions/secrets` and `/actions/variables` paths and keep using
+`CLAWS_FORGEJO_TOKEN` for issues, PRs, comments and git.
+
+The Claws service itself also uses this token in-process, read-only, for the
+Actions runner registry and waiting-jobs endpoints on behalf of
+`mac-runner-waker` (#3099) — separately from, and not widened by, the opt-in
+session capability above. Without `forgejoAdminToken` configured, Forgejo
+repos that declare a `"macos"` runner are never woken. The owner account's name must never appear
+in anything Claws writes, whether from a session or from this in-process use.
+
+Forgejo runs as the `forgejo` deployment in the `default` namespace of the home
+cluster; its admin CLI is reached by `kubectl exec` into the pod:
+
+```bash
+kubectl exec -n default deploy/forgejo -- \
+  forgejo admin user generate-access-token \
+    -u clawsstjohn -t claws-service \
+    --scopes write:repository,write:issue,read:user --raw
+```
+
+Then set `forgejoToken` in `~/.claws/config.json` and
+`sudo systemctl restart claws.service`. The restart is safe for interactive
+sessions: they run in their own session pods, which a Claws restart leaves running.
+
+**Gotcha — tokens can only be revoked in the web UI.** Forgejo's
+token-management endpoints (`DELETE /api/v1/users/{user}/tokens/{name}` and
+friends) accept *password* basic auth only; token auth and basic-auth-with-a-
+token both return `auth method not allowed`. So a token minted by mistake
+cannot be cleaned up programmatically — it has to be deleted by hand in Forgejo
+→ Settings → Applications, as the account that owns it. Mint carefully, and
+don't script token cleanup.
+
+### Granting Claws access to a repo
+
+**Recommended — an org-level team (covers future repos automatically).** In the
+`St-John-Software` Forgejo org, create a team named `bots` with write
+permission and "all repositories" (which includes repositories created later),
+and add `clawsstjohn` to it. Once that team exists, onboarding a newly migrated
+repo is just: create/migrate the repo into the org, and commit a
+[`claws.json`](repo-config.md) to the root of its default branch. No per-repo
+permission step, no config edit and no restart — Claws discovers the repo
+within one repo-cache TTL (5 minutes). The per-repo collaborator grants have
+been migrated into that team, so there is one place granting Claws access.
+
+The two steps that matter, in either arrangement, are: **grant the bot write
+access** (read-only access is logged with a warning naming the repo and the
+repo is skipped — Claws cannot open a PR without push), and **commit a
+`claws.json`**.
+
+Creating the team is a one-time manual step in the Forgejo UI (Organisation →
+Teams → New Team); Claws has no code path for it.
+
+**Fallback — per-repo collaborator (for repos outside the org).** Add
+`clawsstjohn` as a collaborator with write permission:
+
+```
+PUT /api/v1/repos/{owner}/{repo}/collaborators/clawsstjohn
+{"permission":"write"}
+```
+
+This call must be made as a user who administers the repo, so it needs a token
+on *that* account, not on `clawsstjohn`'s — which is why the temporary setup
+tokens minted for the perudo grant then had to be revoked by hand in the UI.
+Prefer the team route and avoid minting throwaway tokens.

@@ -1,0 +1,8493 @@
+import { z } from "zod";
+import http from "node:http";
+import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
+import { Readable } from "node:stream";
+import { Hono } from "hono";
+import type { Context, MiddlewareHandler } from "hono";
+import { bodyLimit } from "hono/body-limit";
+import type { ContentfulStatusCode } from "hono/utils/http-status";
+import { streamSSE } from "hono/streaming";
+import { matchedRoutes } from "hono/route";
+import { serve, upgradeWebSocket } from "@hono/node-server";
+import type { HttpBindings } from "@hono/node-server";
+import { WebSocket, WebSocketServer } from "ws";
+import { isOpenCodeBinaryAvailable } from "./claude.js";
+import { hashAgentMcpToken, safeCompare } from "./internal-mcp-token.js";
+import * as worker from "./worker.js";
+import { AGENT_KINDS } from "./worker.js";
+import type { ControllerClient, ProviderStatuses, WorkerStatus } from "./controller-client.js";
+import { stageRankOf, workLaneOf } from "./work-order.js";
+import { SERVER_PORT, BIND_HOST, WORK_DIR, VALID_AGENT_NAMES, getConfigForDisplay, writeConfig, getUnknownConfigKeys, removeConfigKeys, MAC_RUNNERS, isAgentDisabled, type ConfigFile, type MacRunner, type Repo } from "./config.js";
+import * as config from "./config.js";
+import { enrichQueueItemsWithPRStatus, mergePR, removeQueueItem, listRepos, listPRs, listPRStatuses, getPRReviewStatus, getMergeBlockReason, type PRRepoStatus, type StaleReadOptions, listIssuesByLabel, listOpenIssues, addLabel, removeLabel, listRepoDirectory, fetchRepoFileWithSha, getDefaultBranch, createBranchRef, putRepoFile, createPR, getPRState, ensureLabel, getPRChangedFiles, getPRHeadSHA, fetchRepoFileBytes, infraPathsIn, isNativeIssue, awaitingImportReason, isDependencyBotAuthor, hasPriorityLabel, type ReviewLedgerEntry, type Issue, type PR } from "./github.js";
+import { LABELS } from "./config.js";
+import { findLatestFailedRun, isRunOnCommit, rerunFailedJobsForSession, getPRMergeGate, postOperatorComment, ciFixerGaveUpOnHead } from "./github.js";
+import { getIssueComments, editIssue, editIssueTitle, closeIssue, getIssueState, commentOnIssue as ghCommentOnIssue, type IssueState } from "./github.js";
+import * as planParser from "./plan-parser.js";
+import { normalizeTier } from "./model-selector.js";
+import { isPhaseClaimOnly } from "./phase-coverage.js";
+import { issuesAwaitingOperator } from "./awaiting-operator.js";
+import { loadIssuePhaseState, loadManualActionWarnings, manualWarningRow, resolveTrackerId } from "./planned-prs.js";
+import { clearPrHold } from "./pr-hold.js";
+import { hasManualAction, isMergeApproved, isProblematic } from "./pr-state.js";
+import { hasCurrentDiagnosisReport, REDIAGNOSE_REQUEST_MARKER } from "./agents/problematic-pr-diagnoser.js";
+import { ForgejoActionNotFoundError, forgejoSelfLogin, forgejoReadSelfLogin, getCommitCheckStatus } from "./forgejo.js";
+import { verifyForgejoSignature, handleForgejoDelivery, findOpenPrForHead } from "./forgejo-webhook.js";
+import * as plannerRuns from "./planner-runs.js";
+import * as alertBridge from "./alert-bridge.js";
+import { alertBridgeAuthMiddleware } from "./alert-bridge.js";
+import * as issueFiler from "./issue-filer.js";
+import { issueFilerAuthMiddleware, MAX_ATTACHMENT_BYTES as MAX_FILER_ATTACHMENT_BYTES } from "./issue-filer.js";
+import { completionAuthMiddleware, completionHandler, COMPLETION_DEADLINE_MS, MAX_COMPLETION_BODY_BYTES } from "./completion-api.js";
+import { DEDUPE_KEY_PATTERN, serialiseIssueCreate } from "./issue-create-lock.js";
+import { getWorkRow, getJobRun, getJobRunLogs, getJobRunLogsSince, getLatestRunIdsByJob, getRunningTasks, getTasksByRunId, getWorkItemsForRuns, getRunsForIssue, getLogsForRuns, getQueueSnapshots, getRecentTasksForRepo, getDailyTaskStats, getLastTaskTimePerRepo, getLastUsedByProvider, getRecentWhatsappEvents, cancelJobRunIfRunning, listQueuedWork, setWorkPriority, getUsageStats, getTotalUsage, getUsageFilterOptions, getRecentEffectivenessEvents, getOpencodeAnthropicSpendUsd, getRecentDampReadings, getDampTrendRows, upsertDampReading, deleteDampReading, getLatestDmarcReportsPerReporter, getDmarcVerdictCounts, getDmarcSourceIps, getRecentDmarcRows, upsertBlogDraft, getBlogDraft, listBlogDrafts, insertFrictionNote, listUntriagedFrictionNotes, countUntriagedFrictionNotesByRepoAndCategory, lastFrictionRetrospectiveAt, listFrictionRetrospectives, getTasksByIds, setBlogDraftPushed, clearBlogDraftPR, deleteBlogDraft, resetCIFixerBreakerGrants, getRecentSessionModels, rememberSessionCapabilityDefaults, getAllSessionCapabilityDefaults, rememberSessionAgentDefault, getSessionAgentDefaults, getImportedIssueByNative, listExplicitIssueModelPlanRows, listClawsIssueAttachments, listPRReviews, isRunningAgentPodMcpToken, listOpenClawsIssues, listClawsIssues, listIssueIdsWithPlans, getClawsPr, listClawsPrs, listClawsPrsForIssue, getIssuePlannedPRs, getIssueBlockedReasons, listOpenClawsAlerts, setIssueBlockedReason, setClawsIssueBacklogUntil, getIssueBacklogUntil, listPendingReapprovalIssueIds, getIssueReapproval, listRequirementsApprovedIssueIds, upsertClawsPr, recordSessionPrAction, countLiveSessionsSpawnedBy, listLiveBoardStartedSessions, listLivePrStartedSessions, getPersistedSession, listSessionFiles, getSessionAttachment, insertClaudeAccount, updateClaudeAccountLabel, deleteClaudeAccount, clearProviderHolds, type ClawsPrRecord, type IssueModelPlanRow, type Task } from "./db.js";
+import * as log from "./log.js";
+import { approvalHoldReason as getApprovalHoldReason, attemptMerge, finalizeMergedClawsPR, isApprovalExempt } from "./agents/auto-merger.js";
+import { msUntilHour } from "./scheduler.js";
+import { slackStatus, isSlackBotConfigured } from "./slack.js";
+import { isPairing, startPairing, stopPairing, cancelPairing, unpair } from "./whatsapp.js";
+import * as issueImporter from "./jobs/issue-importer.js";
+import { VERSION } from "./version.js";
+import { httpRequestFinished, httpRequestStarted, latencySummary, markListening, observeHttpRequest, readRolloutGap, routeLabel, setGrafanaAuthOk } from "./metrics.js";
+import { PAGES_LOGIN_PATH, PAGES_READ_COOKIE, pagesHostname, verifyPagesReadToken } from "./pages-read-token.js";
+import { ensureSigningKey, GRAFANA_CLUSTERS, isGrafanaCluster, grafanaProbeFailureMessage, grafanaProbeLogContext, jwks, mintGrafanaJwt, probeGrafanaAuth } from "./grafana-jwt.js";
+import { buildStatusPage, queueCapacitySummary, type QueueCapacityView, type QueueEntryView } from "./pages/dashboard.js";
+import { buildLogDetailPage, buildIssueLogsPage, renderOutcomeCard, parseOutcome } from "./pages/logs.js";
+import { buildConfigPage } from "./pages/config.js";
+import { buildWhatsAppPage } from "./pages/whatsapp.js";
+import { buildRepoPage } from "./pages/repo.js";
+import { buildAllPRsPage, buildAllIssuesPage, type UnassignedIssueRow } from "./pages/lists.js";
+import { parsePrsQuery } from "./pages/prs-view.js";
+import { resolvePRStatus, type PRRowStatus } from "./pages/pr-status.js";
+import { buildIssuePage, buildNewIssuePage, offeredLabels, type IssuePageView, type IssuePullRequestView, type PlanPreview, type PlanView, type RequirementsView } from "./pages/issue.js";
+import { describeModelPlan, isModelPlanPhase, isModelPlanProvider, MODEL_PLAN_PHASES, parseModelPlanForm, setExplicitPlan, summarizeModelPlanCells, type ModelPlanCell } from "./model-plan.js";
+import { buildBoardPage, ideaExcerpt, infraPrLine, renderBoardRefresh, type BoardCard, type BoardCardPr, type BoardPageView, type IdeaPreview } from "./pages/board.js";
+import { buildBacklogPage, parseBacklogQuery, type BacklogRow } from "./pages/backlog.js";
+import { parseBacklogUntil } from "./backlog-until.js";
+import { hasPendingReapproval, promoteReapproval } from "./reapproval.js";
+import { applyIssueApproval, readIssueApproval } from "./issue-approval-write.js";
+import { APPROVAL_GATES, approvalRank, atLeast, isApprovedThrough, maxApproval, withdrawMergeTarget, type ApprovedThrough } from "./issue-approval.js";
+import { RETIRED_GATE_LABELS } from "./issue-lifecycle.js";
+import { deriveApprovalTrack, mergeApproval, renderApprovalTrack, type ApprovalTrackInput } from "./pages/approval-track.js";
+import { approvalForMove, isStalledPr, backlogRefusal, BACKLOG_DESTINATION, BLOCKED_REASON_REQUIRED, columnAfterMove, columnFor, DERIVED_COLUMN_REJECTION, destinationForLifecycle, DONE_COLUMN_LIMIT, DONE_WINDOW_HOURS, FORGE_REOPEN_REJECTION, isBoardDestination, isDerivedColumn, isRequirementsColumn, landsIn, planRefusal, transitionFor, UNASSIGNED_REJECTION, type BoardDestination } from "./issue-board.js";
+import { flightKey, loadBoardFlights, loadIssueFlight } from "./issue-flight.js";
+import { loadIssueStage, loadOpenIssueStages, stageForIssue } from "./issue-stage.js";
+import { renderRequirementsComment, RequirementsRecordSchema } from "./requirements-record.js";
+import { ISSUE_LIFECYCLES, isIssueLifecycle, isStateLabel, type IssueLifecycle } from "./issue-lifecycle.js";
+import * as clawsIssues from "./claws-issues.js";
+import { currentIssueActor, withIssueActor, type IssueActor } from "./issue-history-actor.js";
+import { issuesQueued } from "./queued-issues.js";
+import { columnsForCards, loadOperatorAttentionCounts, withSessionCount, WAITING_COLUMNS, type AttentionCard } from "./operator-attention.js";
+import { findDuplicateCandidates } from "./issue-dedupe.js";
+import * as issueLinks from "./issue-links.js";
+import { canonicalIssueRef, isClawsIssueId, sameIssueRef, shortIssueRef } from "./issue-id.js";
+import { isClawsComment, isPlanComment, isRequirementsComment } from "./marker-text.js";
+import { displayBlockedReason } from "./blocked-reason.js";
+import { renderMarkdown, type IssueRefLinks } from "./markdown.js";
+import { resolveIssueRefLinks } from "./issue-ref-links.js";
+import { buildUsagePage } from "./pages/usage.js";
+import { buildJobsMatrixPage, listsJob, REPO_JOB_NAMES } from "./pages/jobs-matrix.js";
+import { buildReauthPage } from "./pages/reauth.js";
+import { startClaudeLogin, submitClaudeLoginCode, getClaudeLoginStatus } from "./claude-auth.js";
+import { accountKey, authExpiredKey, refreshProviderHolds } from "./provider-holds.js";
+import { CLAUDE_ACCOUNT_ID_RE, claudeAccounts, claudeAccountsStale, findClaudeAccount, refreshClaudeAccounts } from "./claude-accounts.js";
+import { startCodexLogin, getCodexLoginStatus } from "./codex-auth.js";
+import { piCredentialStatuses } from "./pi-auth.js";
+import { runConnectivityVerification, loadLatestReport } from "./jobs/connectivity-verifier.js";
+import { getEndedSession, listEndedSessions, describeCreateSessionError, createSessionErrorStatus, isSessionAgentStatus, SESSION_AGENT_STATUSES, SESSION_MODES, SESSION_PROVIDERS, type SessionMode, type SessionProvider } from "./sessions.js";
+import { getSessionBackend, type SessionUploadResult } from "./session-backend.js";
+import { MAX_SESSION_INITIAL_PROMPT_CHARS, normalizeInitialPrompt } from "./session-initial-prompt.js";
+import { createClawsStateMcpHandler, mcpMethodNotAllowed, listOpenPrsForManagedRepo } from "./claws-state-http.js";
+import { fetchForgejoJobLogs, ForgejoJobLogsError } from "./forgejo-job-logs.js";
+import { guardContent, makeGuardCtx } from "./prompt-guard.js";
+import { attachmentResult, attachmentSummary, FRICTION_CATEGORIES, FRICTION_REFERENCE_MAX, FRICTION_TEXT_MAX } from "./claws-state-tools.js";
+import { liveGrantableCapabilities, classifyLiveGrants, FIXED_AT_LAUNCH_REASON, validCapabilityIds, capabilityGroup, isRememberableCapability, defaultProviderAuthCapabilities, withImplicitCapabilities, INFRA_MERGE_CAPABILITY_ID } from "./capabilities.js";
+import {
+  MAX_PENDING_PER_SESSION as MAX_PENDING_CAPABILITY_REQUESTS,
+  clearCapabilityRequest,
+  clearCapabilityRequestsForSession,
+  decide as decideCapabilityRequest,
+  deliverGrantNotice,
+  describeCapabilityRequest,
+  describeGrantedCapability,
+  get as getCapabilityRequest,
+  listPending as listPendingCapabilityRequests,
+  markGrantSeen as markCapabilityGrantSeen,
+  markPolled as markCapabilityPolled,
+  recordGrant as recordCapabilityGrant,
+  request as requestCapability,
+  type GrantNoticeOutcome,
+} from "./capability-requests.js";
+import { buildEndedSessionPage, buildSessionsListPage, buildSessionTerminalPage, renderSessionsTables, sessionPageTitle } from "./pages/sessions.js";
+import { CUSTOM_MODEL_SENTINEL, rememberedSessionModel, isValidSessionModel, sessionModelsFor } from "./session-models.js";
+import { buildIssueOpeningMessage, buildPrOpeningMessage, buildPrSessionBrief, buildSessionBrief, buildStandaloneSessionBrief, MAX_SESSION_INSTRUCTIONS_CHARS, parsePrSessionRef, prSessionRef, issueSessionTitle, prSessionTitle, standaloneSessionTitle, MAX_SESSION_DESCRIPTION_LEN, type IssueSessionFocus, type PrSessionFocus } from "./session-brief.js";
+import { preselectedSessionCapabilities } from "./session-form-defaults.js";
+import { listOpenRouterSessionModels } from "./openrouter.js";
+import { buildDampPage, DAMP_POINTS } from "./pages/damp.js";
+import { buildDmarcPage } from "./pages/dmarc.js";
+import { getDmarcStatus } from "./jobs/dmarc-monitor.js";
+import { buildRetroPage, type RetroPageView, type RetroRepoView } from "./pages/retro.js";
+import { buildAlertsPage, type AlertRow } from "./pages/alerts.js";
+import { parseLastSeen, parseOccurrenceCount } from "./occurrence-tracking.js";
+import { nextTimeBasedDue, parseSqlTime } from "./jobs/friction-retrospective.js";
+import { buildBlogListPage, loadRepoDraftFlags, buildBlogEditPage, buildBlogDiffPage, draftLiveness, blogSlug, BLOG_REPO, BLOG_CONTENT_DIR, isValidBlogPath, type OpenPrFiles, type BlogEditDraftInfo } from "./pages/blog.js";
+import { lineDiff } from "./blog-diff.js";
+import { escapeHtml, setPageControllerHeartbeat, navLinkCount } from "./pages/layout.js";
+import { getRepoConfig } from "./repo-config.js";
+import { isAlertInbox } from "./alert-issue.js";
+import { buildErrorPage, type ErrorPageAction } from "./pages/error-page.js";
+import { waitForEvents, parseKindFilter, GITHUB_EVENT_KINDS, type EventFilter, type KindFilter } from "./github-events.js";
+import { ALPINE_JS_SOURCE } from "./resources/alpinejs.js";
+import { CHARTJS_SOURCE } from "./resources/chartjs.js";
+import { reportError } from "./error-reporter.js";
+import { TAILWIND_CSS_SOURCE } from "./resources/tailwind-css.generated.js";
+import { WEB_MANIFEST, getAppIconPng } from "./pwa.js";
+import { mapWithConcurrency, mapSettledWithConcurrency } from "./util.js";
+import { MAX_UPLOAD_BYTES, MAX_LARGE_UPLOAD_BYTES, UPLOAD_REQUEST_TIMEOUT_MS, isAudioUpload, sanitizeUploadFilename, type SaveUploadResult } from "./session-uploads-core.js";
+import { storeSessionFile, readSessionFile, describeSessionFile, describeSessionFiles, type SessionFileView } from "./session-files.js";
+import { formatBytes } from "./format.js";
+import { transcribe, isAvailable as transcribeAvailable, voiceVocabularyPrompt } from "./transcribe.js";
+import { isShuttingDown, shutdownElapsedMs } from "./shutdown.js";
+import { stageSessionAttachment, stageSessionAttachmentStream, findPendingSessionAttachments, deleteSessionAttachment, openSessionAttachment, sweepPendingSessionAttachments, isSessionAttachmentId } from "./session-attachments.js";
+import { storeIssueAttachment, storeIssueAttachmentStream, readIssueAttachment, openIssueAttachment, readIssueAttachmentBytes, deleteIssueAttachment, claimPendingAttachments, sweepPendingAttachments, attachmentUrl, parseAttachmentUrl, serveContentType, contentDisposition, isInlineImage, PENDING_URL_SEGMENT } from "./issue-attachments.js";
+import type { ClawsIssueAttachmentRow, ClawsIssuePlanRow, ClawsIssueRecord, ClawsIssueRequirementsRow } from "./db.js";
+import { agentPodTokenLive, executeAgentPodOp } from "./agent-pod-ops.js";
+import { decodeWire, encodeWire } from "./agent-pod-wire.js";
+
+const ALPINE_JS_ETAG = `"${crypto.createHash("sha256").update(ALPINE_JS_SOURCE).digest("hex").slice(0, 16)}"`;
+const CHARTJS_ETAG = `"${crypto.createHash("sha256").update(CHARTJS_SOURCE).digest("hex").slice(0, 16)}"`;
+const TAILWIND_CSS_ETAG = `"${crypto.createHash("sha256").update(TAILWIND_CSS_SOURCE).digest("hex").slice(0, 16)}"`;
+
+// Re-export for backwards compatibility with tests and other consumers
+export { formatUptime } from "./pages/layout.js";
+export type { Theme } from "./pages/layout.js";
+export { buildLogDetailPage, buildIssueLogsPage } from "./pages/logs.js";
+
+const startedAt = new Date().toISOString();
+
+type Env = { Bindings: HttpBindings };
+type Ctx = Context<Env>;
+
+let homeAssistantStatus: { lastCheck: string | null; lastError: string | null } = { lastCheck: null, lastError: null };
+
+/**
+ * Leave the audit trail on an issue a `claws_create_issue` call was
+ * deduplicated onto: one automated comment naming where else the work is
+ * needed. Posted through the façade, so it carries the "Automated by Claws"
+ * marker and the refiner does not read it as feedback; skipped when an
+ * identical comment is already there, so a retrying agent adds nothing.
+ */
+async function postDedupeAuditComment(
+  kept: { id: string; repos: string[]; primary_repo?: string | null },
+  call: { title: string; repos: string[]; origin: string; dedupeKey?: string },
+): Promise<void> {
+  const key = call.dedupeKey ? `, dedupe key \`${call.dedupeKey}\`` : "";
+  const body = `Also needed by ${call.origin} for ${call.repos.join(", ")}: a claws_create_issue call proposed "${call.title}"${key} and was deduplicated onto this issue.`;
+  try {
+    const existing = await clawsIssues.listCommentDetails(kept.id);
+    if (existing.some((c) => c.body.includes(body))) return;
+    await ghCommentOnIssue(clawsIssues.primaryRepo(kept), kept.id, body);
+  } catch (err) {
+    log.warn(`claws_create_issue: dedupe audit comment on ${kept.id} failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/**
+ * Attach each PR's last few recorded review rounds (`pr_reviews`) to its row
+ * so the dashboard can render the review ledger. A failed read leaves that
+ * row's `reviewLedger` unset.
+ */
+async function attachReviewLedgers(
+  rows: Array<{ repo: string; prNumber: number; target: { reviewLedger?: ReviewLedgerEntry[] } }>,
+): Promise<void> {
+  await mapSettledWithConcurrency(rows, 8, async ({ repo, prNumber, target }) => {
+    const reviews = await listPRReviews(repo, prNumber, 5);
+    if (reviews.length === 0) return;
+    target.reviewLedger = reviews.map((r) => ({
+      headSha: r.headSha,
+      verdict: r.verdict,
+      mode: r.mode,
+      iteration: r.iteration,
+      provider: r.provider,
+      model: r.model,
+      createdAt: r.createdAt,
+    }));
+  });
+}
+
+/**
+ * Live status for `repo`'s open `prs`, keyed by PR number — the one source
+ * the All PRs page and the repository page both render from, so they agree
+ * about a PR. Reads the 60s-cached `listPRStatuses` bulk fetch (a failure
+ * yields an empty map), adds a Claws review status for merge candidates and
+ * the review ledger for every PR with a status. Page handlers pass
+ * `staleOk` (src/ttl-cache.ts) so a reload does not wait on the forge.
+ */
+export async function loadPRRowStatuses(repo: string, prs: PR[], opts?: StaleReadOptions): Promise<Map<number, PRRowStatus>> {
+  const statuses = await listPRStatuses(repo, opts).catch((): Map<number, PRRepoStatus> => new Map());
+  const rows: Array<{ prNumber: number; status: PRRowStatus }> = [];
+  for (const pr of prs) {
+    const st = statuses.get(pr.number);
+    // Copy: listPRStatuses caches its Map, so mutating the stored object
+    // below would leak review status across requests.
+    if (st) rows.push({ prNumber: pr.number, status: { ...st } });
+  }
+  // Only merge candidates need a review status — getPRReviewStatus costs one
+  // comments fetch per PR, and blocked PRs already render a reason.
+  const candidates = rows.filter((row) =>
+    row.status.mergeableState !== "CONFLICTING"
+    && row.status.checkStatus !== "failing"
+    && row.status.checkStatus !== "pending"
+    && row.status.checkStatus !== "held");
+  // The ledger is a local pr_reviews read (no per-PR GitHub fetch), so unlike
+  // getPRReviewStatus above it isn't restricted to merge candidates — a PR
+  // failing CI or in conflict is exactly where an operator wants the history.
+  await Promise.all([
+    mapSettledWithConcurrency(candidates, 8, async (row) => {
+      const rev = await getPRReviewStatus(repo, row.prNumber, opts);
+      row.status.reviewStatus = rev.status;
+      row.status.reviewIssueCount = rev.issueCount;
+    }),
+    attachReviewLedgers(rows.map((row) => ({ repo, prNumber: row.prNumber, target: row.status }))),
+  ]);
+  return new Map(rows.map((row) => [row.prNumber, row.status]));
+}
+
+function isHomeAssistantConfigured(): boolean {
+  return !!(config.HOME_ASSISTANT_BASE_URL && config.HOME_ASSISTANT_TOKEN);
+}
+
+async function pingHomeAssistant(): Promise<void> {
+  if (!isHomeAssistantConfigured()) {
+    homeAssistantStatus = { lastCheck: null, lastError: null };
+    return;
+  }
+  try {
+    const url = config.HOME_ASSISTANT_BASE_URL.replace(/\/$/, "") + "/api/";
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${config.HOME_ASSISTANT_TOKEN}` },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) {
+      homeAssistantStatus = { lastCheck: new Date().toISOString(), lastError: `HTTP ${res.status}` };
+      return;
+    }
+    homeAssistantStatus = { lastCheck: new Date().toISOString(), lastError: null };
+  } catch (err) {
+    homeAssistantStatus = {
+      lastCheck: new Date().toISOString(),
+      lastError: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+/** Probe each cluster's Grafana with a fresh Claws JWT and export the result
+ *  as `claws_grafana_auth_ok`; fleet Grafana alerts on it (docs/metrics.md). */
+async function probeGrafanaClusters(): Promise<void> {
+  await Promise.all(GRAFANA_CLUSTERS.map(async (cluster) => {
+    const result = await probeGrafanaAuth(cluster);
+    setGrafanaAuthOk(cluster, result.ok);
+    if (!result.ok) log.warn(`[grafana-auth] ${grafanaProbeFailureMessage(cluster, result)}`, undefined, grafanaProbeLogContext(cluster, result));
+  }));
+}
+
+function getHomeAssistantStatus() {
+  return { configured: isHomeAssistantConfigured(), lastCheck: homeAssistantStatus.lastCheck, lastError: homeAssistantStatus.lastError };
+}
+
+/**
+ * The configured repo matching `repo` ("owner/name"), or `undefined` if it
+ * isn't one of Claws' configured repos.
+ */
+async function findConfiguredRepo(repo: string): Promise<Repo | undefined> {
+  const repos = await listRepos();
+  return repos.find((r) => r.fullName === repo);
+}
+
+/**
+ * True when `repo` ("owner/name") is one of Claws' configured repos.
+ * Dashboard routes that mutate forge state must gate on this: the Forgejo bot
+ * token can reach repos outside Claws' managed set.
+ */
+async function isConfiguredRepo(repo: string): Promise<boolean> {
+  return (await findConfiguredRepo(repo)) !== undefined;
+}
+
+/**
+ * True when a native issue names repositories but none of them is configured
+ * in Claws any more (a removed or archived repo). Such an issue can still be
+ * closed and relabelled, but no lifecycle move or automation applies to it.
+ */
+async function orphanedRepos(repos: readonly string[]): Promise<boolean> {
+  if (repos.length === 0) return false;
+  const configured = new Set((await listRepos()).map((r) => r.fullName.toLowerCase()));
+  return !repos.some((r) => configured.has(r.toLowerCase()));
+}
+
+/** The refusal for a lifecycle move on an issue whose repositories are all unconfigured. */
+function orphanedRejection(repos: readonly string[]): string {
+  return `None of this issue's repositories (${repos.join(", ")}) is configured in Claws any more — close the issue, or assign a configured repository first.`;
+}
+
+/** A forge issue/PR number, or a Claws-native `clw_…` id, canonicalised. */
+const IssueRefSchema = z.union([z.number().int().positive(), z.string().min(1)])
+  .transform((v) => canonicalIssueRef(v))
+  .refine((v): v is config.IssueRef => v !== null, "not an issue reference");
+const RepoNumberSchema = z.object({ repo: z.string().min(1), number: IssueRefSchema });
+/** The PR-only variant: the circuit breaker is keyed by PR, never by issue. */
+const RepoPrNumberSchema = z.object({ repo: z.string().min(1), number: z.number().int().positive() });
+/** `claws_rerun_failed_ci`: `run` is GitHub's run id or Forgejo's `/actions/runs/<n>` number. */
+const SessionRerunSchema = RepoPrNumberSchema.extend({ run: z.number().int().nonnegative().optional() });
+const SessionApproveMergeSchema = RepoPrNumberSchema.extend({ queue: z.boolean().optional() });
+const SessionPrCommentSchema = RepoPrNumberSchema.extend({ body: z.string() });
+/** The longest operator feedback a session may post through `claws_comment_on_pr`. */
+const SESSION_PR_COMMENT_MAX_CHARS = 20_000;
+const MarkAutomergeSchema = RepoNumberSchema.extend({ alsoRefine: z.boolean().optional(), confirmManual: z.boolean().optional() });
+/** The Agent Queue's Prioritise/Deprioritise toggle on `/status` — labels the item and flips its queue rows' Priority flag. */
+const PriorityLabelSchema = RepoNumberSchema.extend({ add: z.boolean() });
+/**
+ * A board drag: `repo` is empty for an unassigned native issue, which has none.
+ * `until` (`YYYY-MM-DD`, or null to clear) parks a native issue moved to the
+ * Backlog until that day (docs/issue-tracker.md#backlog).
+ */
+const BoardMoveSchema = z.object({ repo: z.string(), ref: IssueRefSchema, to: z.string().min(1), until: z.string().nullable().optional(), reason: z.string().optional() });
+/** The board's `M` toggle: unlike a move, always has a repository — see `automergeToggle` in `pages/board.ts`. */
+const BoardAutomergeSchema = z.object({ repo: z.string().min(1), ref: IssueRefSchema, on: z.boolean() });
+const ApproveThroughSchema = z.object({ repo: z.string().min(1), ref: IssueRefSchema, gate: z.enum(["requirements", "plan", "merge"]), withdraw: z.boolean().optional() });
+/** The board's Start session button. `repo` is empty for an unassigned native card; the issue's own repos are what the session gets. */
+const BoardStartSessionSchema = z.object({ repo: z.string(), ref: IssueRefSchema });
+/**
+ * A board card's Approve infra merge button: the card's issue, the
+ * infrastructure PR it approves, and the head whose plan summary the operator saw.
+ */
+const BoardInfraApproveSchema = z.object({ repo: z.string().min(1), ref: IssueRefSchema, prRepo: z.string().min(1), prNumber: z.number().int().positive(), headSha: z.string().min(7) });
+/** The most items one bulk board move takes — a sweep, not a migration. */
+const BULK_MOVE_LIMIT = 200;
+const BoardBulkMoveSchema = z.object({
+  // `ideas` is the backlog's Promote: the issue re-enters the board wherever
+  // `clawsIssues.entryLifecycle` puts it — Planning, or Drafting or
+  // Requirements review. Mapped to `requirements-review` before the move.
+  to: z.enum(["backlog", "ideas"]),
+  items: z.array(z.object({ repo: z.string(), ref: IssueRefSchema })).min(1).max(BULK_MOVE_LIMIT),
+});
+const RepoItemSchema = z.object({ repo: z.string().min(1), prNumber: z.number().int().positive(), confirmInfra: z.boolean().optional(), confirmManual: z.boolean().optional() });
+/** A session pod's exit report (#3311); `scrollback` is the pod's tail, at most 50,000 characters. */
+const SessionExitReportSchema = z.object({ code: z.number().int(), scrollback: z.string() });
+const SESSION_EXIT_REPORT_MAX_BYTES = 256 * 1024;
+/** Largest agent-pod ops request body (a batch of job log lines is the biggest). */
+const AGENT_POD_OPS_MAX_BYTES = 4 * 1024 * 1024;
+
+// ── Auth helpers ──
+
+function parseCookies(header: string | undefined | null): Record<string, string> {
+  if (!header) return {};
+  const cookies: Record<string, string> = {};
+  for (const pair of header.split(";")) {
+    const eq = pair.indexOf("=");
+    if (eq < 0) continue;
+    cookies[pair.slice(0, eq).trim()] = pair.slice(eq + 1).trim();
+  }
+  return cookies;
+}
+
+/** The lowercase hostname of a `Host`-style header value (port and any list tail dropped). */
+function requestHostname(header: string | undefined | null): string | null {
+  const first = header?.split(",")[0]?.trim().toLowerCase();
+  if (!first) return null;
+  return first.replace(/:\d+$/, "");
+}
+
+/** Returns true when all four required OIDC fields are non-empty. */
+function isOidcEnabled(): boolean {
+  return !!(
+    config.OIDC_CLIENT_ID &&
+    config.OIDC_CLIENT_SECRET &&
+    config.OIDC_BASE_URL &&
+    config.OIDC_APPLICATION_SLUG
+  );
+}
+
+/** First value of X-Forwarded-Host, else Host, normalised to a bare lowercase hostname. */
+function effectiveHost(c: Ctx): string {
+  const fwd = c.req.header("x-forwarded-host");
+  const raw = (fwd ? fwd.split(",")[0] : c.req.header("host")) ?? "";
+  return raw.trim().toLowerCase().replace(/:\d+$/, "");
+}
+
+/**
+ * Per-request OIDC origin. When the request's host is in the allow-listed
+ * OIDC_HOST_MAP, authorize/token/userinfo go to that host's Authentik and
+ * redirect_uri is derived from the same host — so an externally-reached
+ * dashboard never bounces to an internal-only auth host (#2841).
+ */
+function resolveOidcTarget(c: Ctx): { baseUrl: string; redirectUri: string } {
+  const host = effectiveHost(c);
+  const mapped = host ? config.OIDC_HOST_MAP[host] : undefined;
+  if (mapped) return { baseUrl: mapped, redirectUri: `https://${host}/auth/callback` };
+  const redirectUri = config.OIDC_REDIRECT_URI || `http://localhost:${SERVER_PORT}/auth/callback`;
+  warnUnmappedOidcHost(host, redirectUri);
+  return { baseUrl: config.OIDC_BASE_URL, redirectUri };
+}
+
+/** Hosts already warned about by warnUnmappedOidcHost; bounded so an attacker
+ *  spraying Host headers can't grow it without limit. */
+const warnedUnmappedOidcHosts = new Set<string>();
+const MAX_WARNED_UNMAPPED_OIDC_HOSTS = 100;
+
+/**
+ * Logs once per host when a login arrives on a dashboard host that is neither
+ * in `oidcHostMap` nor the host of the fixed `oidcRedirectUri`. The fallback
+ * still works when that host can reach the default auth origin, but when it
+ * can't (an `.ext.` host served over Tailscale bouncing to an internal-only
+ * `auth.home`) the only symptom is a browser stuck on the auth host — this
+ * makes the missing map entry visible in the journal instead (#2841).
+ */
+function warnUnmappedOidcHost(host: string, redirectUri: string): void {
+  if (!host || warnedUnmappedOidcHosts.has(host)) return;
+  let redirectHost = "";
+  try {
+    redirectHost = new URL(redirectUri).hostname.toLowerCase();
+  } catch {
+    // unparseable redirect URI — nothing sensible to compare against
+  }
+  if (host === redirectHost) return;
+  if (warnedUnmappedOidcHosts.size >= MAX_WARNED_UNMAPPED_OIDC_HOSTS) return;
+  warnedUnmappedOidcHosts.add(host);
+  log.warn(
+    `[oidc] Login reached the dashboard on host "${host}", which is not in oidcHostMap (CLAWS_OIDC_HOST_MAP) ` +
+      `and does not match oidcRedirectUri (${redirectUri}). Falling back to ${config.OIDC_BASE_URL} with that ` +
+      `redirect_uri; if the default auth host is unreachable from where "${host}" is served, add ` +
+      `"${host}=<auth base URL>" to oidcHostMap and register https://${host}/auth/callback with the provider (#2841).`,
+  );
+}
+
+/**
+ * A login in flight lives in a signed cookie rather than process memory, so
+ * the callback succeeds on whichever web replica it reaches, including one
+ * started mid-login (#clw_01M5APX7YF3AGWHV1S1WMHJDR6). `SameSite=Lax`, not
+ * Strict: the IdP's redirect back is a cross-site navigation. Each login gets
+ * its own cookie, named for its state, so logins started together in several
+ * tabs do not overwrite each other.
+ */
+export const OAUTH_STATE_COOKIE = "claws_oauth_state";
+
+/** The cookie holding the login started with `state`. */
+export function oauthStateCookieName(state: string): string {
+  return `${OAUTH_STATE_COOKIE}_${state}`;
+}
+export const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
+
+export interface OAuthStateEntry {
+  returnTo: string;
+  baseUrl: string;
+  redirectUri: string;
+}
+
+function oauthStateMac(payload: string, secret: string): string {
+  // Prefixed so a `claws_session` signature can never pass for this one.
+  return crypto.createHmac("sha256", secret).update(`oauth-state|${payload}`).digest("base64url");
+}
+
+/** The `claws_oauth_state_<state>` cookie value binding `state` to where the login returns. */
+export function signOAuthState(state: string, entry: OAuthStateEntry, expiresAt: number, secret: string): string {
+  const payload = Buffer.from(JSON.stringify({ s: state, r: entry.returnTo, b: entry.baseUrl, u: entry.redirectUri, e: expiresAt })).toString("base64url");
+  return `${payload}.${oauthStateMac(payload, secret)}`;
+}
+
+/**
+ * The login entry when `value` carries a valid signature, has not expired and
+ * was issued for `state`; else null.
+ */
+export function verifyOAuthState(value: string | undefined, state: string, secret: string, now = Date.now()): OAuthStateEntry | null {
+  if (!value || !secret) return null;
+  const dot = value.lastIndexOf(".");
+  if (dot <= 0) return null;
+  const payload = value.slice(0, dot);
+  if (!safeCompare(value.slice(dot + 1), oauthStateMac(payload, secret))) return null;
+  let parsed: { s?: unknown; r?: unknown; b?: unknown; u?: unknown; e?: unknown };
+  try {
+    parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as typeof parsed;
+  } catch {
+    return null;
+  }
+  if (typeof parsed.s !== "string" || typeof parsed.r !== "string" || typeof parsed.b !== "string" || typeof parsed.u !== "string" || typeof parsed.e !== "number") return null;
+  if (parsed.e < now || !safeCompare(parsed.s, state)) return null;
+  return { returnTo: parsed.r, baseUrl: parsed.b, redirectUri: parsed.u };
+}
+
+function oauthStateCookie(state: string, value: string, maxAgeSeconds: number): string {
+  return `${oauthStateCookieName(state)}=${value}; HttpOnly; Secure; SameSite=Lax; Path=/auth/callback; Max-Age=${maxAgeSeconds}`;
+}
+
+function signSession(sub: string, expiresAt: number, secret: string): string {
+  const payload = `${sub}|${expiresAt}`;
+  const hmac = crypto.createHmac("sha256", secret).update(payload).digest("hex");
+  return `${payload}|${hmac}`;
+}
+
+function verifySession(
+  value: string,
+  secret: string,
+): { sub: string; expiresAt: number } | null {
+  const lastPipe = value.lastIndexOf("|");
+  if (lastPipe < 0) return null;
+  const hmac = value.slice(lastPipe + 1);
+  const rest = value.slice(0, lastPipe);
+  const secondLastPipe = rest.lastIndexOf("|");
+  if (secondLastPipe < 0) return null;
+  const expiryStr = rest.slice(secondLastPipe + 1);
+  const sub = rest.slice(0, secondLastPipe);
+  if (!sub || !expiryStr || !hmac) return null;
+  const payload = `${sub}|${expiryStr}`;
+  let expectedBuf: Buffer;
+  try {
+    expectedBuf = Buffer.from(
+      crypto.createHmac("sha256", secret).update(payload).digest("hex"),
+    );
+  } catch {
+    return null;
+  }
+  const providedBuf = Buffer.from(hmac);
+  if (
+    expectedBuf.length !== providedBuf.length ||
+    !crypto.timingSafeEqual(expectedBuf, providedBuf)
+  )
+    return null;
+  const expiresAt = parseInt(expiryStr, 10);
+  if (!Number.isFinite(expiresAt) || Date.now() > expiresAt) return null;
+  return { sub, expiresAt };
+}
+
+/**
+ * Who is acting, for a record that names the approver (a PR row's
+ * `merge_approved_by`): the OIDC `sub` of the request's `claws_session`, or
+ * `"dashboard"` when there is no valid session to read it from.
+ */
+function sessionSubject(c: Context<Env>): string {
+  const raw = parseCookies(c.req.header("cookie"))["claws_session"];
+  if (!raw || !config.OIDC_CLIENT_SECRET) return "dashboard";
+  let decoded: string;
+  try { decoded = decodeURIComponent(raw); } catch { decoded = raw; }
+  return verifySession(decoded, config.OIDC_CLIENT_SECRET)?.sub ?? "dashboard";
+}
+
+/**
+ * Record a dashboard merge approval on the `claws_prs` row for `repo#number`.
+ * Only a PR can have one — a native issue id is left alone, and so is a
+ * numeric ref that turns out not to be an open PR (`mark-automerge` also
+ * takes issue numbers). When the number is an open PR with no row yet (the
+ * dispatcher hasn't reached it, or it's disabled for this repo), seeds one
+ * the same way `refreshPrStore` does before writing the approval, so a
+ * dashboard click can never be silently dropped. Answers whether it wrote a
+ * PR row — the row is a PR's only approval record, so no label follows. Called
+ * before the merge itself; a caller must let a thrown error surface as a
+ * failed response rather than reporting "ok" with the approval lost.
+ */
+async function recordMergeApproval(c: Context<Env>, repo: string, number: config.IssueRef): Promise<boolean> {
+  if (typeof number !== "number") return false;
+  return (await writeMergeApproval(repo, number, sessionSubject(c))) !== null;
+}
+
+/**
+ * Write a merge approval by `approvedBy` on the `claws_prs` row for
+ * `repo#number`, seeding the row first when the PR is open and has none (see
+ * `recordMergeApproval`). With `keepExisting`, an already-approved row is left
+ * as it is, so its approver is kept. Answers the `mergeApprovedAt` it wrote,
+ * or null when it wrote nothing.
+ */
+async function writeMergeApproval(
+  repo: string,
+  number: number,
+  approvedBy: string,
+  opts: { keepExisting?: boolean } = {},
+): Promise<string | null> {
+  const approval = { mergeApprovedBy: approvedBy, mergeApprovedAt: new Date().toISOString() };
+  const row = await getClawsPr(repo, number);
+  if (row) {
+    if (opts.keepExisting && isMergeApproved(row)) return null;
+    await upsertClawsPr(repo, number, approval);
+    return approval.mergeApprovedAt;
+  }
+  if ((await getPRState(repo, number)) !== "OPEN") return null;
+  const status = (await listPRStatuses(repo)).get(number);
+  const stage = status?.checkStatus === "failing" ? "ci-failing" : "opened";
+  await upsertClawsPr(repo, number, { stage, ...approval });
+  return approval.mergeApprovedAt;
+}
+
+/**
+ * An open PR row as a board card reads it: the row overlaid with the live
+ * `listPRStatuses` entry (checks, conflicts, the infra paths and Tofu plan
+ * evidence for its head) and the auto-merger's last refusal, if any.
+ */
+function boardCardPr(row: ClawsPrRecord, live: PRRepoStatus | undefined): BoardCardPr {
+  const blockReason = getMergeBlockReason(row.repo, row.prNumber);
+  return {
+    ...row,
+    liveCheckStatus: live?.checkStatus,
+    mergeableState: live?.mergeableState ?? row.mergeableState,
+    mergeBlocked: !!blockReason,
+    mergeBlockReason: blockReason ?? null,
+    ...(live?.infraPaths ? { infraPaths: live.infraPaths } : {}),
+    ...(live?.tofuPlan ? { tofuPlan: live.tofuPlan } : {}),
+    ...(live?.tofuPlanState ? { tofuPlanState: live.tofuPlanState } : {}),
+    ...(live?.tofuPlanDetail ? { tofuPlanDetail: live.tofuPlanDetail } : {}),
+    ...(live?.tofuPlanHeadSha ? { tofuPlanHeadSha: live.tofuPlanHeadSha } : {}),
+  };
+}
+
+/**
+ * The unmet-manual-action warning `/prs` shows for a PR, or undefined — the
+ * gate `/queue/merge` and `/queue/mark-automerge` hold behind `confirmManual`.
+ * An issue ref or a PR Claws does not track has none.
+ */
+async function manualWarningFor(repo: string, number: config.IssueRef): Promise<string | undefined> {
+  if (typeof number !== "number") return undefined;
+  const row = await getClawsPr(repo, number);
+  if (!row) return undefined;
+  return (await loadManualActionWarnings([manualWarningRow(row)])).get(`${repo}#${number}`);
+}
+
+/**
+ * The approver recorded for a gate an interactive session passes through the
+ * claws-state tools — distinct from an OIDC `sub` and from `"dashboard"`, so the
+ * record tells a session's approval apart from an operator's click.
+ */
+function sessionApprover(sessionId: string): string {
+  return `session:${sessionId}`;
+}
+
+/** A shared gate write's answer: done, or the status and message a route turns into its own response. */
+/** Status values the issue page's comment box accepts with an empty comment. */
+const COMMENT_FREE_STATUSES = new Set(["approved", "approved-automerge", "backlog"]);
+
+type GateWriteResult = { ok: true } | { ok: false; status: ContentfulStatusCode; error: string };
+
+type NativeIssueRecord = NonNullable<Awaited<ReturnType<typeof clawsIssues.getIssue>>>;
+
+function parseFormBody(body: string): Record<string, string> {
+  const params: Record<string, string> = {};
+  for (const pair of body.split("&")) {
+    const eq = pair.indexOf("=");
+    if (eq < 0) continue;
+    try {
+      const key = decodeURIComponent(pair.slice(0, eq));
+      const value = decodeURIComponent(pair.slice(eq + 1).replace(/\+/g, " "));
+      params[key] = value;
+    } catch {
+      continue;
+    }
+  }
+  return params;
+}
+
+/** Parse all values for a repeated form key (parseFormBody keeps only the last). */
+function parseFormBodyMulti(body: string, key: string): string[] {
+  const out: string[] = [];
+  for (const pair of body.split("&")) {
+    const eq = pair.indexOf("=");
+    if (eq < 0) continue;
+    try {
+      const k = decodeURIComponent(pair.slice(0, eq));
+      if (k !== key) continue;
+      out.push(decodeURIComponent(pair.slice(eq + 1).replace(/\+/g, " ")));
+    } catch {
+      continue;
+    }
+  }
+  return out;
+}
+
+function getTheme(c: Ctx): "dark" | "light" | "system" {
+  const cookies = parseCookies(c.req.header("cookie"));
+  const value = cookies["claws_theme"];
+  if (value === "dark" || value === "light") return value;
+  return "system";
+}
+
+async function readTextBody(c: Ctx, maxBytes = 1024 * 1024): Promise<string> {
+  const contentLength = c.req.header("content-length");
+  if (contentLength && parseInt(contentLength, 10) > maxBytes) {
+    throw new Error("Request body too large");
+  }
+  const rawBody = c.req.raw.body;
+  if (!rawBody) return "";
+  const reader = rawBody.getReader();
+  const decoder = new TextDecoder();
+  let result = "";
+  let bytesRead = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    bytesRead += value.byteLength;
+    if (bytesRead > maxBytes) {
+      await reader.cancel();
+      throw new Error("Request body too large");
+    }
+    result += decoder.decode(value, { stream: true });
+  }
+  result += decoder.decode();
+  return result;
+}
+
+// ── Response helpers (exact Content-Type without charset suffix to match legacy) ──
+
+function htmlOk(c: Ctx, body: string, status = 200) {
+  c.header("Content-Type", "text/html");
+  return c.body(body, status as ContentfulStatusCode);
+}
+
+/** Live sessions one session may have started with `claws_start_session` at once. */
+const MAX_LIVE_STARTED_SESSIONS = 5;
+
+/** The New session agent: the remembered one unless it is rate-limited, else the first that is not. */
+function defaultSessionProvider(remembered: string | null | undefined, providers: ProviderStatuses): SessionProvider {
+  const limited = (p: SessionProvider) => providers[p].rateLimited;
+  if (remembered && SESSION_PROVIDERS.includes(remembered as SessionProvider) && !limited(remembered as SessionProvider)) {
+    return remembered as SessionProvider;
+  }
+  if (!limited("claude")) return "claude";
+  if (!limited("codex")) return "codex";
+  if (!limited("opencode")) return "opencode";
+  return "claude";
+}
+
+function defaultMultiSessionProvider(remembered: string | null | undefined, providers: ProviderStatuses): Extract<SessionProvider, "claude" | "codex"> {
+  const limited = (p: "claude" | "codex") => providers[p].rateLimited;
+  if ((remembered === "claude" || remembered === "codex") && !limited(remembered)) return remembered;
+  if (!limited("claude")) return "claude";
+  if (!limited("codex")) return "codex";
+  return "claude";
+}
+
+/** The operator's remembered agent and per-agent models; empty on a DB failure
+ *  so the page and `claws_start_session` fall back to the fixed defaults. */
+async function loadSessionAgentDefaults(): Promise<{ lastProvider: string | null; models: Record<string, string> }> {
+  try {
+    return await getSessionAgentDefaults();
+  } catch (err) {
+    log.warn(`[sessions] Could not load remembered agent defaults: ${err instanceof Error ? err.message : String(err)}`);
+    return { lastProvider: null, models: {} };
+  }
+}
+
+function jsonOk(c: Ctx, obj: unknown, status = 200) {
+  c.header("Content-Type", "application/json");
+  return c.body(JSON.stringify(obj), status as ContentfulStatusCode);
+}
+
+function textPlain(c: Ctx, body: string, status = 200) {
+  c.header("Content-Type", "text/plain");
+  return c.body(body, status as ContentfulStatusCode);
+}
+
+function htmlError(
+  c: Ctx,
+  status: number,
+  heading: string,
+  message: string,
+  extra: { detail?: string; actions?: ErrorPageAction[] } = {},
+) {
+  c.header("Content-Type", "text/html");
+  return c.body(
+    buildErrorPage(getTheme(c), { status, heading, message, ...extra }),
+    status as ContentfulStatusCode,
+  );
+}
+
+function shutdownRetryError(c: Ctx, heading: string, action: string, fields: Array<{ name: string; value: string }>) {
+  c.header("Content-Type", "text/html");
+  c.header("Cache-Control", "no-store");
+  return c.body(buildErrorPage(getTheme(c), {
+    status: 503,
+    heading,
+    message: "Claws is restarting — normally an auto-update deploy. It can't start new sessions until the restart finishes; shutdown waits up to 5 minutes for running jobs to drain.",
+    actions: [{ href: "/sessions", label: "← Sessions" }],
+    retry: { action, fields, elapsedMs: shutdownElapsedMs() },
+  }), 503 as ContentfulStatusCode);
+}
+
+function describeUploadError(result: Extract<SaveUploadResult, { ok: false }>, maxLabel: string): string {
+  switch (result.reason) {
+    case "too-large": return `File too large (max ${maxLabel})`;
+    case "write-failed": return "Failed to save upload";
+  }
+}
+
+/** JSON error response for a failed session upload: 404 / 409 / 503 from the backend, else the storage failure. */
+function uploadErrorResponse(c: Ctx, result: Extract<SessionUploadResult, { ok: false }>, maxLabel: string): Response {
+  switch (result.reason) {
+    case "not-found": return jsonOk(c, { error: "Session not found" }, 404);
+    case "not-running": return jsonOk(c, { error: "Session is not running" }, 409);
+    case "unavailable": return jsonOk(c, { error: "Session runtime unavailable" }, 503);
+  }
+  const status = result.reason === "too-large" ? 413 : 500;
+  return jsonOk(c, { error: describeUploadError(result, maxLabel) }, status);
+}
+
+/** Pre-body liveness check for the upload routes: a response to return, or null when the session can take an upload. */
+async function checkUploadTarget(c: Ctx, id: string): Promise<Response | null> {
+  const live = await getSessionBackend().getLive(id);
+  if (!live.ok) return uploadErrorResponse(c, live, "");
+  if (!live.session.alive) return uploadErrorResponse(c, { ok: false, reason: "not-running" }, "");
+  return null;
+}
+
+/**
+ * The error page for a create naming a staged attachment that is unknown or
+ * already claimed (swept, removed, or used by another session), or null when
+ * every id names a pending file.
+ */
+async function checkSessionAttachments(c: Ctx, ids: string[]): Promise<Response | null> {
+  if (ids.length === 0) return null;
+  let pending: Awaited<ReturnType<typeof findPendingSessionAttachments>>;
+  try {
+    pending = await findPendingSessionAttachments(ids);
+  } catch (err) {
+    return htmlError(c, 503, "Cannot create session", `Could not read the attached files: ${err instanceof Error ? err.message : String(err)}`, {
+      actions: [{ href: "/sessions", label: "← Sessions" }],
+    });
+  }
+  if (pending) return null;
+  return htmlError(c, 400, "Cannot create session", describeCreateSessionError({ reason: "attachment-unavailable" }), {
+    actions: [{ href: "/sessions", label: "← Sessions" }],
+  });
+}
+
+// ── Auth middlewares ──
+// src/client/auth-watch.ts treats ANY same-origin 401 as a lapsed session and
+// force-navigates to /login. Do not add another client-facing 401 source
+// (app-level auth failures, bad tokens, etc.) without accounting for that —
+// it will trigger an unwanted full-page redirect.
+
+const authMiddleware: MiddlewareHandler<Env> = async (c, next) => {
+  if (isOidcEnabled()) {
+    const cookies = parseCookies(c.req.header("cookie"));
+    const sessionCookie = cookies["claws_session"];
+    if (sessionCookie) {
+      let decoded: string;
+      try { decoded = decodeURIComponent(sessionCookie); } catch { decoded = sessionCookie; }
+      const session = verifySession(decoded, config.OIDC_CLIENT_SECRET);
+      if (session) return withIssueActor({ kind: "operator", name: session.sub }, next);
+    }
+    const reqPath = c.req.path + (c.req.url.includes("?") ? "?" + c.req.url.split("?").slice(1).join("?") : "");
+    const loginUrl = `/login?next=${encodeURIComponent(reqPath)}`;
+    c.header("Content-Type", "text/html");
+    return c.body(
+      `<!DOCTYPE html><html><head><meta http-equiv="refresh" content="0;url=${loginUrl}"></head><body>Redirecting to login...</body></html>`,
+      401,
+    );
+  }
+  // OIDC not configured: fail closed. Nothing runs open.
+  return textPlain(
+    c,
+    "Authentication is not configured. Set OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_BASE_URL, and OIDC_APPLICATION_SLUG in ~/.claws/env to enable login.",
+    503,
+  );
+};
+
+/** How an issue write over an agent's bearer token reads in the issue's History. */
+const AGENT_MCP_ACTOR: IssueActor = { kind: "automation", name: "agent via MCP" };
+
+const apiAuthMiddleware: MiddlewareHandler<Env> = async (c, next) => {
+  const authHeader = c.req.header("authorization");
+  if (authHeader?.startsWith("Bearer ")) {
+    const token = authHeader.slice(7);
+    if (safeCompare(token, config.INTERNAL_MCP_TOKEN)) return withIssueActor(AGENT_MCP_ACTOR, next);
+    // An agent pod's own token, which outlives this boot's INTERNAL_MCP_TOKEN.
+    // A DB failure here must not block the OIDC/401 fallbacks below.
+    if (token && await isRunningAgentPodMcpToken(hashAgentMcpToken(token)).catch(() => false)) return withIssueActor(AGENT_MCP_ACTOR, next);
+  }
+  if (isOidcEnabled()) {
+    const cookies = parseCookies(c.req.header("cookie"));
+    const sessionCookie = cookies["claws_session"];
+    if (sessionCookie) {
+      let decoded: string;
+      try { decoded = decodeURIComponent(sessionCookie); } catch { decoded = sessionCookie; }
+      const session = verifySession(decoded, config.OIDC_CLIENT_SECRET);
+      if (session) return withIssueActor({ kind: "operator", name: session.sub }, next);
+    }
+  }
+  return jsonOk(c, { error: "unauthorized" }, 401);
+};
+
+/** The operator's dashboard session only: unlike `apiAuthMiddleware`, no agent
+ *  bearer token gets in, so an agent cannot mint itself Grafana access. */
+const operatorSessionMiddleware: MiddlewareHandler<Env> = async (c, next) => {
+  if (isOidcEnabled()) {
+    const cookies = parseCookies(c.req.header("cookie"));
+    const sessionCookie = cookies["claws_session"];
+    if (sessionCookie) {
+      let decoded: string;
+      try { decoded = decodeURIComponent(sessionCookie); } catch { decoded = sessionCookie; }
+      const session = verifySession(decoded, config.OIDC_CLIENT_SECRET);
+      if (session) return withIssueActor({ kind: "operator", name: session.sub }, next);
+    }
+  }
+  return jsonOk(c, { error: "unauthorized" }, 401);
+};
+
+/**
+ * Auth for the session gate-write routes (`/api/sessions/:sid/issues/:id/*`
+ * `/api/sessions/:sid/start-session` and `/api/sessions/:sid/prs/clear-manual-action`,
+ * docs/product/interactive-sessions.md "Let a session pass a native issue's
+ * gates..."). Deliberately never `apiAuthMiddleware`: that accepts
+ * `INTERNAL_MCP_TOKEN` or any running agent pod's own token, both of which
+ * every agent holds, and these routes approve a native issue's plan or merge —
+ * an agent must not be able to grant itself that (#clw_01M3BWP83BQRXE06NWW1GKYT2S).
+ * Only a bearer `getSessionBackend().verifyMcpToken` accepts for this exact
+ * `:sid` gets in: the per-launch token each session pod
+ * holds for its own `/mcp/sessions/:id` endpoint, revoked when it ends.
+ */
+const sessionOwnTokenMiddleware: MiddlewareHandler<Env> = async (c, next) => {
+  const sid = c.req.param("sid") ?? "";
+  const authHeader = c.req.header("authorization");
+  const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : "";
+  if (!token) return jsonOk(c, { error: "unauthorized" }, 401);
+  const verdict = await (getSessionBackend().verifyMcpToken?.(sid, token) ?? Promise.resolve("denied" as const));
+  if (verdict === "unavailable") return jsonOk(c, { error: "session backend unavailable" }, 503);
+  if (verdict !== "ok") return jsonOk(c, { error: "unauthorized" }, 401);
+  return withIssueActor({ kind: "session", name: sid }, next);
+};
+
+// ── Server ──
+
+const REPO_AVATAR_MAX_BYTES = 1024 * 1024;
+const REPO_AVATAR_CACHE_TTL_MS = 30 * 60 * 1000;
+const REPO_AVATAR_CONTENT_TYPES: Record<string, string> = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  svg: "image/svg+xml",
+};
+
+/** Keyed by `repo + path`; a null entry is a cached miss, so a page of rows costs one forge call per repo. */
+const repoAvatarCache = new Map<string, { bytes: Buffer | null; fetchedAt: number }>();
+
+async function loadRepoAvatar(repo: string, avatarPath: string): Promise<Buffer | null> {
+  const key = `${repo.toLowerCase()}\n${avatarPath}`;
+  const cached = repoAvatarCache.get(key);
+  if (cached && Date.now() - cached.fetchedAt < REPO_AVATAR_CACHE_TTL_MS) return cached.bytes;
+  let bytes: Buffer | null = null;
+  try {
+    bytes = await fetchRepoFileBytes(repo, avatarPath);
+  } catch (err) {
+    log.warn(`repo-avatar: could not fetch ${avatarPath} from ${repo} — ${err}`);
+  }
+  if (bytes && bytes.length > REPO_AVATAR_MAX_BYTES) bytes = null;
+  repoAvatarCache.set(key, { bytes, fetchedAt: Date.now() });
+  return bytes;
+}
+
+/**
+ * Fill the forge list caches the dashboard pages and nav counts read, so the
+ * first reloads after a rollout render from cache instead of waiting on the
+ * forge. Run by whichever process serves the dashboard: `main-controller.ts`
+ * under `CLAWS_ROLE=all`, `main-web.ts` on each web pod. Best effort: a
+ * failed read just leaves that entry cold.
+ */
+export async function warmDashboardCaches(): Promise<void> {
+  try {
+    const repos = await listRepos();
+    await mapWithConcurrency(repos, 4, async (r) => {
+      await Promise.allSettled([
+        listOpenIssues(r.fullName),
+        listPRs(r.fullName),
+        listPRStatuses(r.fullName),
+      ]);
+    });
+    await loadOperatorAttentionCounts();
+  } catch (err) {
+    log.warn(`[warm-caches] Dashboard cache warm-up failed: ${err}`);
+  }
+}
+
+// ── Web tier → controller proxy (#clw_01M5APX7YF3AGWHV1S1WMHJDR6) ──
+// The CLI login ptys and the WhatsApp gateway live in the controller, so on
+// the web tier these routes are forwarded to it with the caller's cookies and
+// body; the controller verifies the signed `claws_session` cookie itself.
+
+/** Route patterns the web tier forwards to `CLAWS_CONTROLLER_URL`. */
+export const CONTROLLER_PROXIED_ROUTES = ["/whatsapp", "/whatsapp/*", "/api/claude-auth/*", "/api/codex-auth/*", "/api/pi-auth/*"] as const;
+export const CONTROLLER_RESTARTING_MESSAGE = "Background processing is restarting";
+/**
+ * Longest the proxy waits for the controller's response headers; the body (an
+ * SSE stream) may then run on. It outlasts the slowest proxied handler — a
+ * Claude login code submission waits up to 60 s on the CLI pty — so a slow
+ * answer is never mistaken for a restarting controller. Connection failures
+ * (refused, unresolvable, connect timeout) fail fast and answer 503.
+ */
+export const PROXY_HEADERS_TIMEOUT_MS = 90_000;
+const PROXY_REQUEST_HEADERS = ["cookie", "content-type", "accept", "accept-language", "user-agent", "x-requested-with", "last-event-id"];
+// Hop-by-hop, plus what fetch() already undid (it decompresses the body).
+const PROXY_DROPPED_RESPONSE_HEADERS = new Set(["connection", "keep-alive", "transfer-encoding", "content-encoding", "content-length", "set-cookie"]);
+
+function controllerUnavailable(c: Ctx): Response {
+  const detail = "pages stay available; try again once it is back.";
+  if (c.req.path.startsWith("/api/")) return jsonOk(c, { error: CONTROLLER_RESTARTING_MESSAGE, detail }, 503);
+  return htmlError(c, 503, CONTROLLER_RESTARTING_MESSAGE, `${CONTROLLER_RESTARTING_MESSAGE} — ${detail}`, {
+    actions: [{ href: "/", label: "← Dashboard" }],
+  });
+}
+
+/** Route the web tier forwards to the controller with its `Authorization` header — the caller's completion token. */
+export const COMPLETION_PROXIED_ROUTE = "/api/completion/:owner/:name";
+/** The completion route's proxy headers timeout: it outlasts the controller's own request deadline. */
+export const COMPLETION_PROXY_HEADERS_TIMEOUT_MS = COMPLETION_DEADLINE_MS + 5_000;
+
+/** The only request headers the completion proxy forwards: no session cookie reaches the controller. */
+const COMPLETION_PROXY_HEADERS = ["content-type", "accept", "authorization"] as const;
+
+/** The completion body cap, shared by the web tier's proxy and the controller's handler so the two cannot drift. */
+const completionBodyLimit = bodyLimit({
+  maxSize: MAX_COMPLETION_BODY_BYTES,
+  onError: (c) => {
+    c.header("Content-Type", "application/json");
+    return c.body(JSON.stringify({ error: `Request body too large (max ${MAX_COMPLETION_BODY_BYTES / 1024} KiB)` }), 413);
+  },
+});
+
+async function proxyToController(
+  c: Ctx,
+  controllerUrl: string,
+  headersTimeoutMs: number,
+  /** Forward only these request headers instead of PROXY_REQUEST_HEADERS. */
+  opts: { headers?: readonly string[] } = {},
+): Promise<Response> {
+  const url = new URL(c.req.url);
+  const headers = new Headers();
+  for (const name of opts.headers ?? PROXY_REQUEST_HEADERS) {
+    const value = c.req.header(name);
+    if (value) headers.set(name, value);
+  }
+  const host = c.req.header("x-forwarded-host") ?? c.req.header("host");
+  if (host) headers.set("x-forwarded-host", host);
+  const proto = c.req.header("x-forwarded-proto");
+  if (proto) headers.set("x-forwarded-proto", proto);
+  const method = c.req.method;
+  const body = method === "GET" || method === "HEAD" ? undefined : await c.req.arrayBuffer();
+
+  const abort = new AbortController();
+  const onClientGone = () => abort.abort();
+  c.req.raw.signal?.addEventListener("abort", onClientGone, { once: true });
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    abort.abort();
+  }, headersTimeoutMs);
+  let res: Response;
+  try {
+    res = await fetch(`${controllerUrl}${url.pathname}${url.search}`, { method, headers, body, redirect: "manual", signal: abort.signal });
+  } catch (err) {
+    c.req.raw.signal?.removeEventListener("abort", onClientGone);
+    if (timedOut) {
+      // The controller accepted the request and is still working on it, so it
+      // is up: not "restarting".
+      const error = "The background controller did not answer in time";
+      log.warn(`[web] The controller did not answer ${method} ${url.pathname} within ${headersTimeoutMs} ms`);
+      if (c.req.path.startsWith("/api/")) return jsonOk(c, { error }, 504);
+      return htmlError(c, 504, error, error, { actions: [{ href: "/", label: "← Dashboard" }] });
+    }
+    log.warn(`[web] Proxying ${method} ${url.pathname} to the controller failed: ${err}`);
+    return controllerUnavailable(c);
+  } finally {
+    clearTimeout(timer);
+  }
+  const out = new Headers();
+  for (const [name, value] of res.headers) {
+    if (!PROXY_DROPPED_RESPONSE_HEADERS.has(name.toLowerCase())) out.append(name, value);
+  }
+  for (const cookie of res.headers.getSetCookie()) out.append("set-cookie", cookie);
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers: out });
+}
+
+/** Longest `GET /health` waits for the controller heartbeat before reporting it as null. */
+const HEALTH_HEARTBEAT_TIMEOUT_MS = 1_000;
+
+/** How long a page render reuses the controller heartbeat it last read. */
+const PAGE_HEARTBEAT_TTL_MS = 5_000;
+
+export interface CreateServerOptions {
+  /** Defaults to `CLAWS_ROLE`. */
+  role?: config.ClawsRole;
+  /** Defaults to `CLAWS_CONTROLLER_URL`; used only when `role` is `web`. */
+  controllerUrl?: string;
+  /** Defaults to {@link PROXY_HEADERS_TIMEOUT_MS}; tests shorten it. */
+  proxyHeadersTimeoutMs?: number;
+}
+
+export function createServer(controller: ControllerClient, opts: CreateServerOptions = {}): http.Server {
+  const app = new Hono<Env>();
+  const role = opts.role ?? config.CLAWS_ROLE;
+  const controllerUrl = (opts.controllerUrl ?? config.CLAWS_CONTROLLER_URL).replace(/\/+$/, "");
+  const proxyHeadersTimeoutMs = opts.proxyHeadersTimeoutMs ?? PROXY_HEADERS_TIMEOUT_MS;
+
+  // Per-route latency for docs/metrics.md. Registered before every route so it
+  // wraps them all; the label is the matched route pattern, never the raw path.
+  app.use("*", async (c, next) => {
+    const start = performance.now();
+    httpRequestStarted();
+    try {
+      await next();
+    } finally {
+      httpRequestFinished();
+      observeHttpRequest(routeLabel(matchedRoutes(c)), c.req.method, c.res.status, performance.now() - start);
+    }
+  });
+
+  // Every page renders the "background processing is restarting" banner from
+  // the controller's heartbeat (pages/layout.ts), re-read at most every 5 s.
+  let heartbeatReadAt = 0;
+  let heartbeatRead: Promise<void> | null = null;
+  const refreshPageHeartbeat = (): Promise<void> => {
+    if (Date.now() - heartbeatReadAt < PAGE_HEARTBEAT_TTL_MS) return Promise.resolve();
+    heartbeatRead ??= controller.heartbeat()
+      .then((hb) => setPageControllerHeartbeat(hb), () => { /* keep the last one */ })
+      .finally(() => {
+        heartbeatReadAt = Date.now();
+        heartbeatRead = null;
+      });
+    return heartbeatRead;
+  };
+  app.use("*", async (c, next) => {
+    const p = c.req.path;
+    if (c.req.method === "GET" && p !== "/health" && !p.startsWith("/api/") && !p.startsWith("/static/")) await refreshPageHeartbeat();
+    await next();
+  });
+
+  registerRoutes(app, controller, { role, controllerUrl, proxyHeadersTimeoutMs });
+
+  // ── Default 404 / 405 ──
+  // Preserve legacy behavior: the original handleRequest returned 405 for any
+  // non-GET that didn't match a POST handler, and 404 for unmatched GETs.
+  app.notFound((c) => {
+    if (c.req.method !== "GET") return c.body(null, 405);
+    if (c.req.path.startsWith("/api/")) return jsonOk(c, { error: "Not found" }, 404);
+    return htmlError(c, 404, "Page not found", "That URL doesn't match anything on this dashboard.", {
+      detail: c.req.path,
+      actions: [{ href: "/", label: "← Dashboard" }],
+    });
+  });
+
+  app.onError((err, c) => {
+    log.error(`HTTP handler error: ${err}`);
+    c.header("Content-Type", "text/plain");
+    return c.body("Internal Server Error", 500);
+  });
+
+  const wss = new WebSocketServer({ noServer: true });
+  const server = serve(
+    { fetch: app.fetch, port: SERVER_PORT, hostname: BIND_HOST, websocket: { server: wss } },
+    (info) => {
+      log.info(`HTTP server listening on ${info.address}:${info.port}`);
+      const listeningAt = Date.now();
+      markListening(listeningAt);
+      readRolloutGap(listeningAt);
+    },
+  ) as http.Server;
+
+  // A 1 GB session upload can legitimately take far longer than Node's 300 s
+  // default request timeout; headersTimeout stays at its default.
+  server.requestTimeout = UPLOAD_REQUEST_TIMEOUT_MS;
+
+  pingHomeAssistant().catch(() => {});
+  const haInterval = setInterval(() => { pingHomeAssistant().catch(() => {}); }, 5 * 60 * 1000);
+  haInterval.unref();
+  server.on("close", () => { clearInterval(haInterval); });
+
+  ensureSigningKey()
+    .catch((err) => log.warn(`[grafana-auth] could not store the JWT signing key: ${err instanceof Error ? err.message : String(err)}`))
+    .then(() => probeGrafanaClusters())
+    .catch(() => {});
+  const grafanaAuthInterval = setInterval(() => { probeGrafanaClusters().catch(() => {}); }, 15 * 60 * 1000);
+  grafanaAuthInterval.unref();
+  server.on("close", () => { clearInterval(grafanaAuthInterval); });
+
+  server.on("close", () => {
+    getSessionBackend().shutdown().catch((err) => log.error(`Session backend shutdown on close: ${err}`));
+  });
+
+  return server;
+}
+
+/** The running-task row shape shared by `/api/status`, `/status` and `/jobs`,
+ *  so their three copies can't drift the way `/status`'s `itemShort` once did. */
+async function runningTaskViews() {
+  return (await getRunningTasks()).map((t) => ({
+    jobName: t.job_name,
+    repo: t.repo,
+    itemNumber: t.item_number,
+    itemShort: shortIssueRef(t.item_number),
+    startedAt: t.started_at,
+  }));
+}
+
+/** Work-queue kinds whose `item_number` is a PR, not an issue (#clw_01M39XF6QQ3EF0JX48AT81FNPK).
+ *  Everything else in `AGENT_KINDS` is an issue kind; a native `clw_…` id is always an issue. */
+const PR_WORK_KINDS: ReadonlySet<string> = new Set([
+  AGENT_KINDS.CI_FIXER,
+  AGENT_KINDS.CI_FIXER_CONFLICT,
+  AGENT_KINDS.CI_FIXER_RERUN,
+  AGENT_KINDS.CI_FIXER_PROBLEMATIC,
+  AGENT_KINDS.REVIEW_ADDRESSER,
+  AGENT_KINDS.PR_REVIEWER,
+  AGENT_KINDS.AUTO_MERGER_SWEEP,
+]);
+
+/**
+ * The `/status` page's Agent Queue table: every queued or running work row,
+ * in claim order, joined against its issue/PR title and current Priority
+ * label. Titles come from the 60s-cached `listOpenIssues`/`listPRs`, one
+ * fetch per distinct repo — `listPRs` only for a repo with a PR-kind row, since
+ * it spawns `gh pr list`. An unmatched row still gets a Prioritise button.
+ *
+ * Primary-only listing is intentional here: queue rows are keyed on the
+ * primary repo, so a multi-repo issue resolves under that repo alone.
+ */
+async function queueEntryViews(): Promise<QueueEntryView[]> {
+  const rows = await listQueuedWork();
+  const repos = [...new Set(rows.map((r) => r.repo))];
+  const issuesByRepo = new Map<string, Issue[]>();
+  const prsByRepo = new Map<string, PR[]>();
+  await mapWithConcurrency(repos, 8, async (repo) => {
+    issuesByRepo.set(repo, await listOpenIssues(repo).catch((err) => {
+      log.warn(`[status] listOpenIssues(${repo}) failed: ${err}`);
+      return [];
+    }));
+    if (rows.some((r) => r.repo === repo && PR_WORK_KINDS.has(r.kind) && !isNativeIssue(r.item_number))) {
+      prsByRepo.set(repo, await listPRs(repo).catch((err) => {
+        log.warn(`[status] listPRs(${repo}) failed: ${err}`);
+        return [];
+      }));
+    }
+  });
+
+  return rows.map((r, i) => {
+    const isPr = PR_WORK_KINDS.has(r.kind) && !isNativeIssue(r.item_number);
+    const match = isPr
+      ? (prsByRepo.get(r.repo) ?? []).find((pr) => pr.number === r.item_number)
+      : (issuesByRepo.get(r.repo) ?? []).find((issue) => sameIssueRef(issue.number, r.item_number));
+    return {
+      id: r.id,
+      position: i + 1,
+      kind: r.kind,
+      repo: r.repo,
+      itemNumber: r.item_number,
+      itemShort: shortIssueRef(r.item_number),
+      status: r.status,
+      priority: r.priority === 1,
+      title: match?.title ?? "(title unavailable)",
+      hasPriorityLabel: hasPriorityLabel(match?.labels ?? []),
+      lane: workLaneOf(r.kind, r.priority === 1),
+    };
+  });
+}
+
+async function jobStateRecord(controller: ControllerClient): Promise<Record<string, boolean>> {
+  const jobs: Record<string, boolean> = {};
+  for (const [name, running] of await controller.jobStates()) {
+    jobs[name] = running;
+  }
+  return jobs;
+}
+
+/** The largest Forgejo webhook delivery accepted; real payloads are a few tens of KiB. */
+const MAX_FORGEJO_WEBHOOK_BYTES = 1024 * 1024;
+let forgejoSelfLoginWarned = false;
+
+/**
+ * Claws' own Forgejo logins, lowercased, so a delivery Claws caused is not
+ * re-reported as a human action. A failed lookup filters nothing and warns once.
+ */
+async function forgejoSelfLogins(): Promise<Set<string>> {
+  const out = new Set<string>();
+  for (const lookup of [forgejoSelfLogin, forgejoReadSelfLogin]) {
+    try {
+      const login = await lookup();
+      if (login) out.add(login.toLowerCase());
+    } catch (err) {
+      if (!forgejoSelfLoginWarned) {
+        forgejoSelfLoginWarned = true;
+        log.warn(`[forgejo-webhook] Could not resolve Claws' Forgejo login — its own actions will not be filtered: ${err}`);
+      }
+    }
+  }
+  return out;
+}
+
+/** True when `fullName` is a managed (Forgejo) repo. */
+async function isManagedForgejoRepo(fullName: string): Promise<boolean> {
+  const target = fullName.toLowerCase();
+  return (await listRepos()).some((r) => r.fullName.toLowerCase() === target);
+}
+
+function registerRoutes(
+  app: Hono<Env>,
+  controller: ControllerClient,
+  { role, controllerUrl, proxyHeadersTimeoutMs }: { role: config.ClawsRole; controllerUrl: string; proxyHeadersTimeoutMs: number },
+): void {
+  // ── Public routes (no auth) ──
+
+  // 200 whether or not the controller is alive: the web tier's readiness must
+  // never follow the controller's restarts — nor a stalled database read, so
+  // the heartbeat read is bounded and falls back to null.
+  app.get("/health", async (c) => {
+    c.header("Cache-Control", "no-store");
+    let timer: NodeJS.Timeout | undefined;
+    const heartbeat = await Promise.race([
+      controller.heartbeat().catch(() => null),
+      new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), HEALTH_HEARTBEAT_TIMEOUT_MS); }),
+    ]).finally(() => clearTimeout(timer));
+    return jsonOk(c, { status: "ok", role, version: VERSION, shuttingDown: isShuttingDown(), shutdownElapsedMs: shutdownElapsedMs(), controller: heartbeat });
+  });
+
+  // Signed Forgejo deliveries (src/forgejo-webhook.ts). No session auth: the
+  // HMAC signature is the authentication, and with no secret the route is off.
+  app.post(
+    "/webhooks/forgejo",
+    bodyLimit({
+      maxSize: MAX_FORGEJO_WEBHOOK_BYTES,
+      onError: (c) => jsonOk(c, { error: "Payload too large" }, 413),
+    }),
+    async (c) => {
+      const secret = config.FORGEJO_WEBHOOK_SECRET?.trim();
+      if (!secret) return jsonOk(c, { error: "Not found" }, 404);
+      const raw = await c.req.text();
+      if (!verifyForgejoSignature(raw, c.req.header("x-forgejo-signature"), secret)) {
+        return jsonOk(c, { error: "Invalid signature" }, 401);
+      }
+      let payload: unknown;
+      try {
+        payload = JSON.parse(raw);
+      } catch {
+        return jsonOk(c, { error: "Malformed JSON" }, 400);
+      }
+      const event = c.req.header("x-forgejo-event")?.trim();
+      if (!event) return jsonOk(c, { error: "Missing X-Forgejo-Event" }, 400);
+      try {
+        const { managed, recorded } = await handleForgejoDelivery(event, payload, {
+          selfLogins: await forgejoSelfLogins(),
+          isManagedRepo: isManagedForgejoRepo,
+          findPrForHead: findOpenPrForHead,
+          readCombinedStatus: getCommitCheckStatus,
+        });
+        return jsonOk(c, { ok: true, events: recorded }, managed ? 200 : 202);
+      } catch (err) {
+        // Answered 200 so Forgejo does not mark the hook failing over a mapping bug.
+        log.warn(`[forgejo-webhook] Failed to handle ${event} delivery: ${err}`);
+        return jsonOk(c, { ok: true, events: 0 });
+      }
+    },
+  );
+
+  // Registered ahead of the controller's own handlers for these paths, which
+  // then never run on the web tier.
+  if (role === "web") {
+    for (const route of CONTROLLER_PROXIED_ROUTES) {
+      app.all(route, authMiddleware, (c) => proxyToController(c, controllerUrl, proxyHeadersTimeoutMs));
+    }
+    // The completion run needs the controller's provider logins and rate-limit
+    // breaker. No `authMiddleware`: the controller checks the caller's token.
+    app.post(COMPLETION_PROXIED_ROUTE, (c, next) => {
+      // No bearer token: refuse here so unauthenticated traffic never reaches the controller.
+      if (!c.req.header("authorization")?.startsWith("Bearer ")) return c.json({ error: "unauthorized" }, 401);
+      return next();
+    }, completionBodyLimit, (c) =>
+      proxyToController(c, controllerUrl, Math.max(proxyHeadersTimeoutMs, COMPLETION_PROXY_HEADERS_TIMEOUT_MS), { headers: COMPLETION_PROXY_HEADERS }));
+  }
+
+  app.get("/static/alpine.js", (c) => {
+    if (c.req.header("if-none-match") === ALPINE_JS_ETAG) {
+      c.header("ETag", ALPINE_JS_ETAG);
+      return c.body(null, 304);
+    }
+    c.header("Content-Type", "application/javascript");
+    c.header("Cache-Control", "max-age=31536000, immutable");
+    c.header("ETag", ALPINE_JS_ETAG);
+    return c.body(ALPINE_JS_SOURCE);
+  });
+
+  app.get("/static/chart.js", (c) => {
+    if (c.req.header("if-none-match") === CHARTJS_ETAG) {
+      c.header("ETag", CHARTJS_ETAG);
+      return c.body(null, 304);
+    }
+    c.header("Content-Type", "application/javascript");
+    c.header("Cache-Control", "max-age=31536000, immutable");
+    c.header("ETag", CHARTJS_ETAG);
+    return c.body(CHARTJS_SOURCE);
+  });
+
+  app.get("/static/tailwind.css", (c) => {
+    if (c.req.header("if-none-match") === TAILWIND_CSS_ETAG) {
+      c.header("ETag", TAILWIND_CSS_ETAG);
+      return c.body(null, 304);
+    }
+    c.header("Content-Type", "text/css");
+    c.header("Cache-Control", "no-cache");
+    c.header("ETag", TAILWIND_CSS_ETAG);
+    return c.body(TAILWIND_CSS_SOURCE);
+  });
+
+  // Public by design: Grafana's auth.jwt fetches it unauthenticated to verify
+  // Claws-signed observability JWTs (docs/observability-access.md).
+  app.get("/.well-known/claws-jwks.json", (c) => {
+    c.header("Cache-Control", "max-age=300");
+    return jsonOk(c, jwks());
+  });
+
+  // Public by design (#clw_01M619KBVSEV0SNRRXD33YYVQC): Traefik routes token-carrying
+  // pages-host requests here instead of Authentik. Both refuse any other host so a
+  // pages read token never authenticates the dashboard or another app. Never log
+  // the token or the request URL: the login path carries the token.
+  app.get(`${PAGES_LOGIN_PATH}/:token`, async (c) => {
+    const pagesHost = pagesHostname();
+    if (!pagesHost || requestHostname(c.req.header("host")) !== pagesHost) return c.text("Not found", 404);
+    const token = c.req.param("token");
+    if (await verifyPagesReadToken(token) !== "ok") return c.text("Unauthorized", 401);
+    c.header("Set-Cookie", `${PAGES_READ_COOKIE}=${token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=604800`);
+    c.header("Cache-Control", "no-store");
+    return c.redirect("/", 302);
+  });
+
+  app.get("/api/pages/auth", async (c) => {
+    const pagesHost = pagesHostname();
+    if (!pagesHost || requestHostname(c.req.header("x-forwarded-host")) !== pagesHost) return c.body(null, 404);
+    const bearer = /^Bearer\s+(\S+)$/i.exec(c.req.header("authorization") ?? "")?.[1];
+    const token = bearer ?? parseCookies(c.req.header("cookie"))[PAGES_READ_COOKIE];
+    if (!token || await verifyPagesReadToken(token) !== "ok") return c.body(null, 401);
+    return c.body(null, 204);
+  });
+
+  app.get("/manifest.webmanifest", (c) => {
+    c.header("Content-Type", "application/manifest+json");
+    c.header("Cache-Control", "max-age=86400");
+    return c.body(WEB_MANIFEST);
+  });
+
+  const serveIcon = async (c: Ctx, size: number) => {
+    try {
+      const png = await getAppIconPng(size);
+      c.header("Content-Type", "image/png");
+      c.header("Cache-Control", "max-age=86400");
+      return c.body(new Uint8Array(png));
+    } catch (err) {
+      log.warn(`[pwa] icon render failed (${size}): ${err}`);
+      return c.body(null, 500);
+    }
+  };
+
+  app.get("/static/icon-180.png", (c) => serveIcon(c, 180));
+  app.get("/static/icon-192.png", (c) => serveIcon(c, 192));
+  app.get("/static/icon-512.png", (c) => serveIcon(c, 512));
+  app.get("/apple-touch-icon.png", (c) => serveIcon(c, 180));
+  app.get("/apple-touch-icon-precomposed.png", (c) => serveIcon(c, 180));
+
+  // Public by design: reports only whether the caller's *own* cookie is still
+  // valid, so a restored page can detect a lapsed session without having to
+  // parse authMiddleware's 401 HTML redirect body. Must never itself 401 —
+  // src/client/auth-watch.ts treats a non-200 here as "server trouble", not
+  // stale auth (#2479). Wire format is consumed by that module.
+  app.get("/api/auth/status", (c) => {
+    c.header("Cache-Control", "no-store");
+    if (!isOidcEnabled()) {
+      return jsonOk(c, { authenticated: false, oidcEnabled: false, expiresAt: null });
+    }
+    const cookies = parseCookies(c.req.header("cookie"));
+    const raw = cookies["claws_session"];
+    let session: { sub: string; expiresAt: number } | null = null;
+    if (raw) {
+      let decoded: string;
+      try { decoded = decodeURIComponent(raw); } catch { decoded = raw; }
+      session = verifySession(decoded, config.OIDC_CLIENT_SECRET);
+    }
+    return jsonOk(c, {
+      authenticated: !!session,
+      oidcEnabled: true,
+      expiresAt: session ? session.expiresAt : null,
+    });
+  });
+
+  app.get("/login", (c) => {
+    if (isOidcEnabled()) {
+      const raw = c.req.query("next") ?? "/";
+      const returnTo =
+        raw.startsWith("/") && !raw.startsWith("//") && !raw.includes("\\")
+          ? raw
+          : "/";
+      const { baseUrl, redirectUri } = resolveOidcTarget(c);
+      const state = crypto.randomBytes(16).toString("hex");
+      const signed = signOAuthState(state, { returnTo, baseUrl, redirectUri }, Date.now() + OAUTH_STATE_TTL_MS, config.OIDC_CLIENT_SECRET);
+      c.header("Set-Cookie", oauthStateCookie(state, signed, OAUTH_STATE_TTL_MS / 1000));
+      const authorizeUrl = new URL(
+        `${baseUrl}/application/o/authorize/`,
+      );
+      authorizeUrl.searchParams.set("client_id", config.OIDC_CLIENT_ID);
+      authorizeUrl.searchParams.set("redirect_uri", redirectUri);
+      authorizeUrl.searchParams.set("response_type", "code");
+      authorizeUrl.searchParams.set("scope", "openid profile email");
+      authorizeUrl.searchParams.set("state", state);
+      return c.redirect(authorizeUrl.toString(), 302);
+    }
+
+    return textPlain(
+      c,
+      "Authentication is not configured. Set the OIDC_* variables in ~/.claws/env to enable login.",
+      503,
+    );
+  });
+
+  app.get("/auth/callback", async (c) => {
+    if (!isOidcEnabled()) {
+      return c.body(null, 404);
+    }
+
+    const code = c.req.query("code");
+    const state = c.req.query("state");
+
+    if (!code || !state) {
+      return htmlOk(c, "Bad request: missing code or state parameter", 400);
+    }
+
+    // /login only mints hex states; anything else would not name a cookie.
+    if (!/^[0-9a-f]{1,64}$/.test(state)) {
+      return htmlOk(c, "Bad request: invalid or expired OAuth state. Please try logging in again.", 400);
+    }
+    const stateEntry = verifyOAuthState(parseCookies(c.req.header("cookie"))[oauthStateCookieName(state)], state, config.OIDC_CLIENT_SECRET);
+    // Single use: cleared whatever the outcome. Other tabs' logins keep theirs.
+    c.header("Set-Cookie", oauthStateCookie(state, "", 0), { append: true });
+    if (!stateEntry) {
+      return htmlOk(c, "Bad request: invalid or expired OAuth state. Please try logging in again.", 400);
+    }
+    const { returnTo, baseUrl, redirectUri } = stateEntry;
+
+    try {
+      const tokenUrl = `${baseUrl}/application/o/token/`;
+      const tokenRes = await fetch(tokenUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          redirect_uri: redirectUri,
+          client_id: config.OIDC_CLIENT_ID,
+          client_secret: config.OIDC_CLIENT_SECRET,
+        }).toString(),
+        signal: AbortSignal.timeout(10_000),
+      });
+
+      if (!tokenRes.ok) {
+        const text = await tokenRes.text();
+        log.error(`OIDC token exchange failed: ${tokenRes.status} ${text}`);
+        return htmlOk(c, "Authentication failed: could not exchange code. Please try again.", 502);
+      }
+
+      const tokens = (await tokenRes.json()) as { access_token: string };
+
+      if (!tokens.access_token || typeof tokens.access_token !== "string") {
+        log.error("OIDC token exchange: missing access_token in response");
+        return htmlOk(c, "Authentication failed: unexpected token response.", 502);
+      }
+
+      const userinfoUrl = `${baseUrl}/application/o/userinfo/`;
+      const userRes = await fetch(userinfoUrl, {
+        headers: { Authorization: `Bearer ${tokens.access_token}` },
+        signal: AbortSignal.timeout(10_000),
+      });
+
+      if (!userRes.ok) {
+        log.error(`OIDC userinfo fetch failed: ${userRes.status}`);
+        return htmlOk(c, "Authentication failed: could not fetch user info. Please try again.", 502);
+      }
+
+      const userinfo = (await userRes.json()) as { sub: string };
+
+      if (!userinfo.sub || typeof userinfo.sub !== "string") {
+        log.error("OIDC userinfo: missing sub claim");
+        return htmlOk(c, "Authentication failed: user identity missing.", 502);
+      }
+
+      // No in-app identity allowlist by design. Dashboard authorization is
+      // enforced upstream by the Authentik group policy bindings for the
+      // claws-app application (fleet-infra:
+      // apps/authentik/configmap-blueprints.yaml, "Claws bindings"), which
+      // restrict completion of OIDC authorization to members of group-infra
+      // or group-all-apps (policy_engine_mode: any). A user who can merely
+      // authenticate to the IdP but is not in those groups is rejected at the
+      // application-authorization step and never reaches this callback with a
+      // valid code, so any sub/email arriving here is already authorized.
+      // Adding a second allowlist here would duplicate that version-controlled
+      // authorization across two systems (drift hazard) for a single-tenant
+      // deployment. See issue #1792.
+
+      const expiresAt = Date.now() + 24 * 60 * 60 * 1000;
+      const sessionValue = signSession(userinfo.sub, expiresAt, config.OIDC_CLIENT_SECRET);
+
+      log.info(`OIDC login: sub=${userinfo.sub}`);
+      c.header("Set-Cookie", `claws_session=${encodeURIComponent(sessionValue)}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${24 * 60 * 60}`, { append: true });
+      return c.redirect(returnTo, 303);
+    } catch (err) {
+      log.error(`OIDC callback error: ${err}`);
+      return htmlOk(c, "Internal error during authentication. Please try again.", 500);
+    }
+  });
+
+  app.get("/logout", (c) => {
+    c.header("Set-Cookie", `claws_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0`, { append: true });
+
+    const { baseUrl, redirectUri } = resolveOidcTarget(c);
+    if (isOidcEnabled() && redirectUri) {
+      const postLogoutUri = encodeURIComponent(
+        redirectUri.replace(/\/auth\/callback$/, "/login"),
+      );
+      const endSessionUrl = `${baseUrl}/application/o/${config.OIDC_APPLICATION_SLUG}/end-session/?post_logout_redirect_uri=${postLogoutUri}`;
+      return c.redirect(endSessionUrl, 303);
+    }
+    return c.redirect("/", 303);
+  });
+
+  /** The Agent Queue's Capacity line: the published capacity snapshot means the controller runs `k8s-pod`. */
+  function queueCapacityView(ws: WorkerStatus): QueueCapacityView {
+    return { backend: ws.capacity ? "k8s-pod" : config.WORK_BACKEND, workers: ws.workers, snapshot: ws.capacity };
+  }
+
+  // ── /api/state uses apiAuth (JSON 401) ──
+
+  app.get("/api/state", apiAuthMiddleware, async (c) => {
+    const snapshot = await controller.queueSnapshot();
+    const ws = await controller.workerStatus();
+    const queuedRows = await listQueuedWork();
+    return jsonOk(c, {
+      queue: snapshot.items,
+      claudeQueue: { pending: ws.queued, active: ws.running },
+      capacity: ws.capacity
+        ? { ceiling: ws.capacity.ceiling, min: ws.capacity.min, max: ws.capacity.max, lanes: ws.capacity.lanes, source: ws.capacity.source }
+        : null,
+      claudeQueueEntries: queuedRows.map((r, i) => ({
+        position: i + 1,
+        priority: r.priority === 1,
+        meta: { repo: r.repo, itemNumber: r.item_number, jobName: r.kind },
+      })),
+      updatedAt: new Date().toISOString(),
+    });
+  });
+
+  app.get("/api/runtime/status", apiAuthMiddleware, async (c) => {
+    try {
+      const snapshot = await controller.queueSnapshot();
+      const ws = await controller.workerStatus();
+      const queuedRows = await listQueuedWork();
+      return jsonOk(c, {
+        status: "ok",
+        version: VERSION,
+        startedAt,
+        uptimeSeconds: Math.floor((Date.now() - new Date(startedAt).getTime()) / 1000),
+        activationState: config.ACTIVATION_STATE,
+        shuttingDown: isShuttingDown(),
+        shutdownElapsedMs: shutdownElapsedMs(),
+        queue: {
+          items: snapshot.items,
+          total: snapshot.items.length,
+        },
+        // A run blocked in the shared memory-admission gate still counts as
+        // `active` above, so report the gate separately rather than leaving
+        // "running but waiting for memory" indistinguishable from real work.
+        agentMemoryAdmission: ws.agentMemory,
+        workQueue: {
+          pending: ws.queued,
+          active: ws.running,
+          workers: ws.workers,
+          // `k8s-pod`: the live ceiling, the min/max it is clamped to, and the
+          // per-node figures it was derived from; null under `in-process`.
+          capacity: ws.capacity ? { ...ws.capacity, fibers: ws.fibers } : null,
+          entries: queuedRows.map((r, i) => ({
+            position: i + 1,
+            id: r.id,
+            kind: r.kind,
+            repo: r.repo,
+            itemNumber: r.item_number,
+            status: r.status,
+            priority: r.priority === 1,
+            stage: stageRankOf(r.kind),
+            attempts: r.attempts,
+            enqueuedAt: r.enqueued_at,
+            startedAt: r.started_at,
+            runId: r.run_id,
+          })),
+        },
+        updatedAt: new Date().toISOString(),
+      });
+    } catch (err) {
+      return jsonOk(c, { error: err instanceof Error ? err.message : String(err) }, 503);
+    }
+  });
+
+  app.get("/api/runtime/latency", apiAuthMiddleware, (c) => jsonOk(c, latencySummary()));
+
+  // A 1-hour Grafana JWT for the operator's "Verify access" curls
+  // (docs/observability-access.md). Never logged.
+  app.get("/api/grafana-auth/token/:cluster", operatorSessionMiddleware, (c) => {
+    const cluster = c.req.param("cluster");
+    if (!isGrafanaCluster(cluster)) return jsonOk(c, { error: "Not found" }, 404);
+    const ttlMs = 60 * 60 * 1000;
+    const now = Date.now();
+    c.header("Cache-Control", "no-store");
+    return jsonOk(c, { token: mintGrafanaJwt(cluster, ttlMs, now), expiresAt: new Date(now + ttlMs).toISOString() });
+  });
+
+  app.get("/api/runtime/jobs", apiAuthMiddleware, async (c) => {
+    try {
+      const latestRuns = await getLatestRunIdsByJob();
+      const schedInfo = await controller.jobScheduleInfo();
+      const pausedSet = await controller.pausedJobs();
+      const manualSet = await controller.manualOnlyJobs();
+      const jobs = [...await controller.jobStates()].sort(([a], [b]) => a.localeCompare(b)).map(([name, running]) => {
+        const sched = schedInfo.get(name);
+        const latest = latestRuns.get(name);
+        let nextRunInMs: number | null = null;
+        if (!pausedSet.has(name) && sched?.nextTickAt !== undefined) {
+          nextRunInMs = Math.max(0, sched.nextTickAt - Date.now());
+        }
+        return {
+          name,
+          running,
+          paused: pausedSet.has(name),
+          manualOnly: manualSet.has(name),
+          schedule: sched ? {
+            intervalMs: sched.intervalMs,
+            ...(sched.scheduledHour !== undefined ? { scheduledHour: sched.scheduledHour } : {}),
+            nextRunInMs,
+          } : null,
+          latestRun: latest ? {
+            runId: latest.runId,
+            status: latest.status,
+            startedAt: latest.startedAt,
+            completedAt: latest.completedAt,
+          } : null,
+        };
+      });
+      return jsonOk(c, {
+        activationState: config.ACTIVATION_STATE,
+        repositoryJobExclusions: config.getRepoJobExclusions(),
+        pausedJobs: [...pausedSet].sort(),
+        manualOnlyJobs: [...manualSet].sort(),
+        jobs,
+        updatedAt: new Date().toISOString(),
+      });
+    } catch (err) {
+      return jsonOk(c, { error: err instanceof Error ? err.message : String(err) }, 503);
+    }
+  });
+
+  /**
+   * Which steps of an issue's multi-PR plan Claws currently believes are
+   * covered. Backs the `claws_issue_phases` MCP tool, so a session can check
+   * before implementing a step by hand (#2594).
+   */
+  app.get("/api/issue-phases", apiAuthMiddleware, async (c) => {
+    const repo = c.req.query("repo") ?? "";
+    const issue = canonicalIssueRef(c.req.query("issue") ?? "");
+    if (!repo || issue === null || (typeof issue === "number" && issue <= 0)) {
+      return jsonOk(c, { error: "repo and an issue reference are required" }, 400);
+    }
+    // The Forgejo bot token can reach repos outside Claws' managed set, so
+    // gate on the configured list.
+    if (!await isConfiguredRepo(repo)) {
+      return jsonOk(c, { error: `${repo} is not a configured repo` }, 404);
+    }
+    const startedAt = Date.now();
+    try {
+      const comments = await getIssueComments(repo, issue);
+      const planText = planParser.findPlanComment(comments);
+      const plan = planText ? planParser.parsePlan(planText) : null;
+      // The stored PR list when there is one, the plan text otherwise. The
+      // merged-PR walk is left to `loadIssuePhaseState`, which runs it only
+      // when a stored step is unlinked or on the plan-text path.
+      const { totalPhases, coverage, entries } = await loadIssuePhaseState(repo, issue, comments, { planText });
+      const durationMs = Date.now() - startedAt;
+      if (durationMs > 5_000) {
+        log.info(`[server] slow issue-phases: repo=${repo} issue=${issue} durationMs=${durationMs} source=${entries ? "stored" : "plan-text"}`);
+      }
+      return jsonOk(c, {
+        repo,
+        issue,
+        totalPhases,
+        nextPhase: coverage.nextPhase,
+        readyPhases: coverage.readyPhases,
+        openPhases: coverage.openPhases,
+        blockedPhases: coverage.blockedPhases,
+        // Manual (operator) steps whose dependencies have landed: no PR implements them.
+        awaitingOperator: coverage.awaitingOperator,
+        source: entries ? "stored" : "plan-text",
+        phases: Array.from({ length: totalPhases }, (_, i) => i + 1).map((phase) => {
+          const pr = coverage.coveringPRs.get(phase);
+          const entry = entries?.[phase - 1];
+          return {
+            phase,
+            title: entry?.title ?? plan?.phases[phase - 1]?.title ?? null,
+            repo: entry?.repo ?? repo,
+            // `manual`: the plan's operator step, done only by a `claws-phase-done:` claim.
+            kind: entry?.kind ?? "pr",
+            covered: coverage.covered.has(phase),
+            coveredBy: pr?.number ?? null,
+            state: pr?.state ?? null,
+            // A linked PR that could not be read (e.g. linked before its repo changed forge).
+            unreadable: pr?.unreadable ?? null,
+            // Effective dependencies: declared, else after the previous step.
+            dependsOn: coverage.dependencies.get(phase) ?? [],
+            status: coverage.done.has(phase) ? "done"
+              : coverage.covered.has(phase) ? "pending"
+              : entry?.kind === "manual" ? "manual"
+              : coverage.readyPhases.includes(phase) ? "ready"
+              : "blocked",
+          };
+        }),
+      });
+    } catch (err) {
+      return jsonOk(c, { error: err instanceof Error ? err.message : String(err) }, 502);
+    }
+  });
+
+  /**
+   * An issue's links, for the `claws_issue_links` / `claws_link_issues` /
+   * `claws_unlink_issues` MCP tools. `:id` must be a live native issue: a
+   * shadow or unknown id answers 404, as the dashboard's writes do.
+   */
+  async function apiLinkIssue(c: Ctx): Promise<{ id: string; repo: string } | null> {
+    const ref = canonicalIssueRef(c.req.param("id") ?? "");
+    if (!isNativeIssue(ref)) return null;
+    const record = await clawsIssues.getIssue(ref);
+    if (!record || record.kind === "shadow") return null;
+    return { id: record.id, repo: clawsIssues.primaryRepo(record) };
+  }
+
+  /**
+   * These two back the `claws_get_issue` / `claws_list_issues` MCP tools, so a
+   * session can read the tracker instead of only writing to it (#3286 added
+   * the writes; this closes the read gap). Not a public API.
+   */
+  app.get("/api/issues/:id", apiAuthMiddleware, async (c) => {
+    const loaded = await loadNativeIssue(c);
+    if (!loaded?.record || loaded.record.kind === "shadow") return jsonOk(c, { error: "Issue not found" }, 404);
+    const { record } = loaded;
+    const [comments, plans, requirements] = await Promise.all([
+      clawsIssues.listCommentDetails(record.id),
+      clawsIssues.listPlans(record.id),
+      clawsIssues.listRequirements(record.id),
+    ]);
+    // The plan comment is reported separately as `plan`, not in `comments` —
+    // the same split the `/issues/:id` page renders. A legacy `## Requirements`
+    // comment is dropped too: the record lives in the requirements versions,
+    // reported as `requirements` / `previous_requirements`.
+    const latestPlan = plans.at(-1) ?? null;
+    const latestRequirements = requirements.at(-1) ?? null;
+    const stageReads = await loadIssueStage(record, comments, latestRequirements);
+    const { stage, stage_title } = stageReads.stage;
+    // A version is approved only when it is the one promotion recorded, so an
+    // approved v1 followed by an unreviewed v2 shows v2 as not approved.
+    const approvedVersion = record.approved_requirements_version == null ? null : Number(record.approved_requirements_version);
+    const isApproved = (version: number): boolean => approvedVersion === version && !!record.requirements_approved_at;
+    // The blocked reason, best-effort: a failed read answers null rather than failing the read.
+    const blockedReason = record.lifecycle === "blocked"
+      ? await getIssueBlockedReasons([record.id])
+        .then((reasons) => reasons.get(record.id) ?? null)
+        .catch((err) => { log.warn(`[server] could not read the blocked reason of issue ${record.id}: ${err}`); return null; })
+      : null;
+    // The approval track's "Stops at" line, from the reads `stage` came
+    // from, so the two agree, as `stopsAtForOpenIssues` does for the list.
+    const primary = clawsIssues.primaryRepo(record);
+    const stopsAt = deriveApprovalTrack({
+      repo: primary,
+      ref: record.id,
+      column: stage,
+      labels: record.labels,
+      lifecycle: record.lifecycle,
+      approvedThrough: record.approved_through ?? "none",
+      requirementsApproved: record.requirements_approved_at != null,
+      hasPlan: latestPlan !== null,
+      reapprovalPending: stageReads.reapprovalPending,
+      awaitingOperator: stageReads.awaitingOperator,
+      openPrs: stageReads.flight.openPrs,
+    }).stopsAt;
+    return jsonOk(c, {
+      id: record.id,
+      title: record.title,
+      body: record.body,
+      state: record.state,
+      state_reason: record.state_reason,
+      author_login: record.author_login,
+      labels: record.labels,
+      repos: record.repos,
+      created_at: clawsIssues.toIso(record.created_at),
+      updated_at: clawsIssues.toIso(record.updated_at),
+      url: clawsIssues.dashboardIssueUrl(record.id),
+      stage,
+      stage_title,
+      approved_through: record.approved_through ?? "none",
+      stops_at: stopsAt,
+      backlog_until: record.backlog_until ?? null,
+      blocked_reason: blockedReason,
+      requirements: latestRequirements
+        ? {
+            version: latestRequirements.version,
+            created_at: latestRequirements.createdAt,
+            kind: latestRequirements.kind,
+            title: latestRequirements.title,
+            context: latestRequirements.context,
+            requirement: latestRequirements.requirement,
+            acceptance_criteria: latestRequirements.acceptanceCriteria,
+            out_of_scope: latestRequirements.outOfScope,
+            body: renderRequirementsComment(latestRequirements),
+            approved: isApproved(latestRequirements.version),
+            approved_by: isApproved(latestRequirements.version) ? record.requirements_approved_by : null,
+            approved_at: isApproved(latestRequirements.version) && record.requirements_approved_at
+              ? clawsIssues.toIso(record.requirements_approved_at)
+              : null,
+            awaiting_review: stage === "requirements-review",
+          }
+        : null,
+      previous_requirements: requirements.slice(0, -1).map((r) => ({
+        version: r.version,
+        created_at: r.createdAt,
+        kind: r.kind,
+        title: r.title,
+        approved: isApproved(r.version),
+      })),
+      plan: latestPlan
+        ? { version: latestPlan.version, comment_id: latestPlan.commentId, created_at: latestPlan.createdAt, body: latestPlan.body }
+        : null,
+      previous_plans: plans.slice(0, -1).map((p) => ({ version: p.version, comment_id: p.commentId, created_at: p.createdAt })),
+      comments: comments
+        .filter((cm) => (latestPlan?.commentId == null || String(cm.id) !== latestPlan.commentId) && !isRequirementsComment(cm.body))
+        .map((cm) => ({
+          id: String(cm.id),
+          author_login: cm.login,
+          body: cm.body,
+          created_at: cm.createdAt,
+          is_claws: isClawsComment(cm.body),
+          is_plan: isPlanComment(cm.body),
+        })),
+    });
+  });
+
+  /**
+   * The approval track's "Stops at" line for each of `records` (open native
+   * issues), keyed by id — `GET /api/issues`' batched counterpart of
+   * `loadApprovalTrackInput`, derived from the same batched reads as the
+   * rows' `stage` (`loadOpenIssueStages`), so the two agree. A row with no
+   * stage has no line.
+   */
+  function stopsAtForOpenIssues(
+    records: readonly ClawsIssueRecord[],
+    reads: Awaited<ReturnType<typeof loadOpenIssueStages>>,
+    plans: { has(id: string): boolean },
+  ): Map<string, string> {
+    const { stages, flights, awaitingOperator, reapprovals } = reads;
+    const lines = new Map<string, string>();
+    for (const r of records) {
+      const column = stages.get(r.id)?.stage;
+      if (!column) continue;
+      const repo = clawsIssues.primaryRepo(r);
+      lines.set(r.id, deriveApprovalTrack({
+        repo,
+        ref: r.id,
+        column,
+        labels: r.labels,
+        lifecycle: r.lifecycle,
+        approvedThrough: r.approved_through ?? "none",
+        requirementsApproved: r.requirements_approved_at != null,
+        hasPlan: plans.has(r.id),
+        reapprovalPending: reapprovals.has(r.id),
+        awaitingOperator: awaitingOperator.has(r.id),
+        openPrs: flights.get(flightKey(repo, r.id))?.openPrs,
+      }).stopsAt);
+    }
+    return lines;
+  }
+
+  app.get("/api/issues", apiAuthMiddleware, async (c) => {
+    const repoQuery = c.req.query("repo");
+    let repo: string | undefined;
+    if (repoQuery) {
+      if (!/^[^/\s]+\/[^/\s]+$/.test(repoQuery)) return jsonOk(c, { error: "repo must be owner/name" }, 400);
+      const managed = new Map((await listRepos()).map((r) => [r.fullName.toLowerCase(), r.fullName]));
+      repo = managed.get(repoQuery.toLowerCase()) ?? repoQuery;
+    }
+    const stateQuery = c.req.query("state") ?? "open";
+    if (stateQuery !== "open" && stateQuery !== "closed" && stateQuery !== "all") return jsonOk(c, { error: "state must be open, closed or all" }, 400);
+    const state: "open" | "closed" | "all" = stateQuery;
+    const title = (c.req.query("title") ?? "").trim();
+    if (title.length > 200) return jsonOk(c, { error: "title must be at most 200 characters" }, 400);
+    const parseSince = (name: "closed_since" | "updated_since"): Date | undefined | null => {
+      const raw = c.req.query(name);
+      if (!raw) return undefined;
+      const ms = Date.parse(raw);
+      return Number.isNaN(ms) ? null : new Date(ms);
+    };
+    const closedSince = parseSince("closed_since");
+    if (closedSince === null) return jsonOk(c, { error: "closed_since must be an ISO 8601 date" }, 400);
+    const updatedSince = parseSince("updated_since");
+    if (updatedSince === null) return jsonOk(c, { error: "updated_since must be an ISO 8601 date" }, 400);
+    if (closedSince && state === "open") return jsonOk(c, { error: "closed_since cannot be combined with state=open" }, 400);
+    const offsetQuery = c.req.query("offset");
+    if (offsetQuery !== undefined && !/^\d+$/.test(offsetQuery)) return jsonOk(c, { error: "offset must be a non-negative integer" }, 400);
+    const offset = offsetQuery === undefined ? 0 : Number(offsetQuery);
+    // Ordered `updated_at DESC` already, by listClawsIssues' own query.
+    const records = await listClawsIssues({
+      state,
+      ...(repo !== undefined ? { repo } : {}),
+      ...(title ? { titleContains: title } : {}),
+      ...(closedSince ? { closedSince } : {}),
+      ...(updatedSince ? { updatedSince } : {}),
+      limit: 101,
+      offset,
+    });
+    const truncated = records.length > 100;
+    const rows = records.slice(0, 100);
+    const openRows = rows.filter((r) => r.state === "open");
+    const plansByIssue = await listIssueIdsWithPlans(rows.map((r) => r.id));
+    const closedIds = rows.filter((r) => r.state === "closed").map((r) => r.id);
+    const duplicateOf = closedIds.length > 0 ? await clawsIssues.duplicateOfForIssues(closedIds) : new Map<string, string>();
+    // Best-effort: a failed stage read gives the rows `stage: null` rather
+    // than failing the list.
+    const reads = await loadOpenIssueStages(openRows).catch((err) => {
+      log.warn(`[api] issue stages: ${err}`);
+      return { stages: new Map(), awaitingOperator: new Map(), flights: new Map(), reapprovals: new Set<string>(), queued: new Map<string, string>() };
+    });
+    const { stages } = reads;
+    const stopsAt = stopsAtForOpenIssues(openRows, reads, plansByIssue);
+    return jsonOk(c, {
+      issues: rows.map((r) => ({
+        id: r.id,
+        title: r.title,
+        state: r.state,
+        state_reason: r.state_reason ?? null,
+        closed_at: r.closed_at ? clawsIssues.toIso(r.closed_at) : null,
+        duplicate_of: duplicateOf.get(r.id) ?? null,
+        labels: r.labels,
+        repos: r.repos,
+        primary_repo: clawsIssues.primaryRepo(r),
+        updated_at: clawsIssues.toIso(r.updated_at),
+        has_plan: plansByIssue.has(r.id),
+        dedupe_key: r.dedupe_key ?? null,
+        stage: stages.get(r.id)?.stage ?? null,
+        stage_title: stages.get(r.id)?.stage_title ?? null,
+        approved_through: r.approved_through ?? "none",
+        stops_at: stopsAt.get(r.id) ?? null,
+        backlog_until: r.backlog_until ?? null,
+      })),
+      truncated,
+      next_offset: truncated ? offset + 100 : null,
+    });
+  });
+
+  app.get("/api/issues/:id/links", apiAuthMiddleware, async (c) => {
+    const issue = await apiLinkIssue(c);
+    if (!issue) return jsonOk(c, { error: "Issue not found" }, 404);
+    return jsonOk(c, { issue: issue.id, links: await issueLinks.listLinks(issue.repo, issue.id) });
+  });
+
+  app.post("/api/issues/:id/links", apiAuthMiddleware, async (c) => {
+    const issue = await apiLinkIssue(c);
+    if (!issue) return jsonOk(c, { error: "Issue not found" }, 404);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return jsonOk(c, { error: "Invalid JSON body" }, 400); }
+    const { kind: rawKind, issue: target } = (body ?? {}) as { kind?: unknown; issue?: unknown };
+    const kind = issueLinks.parseLinkKind(rawKind);
+    if (!kind) return jsonOk(c, { error: `kind must be one of ${issueLinks.LINK_KINDS.join(", ")}` }, 400);
+    if (typeof target !== "string" && typeof target !== "number") return jsonOk(c, { error: "issue must be an issue reference" }, 400);
+    try {
+      const result = await issueLinks.addLink(issue.repo, issue.id, kind, String(target), clawsIssues.CLAWS_NATIVE_LOGIN);
+      return jsonOk(c, result, result.created ? 201 : 200);
+    } catch (err) {
+      if (err instanceof issueLinks.LinkError) return jsonOk(c, { error: err.message }, err.status);
+      throw err;
+    }
+  });
+
+  app.delete("/api/issues/:id/links/:linkId", apiAuthMiddleware, async (c) => {
+    const issue = await apiLinkIssue(c);
+    if (!issue) return jsonOk(c, { error: "Issue not found" }, 404);
+    try {
+      await issueLinks.removeLink(issue.repo, issue.id, c.req.param("linkId") ?? "");
+    } catch (err) {
+      if (err instanceof issueLinks.LinkError) return jsonOk(c, { error: err.message }, err.status);
+      throw err;
+    }
+    return jsonOk(c, { ok: true });
+  });
+
+  /**
+   * A native issue's attachments, for the `claws_get_issue_attachments` /
+   * `claws_get_issue_attachment` MCP tools. Both claws-state servers call
+   * these, so an agent pod — no database, no file store — reads the files the
+   * same way a session does (#clw_01M4GFB5Q5YQRQM2XK0RCTBSB5). A shadow or
+   * unknown issue answers 404, as its pages do.
+   */
+  async function apiAttachmentIssue(c: Ctx): Promise<ClawsIssueRecord | null> {
+    const loaded = await loadNativeIssue(c);
+    return loaded?.record && loaded.record.kind !== "shadow" ? loaded.record : null;
+  }
+
+  app.get("/api/issues/:id/attachments", apiAuthMiddleware, async (c) => {
+    const issue = await apiAttachmentIssue(c);
+    if (!issue) return jsonOk(c, { error: `Issue ${c.req.param("id")} not found` }, 404);
+    return jsonOk(c, (await listClawsIssueAttachments(issue.id)).map(attachmentSummary));
+  });
+
+  app.get("/api/issues/:id/attachments/:attachmentId", apiAuthMiddleware, async (c) => {
+    const issue = await apiAttachmentIssue(c);
+    if (!issue) return jsonOk(c, { error: `Issue ${c.req.param("id")} not found` }, 404);
+    const attachmentId = c.req.param("attachmentId");
+    const found = await readIssueAttachment(attachmentId);
+    // Only this issue's own files: a body or comment linking another issue's
+    // attachment does not expose it.
+    if (!found || found.row.issue_id !== issue.id) return jsonOk(c, { error: `No attachment ${attachmentId} on ${issue.id}` }, 404);
+    const guardCtx = makeGuardCtx(issue.repos[0] ?? "claws-issues", issue.id);
+    try {
+      return jsonOk(c, await attachmentResult({
+        meta: attachmentSummary(found.row),
+        read: () => readIssueAttachmentBytes(found),
+        guardText: async (text) => await guardContent(text, guardCtx("issue-attachment-content")),
+      }));
+    } catch (err) {
+      const cause = err instanceof Error ? err.message : String(err);
+      log.warn(`[api] Attachment ${attachmentId} on ${issue.id} could not be read: ${cause}`);
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        return jsonOk(c, { error: `Attachment ${attachmentId} file is missing from the attachment store` }, 404);
+      }
+      return jsonOk(c, { error: `Attachment read failed: ${cause}` }, 500);
+    }
+  });
+
+  // ── Session gate writes (docs/product/interactive-sessions.md) ──
+  //
+  // The claws-state tools an interactive session uses to move a native issue
+  // through the human gates it is driving it through — its approval
+  // (`approval`), Blocked, Priority, promotion — to set its model plan, and to take the
+  // issue page's other actions: close/reopen (`state`), edit title and body
+  // (`edit`), set repos (`repos`), move the Status column (`column`), the
+  // Labels form's other labels (`labels`), and close an issue as a duplicate
+  // of another (`close-as-duplicate`). Issue attachments are not offered:
+  // files flow only the other way, from the session to the user
+  // (`POST /api/sessions/:sid/files`, below). It may also clear a PR's
+  // recorded manual action once the step is done. Only the session
+  // tools call these (`claws-state-tools.ts` registers them only when the
+  // transport supplies `fetchSessionApi`: the `/mcp/sessions/:id` endpoint
+  // every session pod uses), and `:sid` must name a live
+  // session. Each write passes the
+  // dashboard's own checks, records `session:<sid>` as the approver where the
+  // store has an approver column, and posts one Claws-marked audit comment so
+  // the issue's (or PR's) history tells it apart from an operator's click.
+
+  /**
+   * The labels a session may set: the Labels form's set (`offeredLabels`)
+   * plus Blocked, which moves the lifecycle as the Status buttons do.
+   */
+  function sessionLabels(): string[] {
+    return [LABELS.blocked, ...offeredLabels(Object.keys(config.LABEL_SPECS))];
+  }
+
+  /**
+   * The live session and writable native issue a session route acts on, or the
+   * response refusing it: an unknown session or issue (a shadow included) is a
+   * 404, a closed or unassigned issue a 409, and an issue whose primary repo
+   * Claws does not manage a 403. `allowClosed` / `allowUnassigned` lift the
+   * closed and unassigned refusals for the routes the dashboard allows them on;
+   * an unassigned issue then has `repo` `""` and skips the managed-repo check.
+   * `allowOrphaned` lets through an issue none of whose repos is configured
+   * any more (`orphaned: true`) so it can still be closed and relabelled.
+   */
+  async function sessionIssueGuard(c: Ctx, opts: { allowClosed?: boolean; allowUnassigned?: boolean; allowOrphaned?: boolean } = {}): Promise<{ sid: string; record: NativeIssueRecord; id: string; repo: string; orphaned: boolean } | Response> {
+    const sid = c.req.param("sid") ?? "";
+    if (!/^[a-f0-9]+$/.test(sid)) return jsonOk(c, { error: "Session not found" }, 404);
+    const live = await getSessionBackend().getLive(sid);
+    if (!live.ok) return jsonOk(c, { error: "Session not found" }, 404);
+    const loaded = await loadNativeIssue(c, { forWrite: true });
+    if (!loaded?.record) {
+      const raw = c.req.param("id") ?? "";
+      if (!isNativeIssue(canonicalIssueRef(raw))) {
+        return jsonOk(c, { error: "Not a Claws-native issue — use the Forgejo API for a forge issue" }, 404);
+      }
+      return jsonOk(c, { error: "Issue not found" }, 404);
+    }
+    const { record, id } = loaded;
+    if (record.state === "closed" && !opts.allowClosed) return jsonOk(c, { error: "The issue is closed — reopen it before changing its state." }, 409);
+    if (record.repos.length === 0) {
+      if (!opts.allowUnassigned) return jsonOk(c, { error: UNASSIGNED_REJECTION }, 409);
+      return { sid, record, id, repo: "", orphaned: false };
+    }
+    const repo = clawsIssues.primaryRepo(record);
+    if (!(await isConfiguredRepo(repo))) {
+      if (opts.allowOrphaned && await orphanedRepos(record.repos)) return { sid, record, id, repo, orphaned: true };
+      return jsonOk(c, { error: "Repository not configured" }, 403);
+    }
+    return { sid, record, id, repo, orphaned: false };
+  }
+
+  /** The audit comment for a session write (on an issue or PR); a failure is logged, never fails the write. */
+  async function postSessionAudit(repo: string, id: string | number, body: string): Promise<void> {
+    try {
+      await ghCommentOnIssue(repo, id, body);
+    } catch (err) {
+      log.warn(`[server] Issue ${id}: failed to post session audit comment: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /** `{ phase, provider, tier, model, source, explicit, suggested }` per phase, for the model-plan routes. */
+  async function sessionModelPlanView(repo: string, record: NativeIssueRecord) {
+    const rows = await describeModelPlan(repo || null, record.id, record.labels.map((name) => ({ name })));
+    return rows.map((r) => ({
+      phase: r.phase,
+      provider: r.provider,
+      tier: r.tier,
+      model: r.resolvedModel,
+      source: r.source,
+      explicit: r.cellProvider || r.cellTier ? { provider: r.cellProvider, tier: r.cellTier } : null,
+      suggested: r.suggestedProvider || r.suggestedTier ? { provider: r.suggestedProvider, tier: r.suggestedTier } : null,
+    }));
+  }
+
+  app.post("/api/sessions/:sid/issues/:id/labels", sessionOwnTokenMiddleware, async (c) => {
+    const guard = await sessionIssueGuard(c, { allowOrphaned: true });
+    if (guard instanceof Response) return guard;
+    const { sid, record, id, repo } = guard;
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return jsonOk(c, { error: "Invalid JSON body" }, 400); }
+    const { label, present, reason } = (body ?? {}) as { label?: unknown; present?: unknown; reason?: unknown };
+    if (reason !== undefined && typeof reason !== "string") return jsonOk(c, { error: "reason must be a string" }, 400);
+    // The retired gate labels are an approval now (#clw_01M5VW14RKAAGS6VZ5PCKQXB9F),
+    // set through the sibling `approval` route.
+    if (typeof label === "string" && (RETIRED_GATE_LABELS as readonly string[]).includes(label)) {
+      return jsonOk(c, { error: `${label} is not a label any more — use claws_set_issue_approval` }, 400);
+    }
+    const allowed = sessionLabels();
+    if (typeof label !== "string" || !allowed.includes(label)) {
+      return jsonOk(c, { error: `label must be one of ${allowed.join(", ")}` }, 400);
+    }
+    if (guard.orphaned && label === LABELS.blocked) {
+      return jsonOk(c, { error: orphanedRejection(record.repos) }, 409);
+    }
+    if (typeof present !== "boolean") return jsonOk(c, { error: "present must be a boolean" }, 400);
+    const approvedBy = sessionApprover(sid);
+    let changed = false;
+    let result: GateWriteResult = { ok: true };
+    if (label === LABELS.blocked) {
+      if (present && record.lifecycle !== "blocked") {
+        result = await setNativeColumn(record, id, "blocked", approvedBy, { reason });
+        changed = result.ok;
+      } else if (!present && record.lifecycle === "blocked") {
+        result = await unblockNative(record, id, approvedBy);
+        changed = result.ok;
+      }
+    } else if (label === LABELS.priority) {
+      if (present && !record.labels.includes(label)) {
+        try {
+          await addLabel(repo, id, label);
+        } catch (err) {
+          return jsonOk(c, { error: `Failed to apply the Priority label: ${err instanceof Error ? err.message : String(err)}` }, 500);
+        }
+        changed = true;
+      } else if (!present && record.labels.includes(label)) {
+        if (!(await removeLabel(repo, id, label))) return jsonOk(c, { error: "Failed to remove the Priority label" }, 500);
+        changed = true;
+      }
+    } else if (present && !record.labels.includes(label)) {
+      // Every other label the Labels form offers is a plain add or remove.
+      try {
+        await addLabel(repo, id, label);
+      } catch (err) {
+        return jsonOk(c, { error: `Failed to apply the ${label} label: ${err instanceof Error ? err.message : String(err)}` }, 500);
+      }
+      changed = true;
+    } else if (!present && record.labels.includes(label)) {
+      if (!(await removeLabel(repo, id, label))) return jsonOk(c, { error: `Failed to remove the ${label} label` }, 500);
+      changed = true;
+    }
+    if (!result.ok) return jsonOk(c, { error: result.error }, result.status);
+    if (changed) await postSessionAudit(repo, id, `Session \`${sid}\` ${present ? "applied" : "removed"} **${label}**.`);
+    const after = (await clawsIssues.getIssue(id)) ?? record;
+    return jsonOk(c, {
+      ok: true,
+      changed,
+      lifecycle: after.lifecycle,
+      labels: after.labels,
+      ...(await sessionIssueTrack(repo, id)),
+    });
+  });
+
+  /**
+   * The board column, approval and "Stops at" line a session issue write
+   * answers with, so its reply shows the stage `claws_list_issues` does
+   * rather than only the stored lifecycle; nulls when the read fails.
+   */
+  async function sessionIssueTrack(repo: string, id: string): Promise<{ column: string | null; approved_through: string | null; stops_at: string | null }> {
+    try {
+      const track = await loadApprovalTrackInput(repo, id);
+      if (track) return { column: track.column, approved_through: track.approvedThrough ?? "none", stops_at: deriveApprovalTrack(track).stopsAt };
+    } catch (err) {
+      log.warn(`[sessions] approval track of ${id} after the write: ${err}`);
+    }
+    return { column: null, approved_through: null, stops_at: null };
+  }
+
+  // The `claws_set_issue_approval` tool (#clw_01M5VW14RKAAGS6VZ5PCKQXB9F): set
+  // how far the issue is approved (`issue-approval.ts`), checked against the
+  // approval track as a gate click on the dashboard is. Raising needs the
+  // target gate to offer `approve` — one click approves every gate up to it —
+  // and lowering from Merge to Plan needs the Merge gate's `withdraw`.
+  // Lowering to Requirements is allowed from any column: it is how a session
+  // sends a planned issue back to plan review, or withdraws a pre-approval.
+  // `none` is refused: an issue leaves Requirements only by being sent back
+  // to Ideas. Answers with the re-read track's column and "Stops at" line.
+  app.post("/api/sessions/:sid/issues/:id/approval", sessionOwnTokenMiddleware, async (c) => {
+    const guard = await sessionIssueGuard(c);
+    if (guard instanceof Response) return guard;
+    const { sid, id, repo } = guard;
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return jsonOk(c, { error: "Invalid JSON body" }, 400); }
+    const { through } = (body ?? {}) as { through?: unknown };
+    if (!isApprovedThrough(through)) return jsonOk(c, { error: `through must be one of ${APPROVAL_GATES.join(", ")}` }, 400);
+    if (through === "none") {
+      return jsonOk(c, { error: "Approval cannot be withdrawn below Requirements — send the issue back to Ideas instead" }, 400);
+    }
+    const result = await checkedApproval(repo, id, () => through, sessionApprover(sid));
+    if (!result.ok) return jsonOk(c, { error: result.error }, result.status);
+    let after: Awaited<ReturnType<typeof loadApprovalTrackInput>> = null;
+    try {
+      after = await loadApprovalTrackInput(repo, id);
+    } catch (err) {
+      log.warn(`[sessions] approval state of ${id} after the write: ${err}`);
+    }
+    if (!after) return jsonOk(c, { approved_through: through, column: null, stops_at: null });
+    return jsonOk(c, { approved_through: after.approvedThrough ?? "none", column: after.column, stops_at: deriveApprovalTrack(after).stopsAt });
+  });
+
+  app.post("/api/sessions/:sid/issues/:id/promote", sessionOwnTokenMiddleware, async (c) => {
+    const guard = await sessionIssueGuard(c);
+    if (guard instanceof Response) return guard;
+    const { sid, record, id, repo } = guard;
+    const result = await promoteNative(record, id, sessionApprover(sid));
+    if (!result.ok) return jsonOk(c, { error: result.error }, result.status);
+    await postSessionAudit(repo, id, `Session \`${sid}\` promoted this issue to Planning, approving its latest requirements.`);
+    const after = (await clawsIssues.getIssue(id)) ?? record;
+    return jsonOk(c, { ok: true, lifecycle: after.lifecycle, ...(await sessionIssueTrack(repo, id)) });
+  });
+
+  // The issue page's Status "Close" / "Reopen" controls. Closed and
+  // unassigned issues pass the guard: reopening needs the one, and the
+  // dashboard closes the other. Already in the requested state is a 409.
+  app.post("/api/sessions/:sid/issues/:id/state", sessionOwnTokenMiddleware, async (c) => {
+    const guard = await sessionIssueGuard(c, { allowClosed: true, allowUnassigned: true, allowOrphaned: true });
+    if (guard instanceof Response) return guard;
+    const { sid, record, id, repo } = guard;
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return jsonOk(c, { error: "Invalid JSON body" }, 400); }
+    const { state, reason } = (body ?? {}) as { state?: unknown; reason?: unknown };
+    if (state !== "open" && state !== "closed") return jsonOk(c, { error: "state must be open or closed" }, 400);
+    if (state === "closed" && reason !== "completed" && reason !== "not_planned") {
+      return jsonOk(c, { error: "reason must be completed or not_planned when closing" }, 400);
+    }
+    if (record.state === state) return jsonOk(c, { error: `The issue is already ${state}.` }, 409);
+    if (state === "open") {
+      await clawsIssues.reopenIssue(id);
+      await postSessionAudit(repo, id, `Session \`${sid}\` reopened this issue.`);
+    } else {
+      const closeReason = reason === "completed" ? "completed" : "not_planned";
+      await closeIssue(repo, id, closeReason);
+      await postSessionAudit(repo, id, `Session \`${sid}\` closed this issue as ${closeReason === "completed" ? "completed" : "not planned"}.`);
+    }
+    const after = (await clawsIssues.getIssue(id)) ?? record;
+    return jsonOk(c, { ok: true, changed: true, state: after.state, state_reason: after.state_reason });
+  });
+
+  // Close as a duplicate in one call, so the order and the refusals live here
+  // rather than in the agent: Duplicate first, then the
+  // `claws-duplicate-of:<canonical>` marker `listDuplicateIssuesOf` reads
+  // (which doubles as the audit comment), then close as not planned. Nothing
+  // is posted on the canonical issue.
+  app.post("/api/sessions/:sid/issues/:id/close-as-duplicate", sessionOwnTokenMiddleware, async (c) => {
+    const guard = await sessionIssueGuard(c, { allowUnassigned: true, allowOrphaned: true });
+    if (guard instanceof Response) return guard;
+    const { sid, record, id, repo } = guard;
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return jsonOk(c, { error: "Invalid JSON body" }, 400); }
+    const rawCanonical = (body as { canonical_id?: unknown } | null)?.canonical_id;
+    const canonical = typeof rawCanonical === "string" ? canonicalIssueRef(rawCanonical) : null;
+    if (!isNativeIssue(canonical)) return jsonOk(c, { error: "canonical_id must be a Claws-native issue id (clw_…)" }, 400);
+    if (canonical === id) return jsonOk(c, { error: "An issue cannot be a duplicate of itself." }, 409);
+    const target = await clawsIssues.getIssue(canonical);
+    if (!target || target.kind === "shadow") return jsonOk(c, { error: `Canonical issue ${canonical} not found` }, 404);
+    if (target.state === "closed") return jsonOk(c, { error: `The canonical issue ${canonical} is closed — pick the open issue the work continues on.` }, 409);
+    if (!record.labels.includes(LABELS.duplicate)) {
+      try {
+        await addLabel(repo, id, LABELS.duplicate);
+      } catch (err) {
+        return jsonOk(c, { error: `Failed to apply the ${LABELS.duplicate} label: ${err instanceof Error ? err.message : String(err)}` }, 500);
+      }
+    }
+    const marker = `claws-duplicate-of:${canonical}`;
+    try {
+      // A retry after a failed close must not post the marker a second time.
+      const marked = (await clawsIssues.listCommentDetails(id)).some((cm) => cm.body.includes(marker));
+      if (!marked) {
+        await ghCommentOnIssue(repo, id, `Session \`${sid}\` closed this issue as a duplicate of #${canonical}.\n\n${marker}`);
+      }
+    } catch (err) {
+      return jsonOk(c, { error: `The ${LABELS.duplicate} label was applied but the issue is still open: ${err instanceof Error ? err.message : String(err)}` }, 500);
+    }
+    try {
+      await closeIssue(repo, id, "not_planned");
+    } catch (err) {
+      return jsonOk(c, { error: `The ${LABELS.duplicate} label and the duplicate marker were applied but closing the issue failed: ${err instanceof Error ? err.message : String(err)}` }, 500);
+    }
+    const after = (await clawsIssues.getIssue(id)) ?? record;
+    return jsonOk(c, { ok: true, state: after.state, state_reason: after.state_reason, canonical });
+  });
+
+  // The issue page's Edit form: an omitted field is left alone, a blank title
+  // is refused, and an empty body is a valid body. A body edit goes through
+  // the same `editIssue` façade as the dashboard's, so an issue with a plan
+  // re-plans through the plan-hash check exactly as after a dashboard edit.
+  app.post("/api/sessions/:sid/issues/:id/edit", sessionOwnTokenMiddleware, async (c) => {
+    const guard = await sessionIssueGuard(c);
+    if (guard instanceof Response) return guard;
+    const { sid, record, id, repo } = guard;
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return jsonOk(c, { error: "Invalid JSON body" }, 400); }
+    const { title, body: newBody } = (body ?? {}) as { title?: unknown; body?: unknown };
+    if (title == null && newBody == null) return jsonOk(c, { error: "Give a title, a body, or both" }, 400);
+    if (title != null && typeof title !== "string") return jsonOk(c, { error: "title must be a string" }, 400);
+    if (newBody != null && typeof newBody !== "string") return jsonOk(c, { error: "body must be a string" }, 400);
+    const trimmed = typeof title === "string" ? title.trim() : undefined;
+    if (trimmed === "") return jsonOk(c, { error: "title must not be blank" }, 400);
+    const parts: string[] = [];
+    if (trimmed !== undefined && trimmed !== record.title) {
+      await editIssueTitle(repo, id, trimmed);
+      parts.push(`edited the title (was: ${record.title})`);
+    }
+    if (typeof newBody === "string" && newBody !== record.body) {
+      await editIssue(repo, id, newBody);
+      parts.push("edited the body");
+    }
+    const changed = parts.length > 0;
+    if (changed) await postSessionAudit(repo, id, `Session \`${sid}\` ${parts.join(" and ")}.`);
+    return jsonOk(c, { ok: true, changed, title: trimmed ?? record.title });
+  });
+
+  // Bulk soft delete for a session tidying an issue's discussion
+  // (docs/product/interactive-sessions.md "Let a session tidy..."). All or
+  // nothing: one unknown, foreign or protected id refuses the whole call.
+  app.post("/api/sessions/:sid/issues/:id/comments/delete", sessionOwnTokenMiddleware, async (c) => {
+    const guard = await sessionIssueGuard(c, { allowClosed: true, allowUnassigned: true, allowOrphaned: true });
+    if (guard instanceof Response) return guard;
+    const { sid, id, repo } = guard;
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return jsonOk(c, { error: "Invalid JSON body" }, 400); }
+    const ids = (body as { comment_ids?: unknown } | null)?.comment_ids;
+    if (!Array.isArray(ids) || ids.length === 0 || !ids.every((x) => typeof x === "string" && x.trim() !== "")) {
+      return jsonOk(c, { error: "comment_ids must be a non-empty array of comment ids" }, 400);
+    }
+    let deleted: number;
+    try {
+      deleted = await clawsIssues.deleteIssueComments(id, ids as string[], `session:${sid}`);
+    } catch (err) {
+      if (!(err instanceof clawsIssues.IssueCommentDeleteError)) throw err;
+      return jsonOk(c, { error: err.message }, err.reason === "refused" ? 409 : 404);
+    }
+    if (deleted > 0) await postSessionAudit(repo, id, `Session \`${sid}\` deleted ${deleted} comment${deleted === 1 ? "" : "s"}; see the issue's History.`);
+    return jsonOk(c, { ok: true, deleted });
+  });
+
+  // Stores a session's revised requirements record as a new, unapproved
+  // version. Approval stays on the operator's paths (Requirements review, then
+  // promote), and a design change awaiting re-approval must be settled first.
+  app.post("/api/sessions/:sid/issues/:id/requirements", sessionOwnTokenMiddleware, async (c) => {
+    const guard = await sessionIssueGuard(c);
+    if (guard instanceof Response) return guard;
+    const { sid, id, repo } = guard;
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return jsonOk(c, { error: "Invalid JSON body" }, 400); }
+    const parsed = RequirementsRecordSchema.safeParse(body);
+    if (!parsed.success) {
+      return jsonOk(c, { error: `Invalid requirements record: ${parsed.error.issues.map((i) => `${i.path.join(".") || "record"}: ${i.message}`).join("; ")}` }, 400);
+    }
+    if (await hasPendingReapproval(id)) {
+      return jsonOk(c, { error: "A design change is awaiting re-approval on this issue — settle it before storing a new requirements version." }, 409);
+    }
+    const version = await clawsIssues.storeSessionRequirements(id, parsed.data);
+    await postSessionAudit(repo, id, `Session \`${sid}\` stored requirements v${version} — not approved.`);
+    return jsonOk(c, { ok: true, version, approved: false });
+  });
+
+  // The issue page's Repositories form, restricted to repos Claws manages. An
+  // unknown repo is refused rather than dropped, and clearing every repo is
+  // not offered. An unassigned issue passes the guard: assigning it is the point.
+  app.post("/api/sessions/:sid/issues/:id/repos", sessionOwnTokenMiddleware, async (c) => {
+    const guard = await sessionIssueGuard(c, { allowUnassigned: true });
+    if (guard instanceof Response) return guard;
+    const { sid, record, id } = guard;
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return jsonOk(c, { error: "Invalid JSON body" }, 400); }
+    const rawRepos = (body as { repos?: unknown } | null)?.repos;
+    if (!Array.isArray(rawRepos) || rawRepos.length === 0 || !rawRepos.every((r) => typeof r === "string")) {
+      return jsonOk(c, { error: "repos must be a non-empty array of repo names" }, 400);
+    }
+    const repos = [...new Set(rawRepos as string[])];
+    const known = new Set((await listRepos()).map((r) => r.fullName));
+    const unknown = repos.find((r) => !known.has(r));
+    if (unknown !== undefined) return jsonOk(c, { error: `Not a repo Claws manages: ${unknown}` }, 400);
+    const before = [...record.repos].sort();
+    const changed = !isDeepStrictEqual(before, [...repos].sort());
+    if (changed) {
+      await clawsIssues.setRepos(id, repos);
+      // Reloaded so a pinned primary (`claws_issues.primary_repo`) still decides where the audit lands.
+      const updated = await clawsIssues.getIssue(id);
+      await postSessionAudit(clawsIssues.primaryRepo(updated ?? { repos }), id, `Session \`${sid}\` set the repositories to ${repos.join(", ")} (was: ${before.length > 0 ? before.join(", ") : "none"}).`);
+    }
+    return jsonOk(c, { ok: true, changed, repos: changed ? repos : record.repos });
+  });
+
+  // The issue page's Status buttons: the same `setNativeColumn` write and
+  // refusals as an operator's click. Closing is the state route, not a column.
+  app.post("/api/sessions/:sid/issues/:id/column", sessionOwnTokenMiddleware, async (c) => {
+    const guard = await sessionIssueGuard(c);
+    if (guard instanceof Response) return guard;
+    const { sid, record, id, repo } = guard;
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return jsonOk(c, { error: "Invalid JSON body" }, 400); }
+    const column = (body as { column?: unknown } | null)?.column;
+    if (typeof column !== "string" || !(ISSUE_LIFECYCLES as readonly string[]).includes(column)) {
+      return jsonOk(c, { error: `column must be one of ${ISSUE_LIFECYCLES.join(", ")}` }, 400);
+    }
+    // `until`: a YYYY-MM-DD day parks the issue in the Backlog until then,
+    // null clears the date, omitted leaves it as it is.
+    const rawUntil = (body as { until?: unknown } | null)?.until;
+    if (rawUntil !== undefined && rawUntil !== null && typeof rawUntil !== "string") {
+      return jsonOk(c, { error: "until must be a YYYY-MM-DD date or null" }, 400);
+    }
+    // `reason`: why the issue is Blocked — required with `column: "blocked"`.
+    const rawReason = (body as { reason?: unknown } | null)?.reason;
+    if (rawReason !== undefined && typeof rawReason !== "string") return jsonOk(c, { error: "reason must be a string" }, 400);
+    const result = await setNativeColumn(record, id, column, sessionApprover(sid), { until: rawUntil, reason: rawReason });
+    if (!result.ok) return jsonOk(c, { error: result.error }, result.status);
+    const after = (await clawsIssues.getIssue(id)) ?? record;
+    const untilBefore = record.backlog_until ?? null;
+    const untilAfter = after.backlog_until ?? null;
+    // A move can lower the approval (`approvalForMove`) without changing the column.
+    const approvalBefore = record.approved_through ?? "none";
+    const approvalAfter = after.approved_through ?? "none";
+    const approvalChanged = approvalBefore !== approvalAfter;
+    const approvalNote = approvalChanged ? ` Its approval went from ${approvalBefore} to ${approvalAfter}.` : "";
+    const changed = record.lifecycle !== column || untilBefore !== untilAfter || approvalChanged;
+    if (record.lifecycle !== column) {
+      await postSessionAudit(repo, id, `Session \`${sid}\` moved this issue to ${column}${untilAfter ? ` until ${untilAfter}` : ""}.${approvalNote}`);
+    } else if (approvalChanged) {
+      await postSessionAudit(repo, id, `Session \`${sid}\` re-sent this issue to ${column}, lowering its approval from ${approvalBefore} to ${approvalAfter}.`);
+    } else if (untilBefore !== untilAfter) {
+      await postSessionAudit(repo, id, untilAfter
+        ? `Session \`${sid}\` set this issue's Backlog return date to ${untilAfter}${untilBefore ? ` (was: ${untilBefore})` : ""}.`
+        : `Session \`${sid}\` cleared this issue's Backlog return date (was: ${untilBefore}).`);
+    }
+    return jsonOk(c, { ok: true, changed, lifecycle: after.lifecycle, backlog_until: untilAfter });
+  });
+
+  // Read-only, so any claws-state caller may use it — but native-only, like the
+  // write below: a shadow's model plan is never surfaced through the dashboard,
+  // so `forWrite` here is not an accident of reuse.
+  app.get("/api/issues/:id/model-plan", apiAuthMiddleware, async (c) => {
+    const loaded = await loadNativeIssue(c, { forWrite: true });
+    if (!loaded?.record) return jsonOk(c, { error: "Not a Claws-native issue" }, 404);
+    const repo = clawsIssues.primaryRepo(loaded.record);
+    return jsonOk(c, { issue: loaded.id, repo: repo || null, phases: await sessionModelPlanView(repo, loaded.record) });
+  });
+
+  // The Model plan form's write (`POST /issues/:id/model-plan`), for only the
+  // phases named: a cell with neither provider nor tier clears the phase's
+  // explicit cell and leaves a planner suggestion in place. An unknown phase,
+  // provider or tier is refused rather than read as blank.
+  app.post("/api/sessions/:sid/issues/:id/model-plan", sessionOwnTokenMiddleware, async (c) => {
+    const guard = await sessionIssueGuard(c);
+    if (guard instanceof Response) return guard;
+    const { sid, record, id, repo } = guard;
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return jsonOk(c, { error: "Invalid JSON body" }, 400); }
+    const rawCells = (body as { cells?: unknown } | null)?.cells;
+    if (!Array.isArray(rawCells) || rawCells.length === 0) return jsonOk(c, { error: "cells must be a non-empty array" }, 400);
+    const cells: ModelPlanCell[] = [];
+    for (const raw of rawCells) {
+      const { phase, provider, tier } = (raw ?? {}) as { phase?: unknown; provider?: unknown; tier?: unknown };
+      if (typeof phase !== "string" || !isModelPlanPhase(phase)) {
+        return jsonOk(c, { error: `phase must be one of ${MODEL_PLAN_PHASES.join(", ")}` }, 400);
+      }
+      if (provider != null && typeof provider !== "string") return jsonOk(c, { error: `${phase}: provider must be a string` }, 400);
+      if (tier != null && typeof tier !== "string") return jsonOk(c, { error: `${phase}: tier must be a string` }, 400);
+      const p = (provider ?? "").trim();
+      const t = (tier ?? "").trim();
+      if (p && !isModelPlanProvider(p)) return jsonOk(c, { error: `${phase}: unknown provider ${p}` }, 400);
+      const normalizedTier = t ? normalizeTier(t) : null;
+      if (t && !normalizedTier) return jsonOk(c, { error: `${phase}: unknown tier ${t}` }, 400);
+      cells.push({ phase, provider: p && isModelPlanProvider(p) ? p : null, tier: normalizedTier });
+    }
+    const before = await sessionModelPlanView(repo, record);
+    await setExplicitPlan(repo, id, cells);
+    const after = await sessionModelPlanView(repo, record);
+    const beforeExplicit = new Map(before.map((r) => [r.phase, r.explicit]));
+    const afterExplicit = new Map(after.map((r) => [r.phase, r.explicit]));
+    // Only the phases whose explicit cell actually moved, not every phase the
+    // request named blank — a blank cell that was already blank cleared nothing.
+    const touched = cells.filter((cell) => !isDeepStrictEqual(beforeExplicit.get(cell.phase), afterExplicit.get(cell.phase)));
+    const changed = touched.length > 0;
+    if (changed) {
+      const set = summarizeModelPlanCells(touched);
+      const cleared = touched.filter((cell) => !cell.provider && !cell.tier).map((cell) => cell.phase);
+      const parts = [set ? `set ${set}` : "", cleared.length > 0 ? `cleared ${cleared.join(", ")}` : ""].filter(Boolean);
+      await postSessionAudit(repo, id, `Session \`${sid}\` changed the model plan: ${parts.join("; ")}.`);
+    }
+    return jsonOk(c, { ok: true, changed, issue: id, repo, phases: after });
+  });
+
+  // Start a new, independent interactive session dedicated to this issue
+  // (`claws_start_session`, the /new-session skill). Options default as the
+  // New session form's do; nothing is silently substituted. The new session
+  // gets only the baseline grant — the implicit capabilities plus the agent's
+  // own login, which the form always pre-ticks — and each requested capability
+  // becomes a pending request the operator decides on its page. The row
+  // records who started it, as plain strings: no live link between the two.
+  app.post("/api/sessions/:sid/issues/:id/start-session", sessionOwnTokenMiddleware, async (c) => {
+    const guard = await sessionIssueGuard(c, { allowUnassigned: true });
+    if (guard instanceof Response) return guard;
+    const { sid, record, id, repo } = guard;
+    return startSpawnedSession(c, sid, { record, id, repo });
+  });
+
+  // The same start with no issue (`claws_start_session` without `issue_id`):
+  // no issue to guard, so the caller must itself be a live session. Repos
+  // default to none (a home-directory session); the brief carries only the
+  // instructions; nothing is filed or commented on an issue.
+  app.post("/api/sessions/:sid/start-session", sessionOwnTokenMiddleware, async (c) => {
+    const sid = c.req.param("sid") ?? "";
+    if (!/^[a-f0-9]+$/.test(sid)) return jsonOk(c, { error: "Session not found" }, 404);
+    const live = await getSessionBackend().getLive(sid);
+    if (!live.ok) return jsonOk(c, { error: "Session not found" }, 404);
+    return startSpawnedSession(c, sid, null);
+  });
+
+  /**
+   * The body of both start-session routes: option parsing, capability checks,
+   * the live-session cap and the create. `issue` is null for an issue-less
+   * start, which differs only in the repos default, the brief, the null
+   * `spawnedForIssue` and the absent issue audit comment.
+   */
+  async function startSpawnedSession(
+    c: Context<Env>,
+    sid: string,
+    issue: { record: NativeIssueRecord; id: string; repo: string } | null,
+  ): Promise<Response> {
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return jsonOk(c, { error: "Invalid JSON body" }, 400); }
+    const raw = (body ?? {}) as { repos?: unknown; provider?: unknown; model?: unknown; instructions?: unknown; title?: unknown; request_capabilities?: unknown; reason?: unknown };
+
+    let repos: string[];
+    if (raw.repos === undefined) {
+      repos = issue && issue.repo ? [issue.repo, ...issue.record.repos.filter((r) => r !== issue.repo)] : [];
+    } else {
+      if (!Array.isArray(raw.repos) || raw.repos.some((r) => typeof r !== "string" || !/^[^/\s]+\/[^/\s]+$/.test(r))) {
+        return jsonOk(c, { error: "repos must be an array of owner/name strings" }, 400);
+      }
+      repos = [...new Set(raw.repos as string[])];
+    }
+    const multi = repos.length > 1;
+
+    const agentDefaults = await loadSessionAgentDefaults();
+    let provider: SessionProvider;
+    if (raw.provider === undefined) {
+      const providers = await controller.providerStatus();
+      provider = multi ? defaultMultiSessionProvider(agentDefaults.lastProvider, providers) : defaultSessionProvider(agentDefaults.lastProvider, providers);
+    } else if (typeof raw.provider === "string" && SESSION_PROVIDERS.includes(raw.provider as SessionProvider)) {
+      provider = raw.provider as SessionProvider;
+    } else {
+      return jsonOk(c, { error: `Unknown provider ${JSON.stringify(raw.provider)}. Allowed: ${SESSION_PROVIDERS.join(", ")}` }, 400);
+    }
+
+    const offeredModels = sessionModelsFor(provider).map((m) => m.id);
+    let model: string | null;
+    if (raw.model === undefined) {
+      model = rememberedSessionModel(provider, agentDefaults.models[provider]) || null;
+    } else if (typeof raw.model === "string" && offeredModels.includes(raw.model.trim())) {
+      model = raw.model.trim();
+    } else {
+      return jsonOk(c, { error: `Model ${JSON.stringify(raw.model)} is not offered for ${provider}. Allowed: ${offeredModels.length > 0 ? offeredModels.join(", ") : "none"}` }, 400);
+    }
+
+    if (raw.instructions !== undefined && typeof raw.instructions !== "string") return jsonOk(c, { error: "instructions must be a string" }, 400);
+    const instructions = (raw.instructions as string | undefined)?.trim() ?? "";
+    if (instructions.length > MAX_SESSION_INSTRUCTIONS_CHARS) {
+      return jsonOk(c, { error: `instructions must be at most ${MAX_SESSION_INSTRUCTIONS_CHARS} characters (got ${instructions.length})` }, 400);
+    }
+    if (raw.title !== undefined && typeof raw.title !== "string") return jsonOk(c, { error: "title must be a string" }, 400);
+    const title = (raw.title as string | undefined)?.trim() ?? "";
+    if (title.length > MAX_SESSION_DESCRIPTION_LEN) {
+      return jsonOk(c, { error: `title must be at most ${MAX_SESSION_DESCRIPTION_LEN} characters (got ${title.length})` }, 400);
+    }
+    if (issue && title) return jsonOk(c, { error: "title cannot be set for an issue session — it is titled from the issue" }, 400);
+    if (raw.reason !== undefined && typeof raw.reason !== "string") return jsonOk(c, { error: "reason must be a string" }, 400);
+    const reason = (raw.reason as string | undefined)?.trim() ?? "";
+
+    let requested: string[] = [];
+    if (raw.request_capabilities !== undefined) {
+      if (!Array.isArray(raw.request_capabilities) || raw.request_capabilities.some((cap) => typeof cap !== "string")) {
+        return jsonOk(c, { error: "request_capabilities must be an array of capability ids" }, 400);
+      }
+      requested = [...new Set(raw.request_capabilities as string[])];
+    }
+    if (requested.length > MAX_PENDING_CAPABILITY_REQUESTS) {
+      return jsonOk(c, { error: `At most ${MAX_PENDING_CAPABILITY_REQUESTS} capabilities may be requested (got ${requested.length})` }, 400);
+    }
+
+    // A login stored since this process last read the accounts keeps claude-auth.
+    if (claudeAccountsStale()) await refreshClaudeAccounts();
+    const mode: SessionMode = repos.length === 0 ? "home-claude" : "worktree-claude";
+    const baseline = withImplicitCapabilities(defaultProviderAuthCapabilities(provider, mode), repos);
+    const backend = getSessionBackend();
+    const classified = classifyLiveGrants(baseline, backend.kind, { provider, mode });
+    const grantable = classified.filter((entry) => entry.state === "grantable").map((entry) => entry.cap.id);
+    const available = validCapabilityIds(requested);
+    const toRequest: string[] = [];
+    for (const cap of requested) {
+      if (baseline.includes(cap)) continue;
+      if (!available.includes(cap)) {
+        return jsonOk(c, { error: `Unknown or unavailable capability ${cap}. Requestable: ${grantable.length > 0 ? grantable.join(", ") : "none"}` }, 400);
+      }
+      if (!grantable.includes(cap)) {
+        // A capability this provider cannot use at all (browser on codex) gives its own reason: launching from the dashboard would not help.
+        const reason = classified.find((entry) => entry.cap.id === cap)?.reason;
+        const why = reason && reason !== FIXED_AT_LAUNCH_REASON
+          ? `${cap} cannot be requested: ${reason}`
+          : `${cap} is only grantable at launch — ask the operator to create the session from the dashboard`;
+        return jsonOk(c, { error: `${why}. Requestable: ${grantable.length > 0 ? grantable.join(", ") : "none"}` }, 400);
+      }
+      toRequest.push(cap);
+    }
+
+    const live = await countLiveSessionsSpawnedBy(sid);
+    if (live >= MAX_LIVE_STARTED_SESSIONS) {
+      return jsonOk(c, { error: `This session already has ${live} live sessions it started (limit ${MAX_LIVE_STARTED_SESSIONS}) — end one before starting another` }, 409);
+    }
+
+    let brief: string;
+    if (issue) {
+      const plans = await clawsIssues.listPlans(issue.id);
+      brief = buildSessionBrief({
+        issueId: issue.id,
+        title: issue.record.title,
+        url: clawsIssues.dashboardIssueUrl(issue.id),
+        body: issue.record.body,
+        planBody: plans.length > 0 ? plans[plans.length - 1]!.body : null,
+        instructions,
+        startedBy: sid,
+      });
+    } else {
+      brief = buildStandaloneSessionBrief({ instructions, startedBy: sid });
+    }
+    const spawn = { brief, spawnedBySession: sid, spawnedForIssue: issue?.id ?? null, title: issue ? issueSessionTitle(issue.record.title) : standaloneSessionTitle(title, instructions, sid) };
+    const result = multi
+      ? await backend.createMulti({ repos, capabilities: baseline, provider, model, ...spawn })
+      : await backend.create({ repo: repos[0] ?? null, mode, capabilities: baseline, provider, model, ...spawn });
+    if (!result.ok) {
+      const status = createSessionErrorStatus(result);
+      return jsonOk(c, { error: `Cannot create session: ${describeCreateSessionError(result)}` }, status);
+    }
+    const newId = result.id;
+
+    const pending: string[] = [];
+    for (const cap of toRequest) {
+      const created = await requestCapability(newId, cap, `Requested by session ${sid} at start${reason ? `: ${reason}` : ""}`);
+      if (created.ok) pending.push(cap);
+    }
+    const url = clawsIssues.dashboardSessionUrl(newId);
+    if (issue) {
+      await postSessionAudit(issue.repo, issue.id, `Session \`${sid}\` started session [\`${newId}\`](${url}) for this issue (${provider}${model ? `, ${model}` : ""}; ${repos.length > 0 ? repos.join(", ") : "home directory"}).${pending.length > 0 ? ` Capabilities awaiting the operator: ${pending.join(", ")}.` : ""}`);
+    }
+    log.info(`[sessions] Session ${sid} started session ${newId} ${issue ? `for issue ${issue.id}` : "(no issue)"} (title: ${JSON.stringify(spawn.title)}, provider: ${provider}, model: ${model ?? "default"}, repos: ${repos.join(", ") || "none"}, pending capabilities: ${pending.join(", ") || "none"})`);
+    return jsonOk(c, { ok: true, id: newId, url, provider, model, repos, pending_capabilities: pending });
+  }
+
+  // The PR's repo and number travel in the body: a repo name contains a slash.
+  app.post("/api/sessions/:sid/prs/clear-manual-action", sessionOwnTokenMiddleware, async (c) => {
+    const sid = c.req.param("sid") ?? "";
+    if (!/^[a-f0-9]+$/.test(sid)) return jsonOk(c, { error: "Session not found" }, 404);
+    const live = await getSessionBackend().getLive(sid);
+    if (!live.ok) return jsonOk(c, { error: "Session not found" }, 404);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return jsonOk(c, { error: "Invalid JSON body" }, 400); }
+    const parsed = RepoPrNumberSchema.safeParse(body);
+    if (!parsed.success) return jsonOk(c, { error: "Missing repo or number" }, 400);
+    const { repo, number } = parsed.data;
+    if (!(await isConfiguredRepo(repo))) return jsonOk(c, { error: "Repository not configured" }, 403);
+    const row = await getClawsPr(repo, number);
+    if (!row) return jsonOk(c, { error: "No Claws record for this PR" }, 404);
+    const reason = row.manualActionReason;
+    if (reason === null) return jsonOk(c, { error: "No manual action is recorded on this PR" }, 409);
+    // The hold is the row's reason alone; there is no forge label to remove.
+    await clearPrHold(repo, number);
+    await postSessionAudit(repo, number, `Session \`${sid}\` cleared the recorded manual action (was: \`${reason}\`) so the PR may auto-merge.`);
+    return jsonOk(c, { ok: true, changed: true, reason });
+  });
+
+  /**
+   * The checks the session PR recovery routes below share with
+   * `clear-manual-action`: a live session, a `{repo, number}` body, a
+   * configured repo. Answers the parsed body and the session's capabilities,
+   * or the refusal to return.
+   */
+  async function sessionPrGuard<T extends z.ZodTypeAny>(c: Context<Env>, schema: T): Promise<Response | { sid: string; body: z.infer<T>; capabilities: string[] }> {
+    const sid = c.req.param("sid") ?? "";
+    if (!/^[a-f0-9]+$/.test(sid)) return jsonOk(c, { error: "Session not found" }, 404);
+    const live = await getSessionBackend().getLive(sid);
+    if (!live.ok) return jsonOk(c, { error: "Session not found" }, 404);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return jsonOk(c, { error: "Invalid JSON body" }, 400); }
+    const parsed = schema.safeParse(body);
+    if (!parsed.success) return jsonOk(c, { error: "Missing repo or number" }, 400);
+    const { repo } = parsed.data as { repo: string };
+    if (!(await isConfiguredRepo(repo))) return jsonOk(c, { error: "Repository not configured" }, 403);
+    return { sid, body: parsed.data, capabilities: live.session.capabilities };
+  }
+
+  /** The `session_pr_actions` row for a session PR action that already happened; a failure is logged, never fails it. */
+  async function recordSessionPrActionLogged(entry: Parameters<typeof recordSessionPrAction>[0]): Promise<void> {
+    try {
+      await recordSessionPrAction(entry);
+    } catch (err) {
+      log.warn(`[server] ${entry.repo}#${entry.prNumber}: failed to record session ${entry.sessionId}'s ${entry.action}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  // `claws_rerun_failed_ci`: re-run only the failed jobs of a CI run on the
+  // PR's head commit — the named run, or the newest failed one — with no push.
+  app.post("/api/sessions/:sid/prs/rerun-failed", sessionOwnTokenMiddleware, async (c) => {
+    const guard = await sessionPrGuard(c, SessionRerunSchema);
+    if (guard instanceof Response) return guard;
+    const { sid, body: { repo, number, run: requested } } = guard;
+    let headSha: string;
+    try {
+      const gate = await getPRMergeGate(repo, number);
+      if (gate.state !== "OPEN") return jsonOk(c, { error: "The PR is not open" }, 404);
+      headSha = gate.headSha;
+    } catch (err) {
+      return jsonOk(c, { error: `Could not read the PR: ${err instanceof Error ? err.message : String(err)}` }, 404);
+    }
+    let run: number;
+    try {
+      if (requested === undefined) {
+        const latest = await findLatestFailedRun(repo, headSha);
+        if (latest === null) return jsonOk(c, { error: "No failed run on the PR's head commit" }, 409);
+        run = latest;
+      } else {
+        if (!(await isRunOnCommit(repo, requested, headSha))) {
+          return jsonOk(c, { error: `Run ${requested} is not on the PR's head commit ${headSha.slice(0, 7)}; re-running it would not change the PR's checks` }, 409);
+        }
+        run = requested;
+      }
+    } catch (err) {
+      return jsonOk(c, { error: `Could not list the PR's CI runs: ${err instanceof Error ? err.message : String(err)}` }, 502);
+    }
+    let result: { run: number; jobs: string[] };
+    try {
+      result = await rerunFailedJobsForSession(repo, run);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (err instanceof ForgejoActionNotFoundError) return jsonOk(c, { error: `Run ${run} not found` }, 404);
+      if ((err as { status?: unknown } | null)?.status === 409) return jsonOk(c, { error: message }, 409);
+      return jsonOk(c, { error: message }, 502);
+    }
+    const jobList = result.jobs.length > 0 ? ` (${result.jobs.map((j) => `\`${j}\``).join(", ")})` : "";
+    await recordSessionPrActionLogged({ repo, prNumber: number, sessionId: sid, action: "rerun", detail: `run ${result.run}: ${result.jobs.join(", ")}` });
+    await postSessionAudit(repo, number, `Session \`${sid}\` re-ran the failed jobs of run ${result.run}${jobList}.`);
+    return jsonOk(c, { ok: true, run: result.run, jobs: result.jobs });
+  });
+
+  // `claws_unmark_problematic`: the `/queue/unmark-problematic` button for a
+  // session, refused unless the PR's row says it is Problematic.
+  app.post("/api/sessions/:sid/prs/unmark-problematic", sessionOwnTokenMiddleware, async (c) => {
+    const guard = await sessionPrGuard(c, RepoPrNumberSchema);
+    if (guard instanceof Response) return guard;
+    const { sid, body: { repo, number } } = guard;
+    const row = await getClawsPr(repo, number);
+    if (!row) return jsonOk(c, { error: "No Claws record for this PR" }, 404);
+    if (!isProblematic(row)) return jsonOk(c, { error: `The PR is not ${LABELS.problematic}` }, 409);
+    if (!(await removeLabel(repo, number, LABELS.problematic))) {
+      return jsonOk(c, { error: `Failed to remove the ${LABELS.problematic} label` }, 500);
+    }
+    // As the dashboard route: without the floor advance, the attempts still in
+    // the 24h window re-trip the breaker on the very next sweep.
+    await resetCIFixerBreakerGrants(repo, number);
+    await recordSessionPrActionLogged({ repo, prNumber: number, sessionId: sid, action: "unmark-problematic" });
+    await postSessionAudit(repo, number, `Session \`${sid}\` unmarked this PR ${LABELS.problematic} and reset its CI-fix budget, returning it to the normal CI-fix and review flow.`);
+    return jsonOk(c, { ok: true, changed: true });
+  });
+
+  // `claws_retry_problematic_diagnosis`: post the rediagnosis marker, after
+  // which the diagnoser no longer counts its earlier report as current.
+  app.post("/api/sessions/:sid/prs/rediagnose", sessionOwnTokenMiddleware, async (c) => {
+    const guard = await sessionPrGuard(c, RepoPrNumberSchema);
+    if (guard instanceof Response) return guard;
+    const { sid, body: { repo, number } } = guard;
+    const row = await getClawsPr(repo, number);
+    if (!row) return jsonOk(c, { error: "No Claws record for this PR" }, 404);
+    if (!isProblematic(row)) return jsonOk(c, { error: `The PR is not ${LABELS.problematic}` }, 409);
+    try {
+      if (!hasCurrentDiagnosisReport(await getIssueComments(repo, number))) {
+        return jsonOk(c, { error: "No diagnosis report to retry" }, 409);
+      }
+      // The marker comment is the audit comment: Claws-marked by commentOnIssue's footer.
+      await ghCommentOnIssue(repo, number, `${REDIAGNOSE_REQUEST_MARKER}\n\nSession \`${sid}\` asked Claws to re-diagnose this ${LABELS.problematic} PR; the Problematic PR Diagnoser runs again on its next pass.`);
+    } catch (err) {
+      return jsonOk(c, { error: `Failed to request a rediagnosis: ${err instanceof Error ? err.message : String(err)}` }, 500);
+    }
+    await recordSessionPrActionLogged({ repo, prNumber: number, sessionId: sid, action: "rediagnose" });
+    return jsonOk(c, { ok: true, changed: true });
+  });
+
+  // `claws_comment_on_pr`: operator feedback posted with no Claws footer and
+  // its id recorded as `feedback`, which is what makes the review readers take
+  // a bot-authored comment as human (forgejo.ts drops every other footer-less
+  // comment by Claws' own login, #3225).
+  app.post("/api/sessions/:sid/prs/comment", sessionOwnTokenMiddleware, async (c) => {
+    const guard = await sessionPrGuard(c, SessionPrCommentSchema);
+    if (guard instanceof Response) return guard;
+    const { sid, body: { repo, number, body } } = guard;
+    if (!body.trim()) return jsonOk(c, { error: "The comment body is empty" }, 400);
+    if (body.length > SESSION_PR_COMMENT_MAX_CHARS) {
+      return jsonOk(c, { error: `The comment body is over ${SESSION_PR_COMMENT_MAX_CHARS} characters` }, 400);
+    }
+    try {
+      const gate = await getPRMergeGate(repo, number);
+      if (gate.state !== "OPEN") return jsonOk(c, { error: "The PR is not open" }, 404);
+    } catch (err) {
+      return jsonOk(c, { error: `Could not read the PR: ${err instanceof Error ? err.message : String(err)}` }, 404);
+    }
+    let commentId: string;
+    try {
+      commentId = await postOperatorComment(repo, number, `**Operator feedback via Claws session \`${sid}\`:**\n\n${body}`);
+    } catch (err) {
+      return jsonOk(c, { error: `Failed to post the comment: ${err instanceof Error ? err.message : String(err)}` }, 502);
+    }
+    // Not `recordSessionPrActionLogged`: without the row the comment reads as
+    // Claws output, so a failed write must reach the session.
+    try {
+      await recordSessionPrAction({ repo, prNumber: number, sessionId: sid, action: "feedback", commentId });
+    } catch (err) {
+      return jsonOk(c, { error: `Posted comment ${commentId} but failed to record it as session feedback, so Claws will not read it as human: ${err instanceof Error ? err.message : String(err)}` }, 500);
+    }
+    return jsonOk(c, { ok: true, commentId });
+  });
+
+  /**
+   * The merge half of `claws_merge_pr` and `claws_approve_pr_merge`, for a PR
+   * whose merge is approved: the auto-merger's own gates, then the merge.
+   * Answers the merge (or that the sweep already merged it), or the refusal
+   * with its skip code and the HTTP status to return it with. A session
+   * holding `infra-merge` makes the human merge of an infrastructure PR
+   * (`infraPaths` names the paths it covered).
+   */
+  async function mergeApprovedPrNow(
+    sid: string,
+    repo: string,
+    number: number,
+    capabilities: string[],
+    opts: { notify?: boolean } = {},
+  ): Promise<{ merged: boolean; note?: string; infraPaths?: string[] } | { refusal: string; code?: string; status: ContentfulStatusCode }> {
+    const repoObj = await findConfiguredRepo(repo);
+    if (!repoObj) return { refusal: "Repository not configured", status: 403 };
+    const alreadyMerged = async (): Promise<boolean> => (await getPRState(repo, number).catch(() => null)) === "MERGED";
+    const pr = (await listPRs(repoObj.fullName)).find((p) => p.number === number);
+    if (!pr) {
+      if (await alreadyMerged()) return { merged: false, note: "already merged" };
+      return { refusal: "PR is not open", status: 409 };
+    }
+    let result: Awaited<ReturnType<typeof attemptMerge>>;
+    try {
+      result = await attemptMerge(repoObj, pr, {
+        mergedBy: `session:${sid}`,
+        ...(opts.notify === false ? { notify: false } : {}),
+        ...(capabilities.includes(INFRA_MERGE_CAPABILITY_ID) ? { infraMergeBy: sid } : {}),
+      });
+    } catch (err) {
+      if (await alreadyMerged()) return { merged: false, note: "already merged" };
+      return { refusal: `Merge failed: ${err instanceof Error ? err.message : String(err)}`, status: 502 };
+    }
+    if (!result.merged) {
+      // The auto-merger's sweep may have merged it first.
+      if ((result.code === "closed" || result.code === "head-moved") && await alreadyMerged()) {
+        return { merged: false, note: "already merged" };
+      }
+      return { refusal: result.message, code: result.code, status: 409 };
+    }
+    return result.infraPaths ? { merged: true, infraPaths: result.infraPaths } : { merged: true };
+  }
+
+  /** The `session_pr_actions` detail suffix and audit-comment clause for a merge
+   *  a session made under `infra-merge`; both empty for any other merge. */
+  function infraMergeNotes(paths: string[] | undefined): { detail: string; audit: string } {
+    if (!paths?.length) return { detail: "", audit: "" };
+    const list = paths.slice(0, 5).join(", ");
+    return {
+      detail: `; human merge for infrastructure paths (${list}) under the infra-merge capability`,
+      audit: ` as the human merge for its infrastructure changes (${list}), under the operator-granted \`infra-merge\` capability`,
+    };
+  }
+
+  // `claws_merge_pr`: merge a PR whose merge is already approved now, through
+  // the auto-merger's own gates, instead of waiting for its next sweep
+  // (#clw_01M4XFRSGNP87QVW0N1W5KN0V4). Never records an approval itself.
+  app.post("/api/sessions/:sid/prs/merge", sessionOwnTokenMiddleware, async (c) => {
+    const guard = await sessionPrGuard(c, RepoPrNumberSchema);
+    if (guard instanceof Response) return guard;
+    const { sid, body: { repo, number }, capabilities } = guard;
+    const row = await getClawsPr(repo, number);
+    if (!row) return jsonOk(c, { error: "No Claws record for this PR" }, 404);
+    if (!isMergeApproved(row)) {
+      return jsonOk(c, { error: "The merge is not approved. Ask the operator; if they approve it, record the approval first (claws_set_issue_approval through merge on the native issue) and call claws_merge_pr again. If the operator told you to merge this one PR only, call claws_approve_pr_merge instead", code: "not-approved" }, 409);
+    }
+    const outcome = await mergeApprovedPrNow(sid, repo, number, capabilities);
+    if ("refusal" in outcome) {
+      return jsonOk(c, { error: outcome.refusal, ...(outcome.code ? { code: outcome.code } : {}) }, outcome.status);
+    }
+    if (!outcome.merged) return jsonOk(c, { ok: true, merged: false, note: outcome.note });
+    const infra = infraMergeNotes(outcome.infraPaths);
+    await recordSessionPrActionLogged({ repo, prNumber: number, sessionId: sid, action: "merge", detail: `approved by ${row.mergeApprovedBy}${infra.detail}` });
+    await postSessionAudit(repo, number, `Session \`${sid}\` merged this PR directly${infra.audit} (merge approved by ${row.mergeApprovedBy}).`);
+    return jsonOk(c, { ok: true, merged: true });
+  });
+
+  // `claws_approve_pr_merge`: at the operator's direction, approve the merge of
+  // this one PR — on its `claws_prs` row only, never the issue's stored
+  // approval, so the issue's other PRs stay unapproved — and merge it through the
+  // same gates as `claws_merge_pr` (#clw_01M5022YK7Z2V63775Y92B59P3). Without
+  // `queue`, a refusal withdraws the approval this call wrote; with it, the
+  // approval stays and the auto-merger's sweep merges the PR once it is ready.
+  app.post("/api/sessions/:sid/prs/approve-merge", sessionOwnTokenMiddleware, async (c) => {
+    const guard = await sessionPrGuard(c, SessionApproveMergeSchema);
+    if (guard instanceof Response) return guard;
+    const { sid, body: { repo, number, queue }, capabilities } = guard;
+    if ((await getPRState(repo, number).catch(() => null)) !== "OPEN") return jsonOk(c, { error: "PR is not open" }, 409);
+    const approver = sessionApprover(sid);
+    let writtenAt: string | null;
+    try {
+      writtenAt = await writeMergeApproval(repo, number, approver, { keepExisting: true });
+    } catch (err) {
+      return jsonOk(c, { error: `Failed to record the merge approval: ${err instanceof Error ? err.message : String(err)}` }, 500);
+    }
+    const outcome = await mergeApprovedPrNow(sid, repo, number, capabilities, queue ? {} : { notify: false });
+    if (!("refusal" in outcome)) {
+      if (!outcome.merged) return jsonOk(c, { ok: true, merged: false, note: outcome.note });
+      const infra = infraMergeNotes(outcome.infraPaths);
+      await recordSessionPrActionLogged({ repo, prNumber: number, sessionId: sid, action: "approve-merge", detail: `merged${infra.detail}` });
+      await postSessionAudit(repo, number, `Session \`${sid}\` approved the merge of this PR only (not the issue's other PRs) and merged it directly${infra.audit}.`);
+      return jsonOk(c, { ok: true, merged: true });
+    }
+    if (queue) {
+      await recordSessionPrActionLogged({ repo, prNumber: number, sessionId: sid, action: "approve-merge", detail: "queued" });
+      await postSessionAudit(repo, number, `Session \`${sid}\` approved the merge of this PR only (not the issue's other PRs); Claws merges it once it is ready.`);
+      return jsonOk(c, { ok: true, merged: false, queued: true, reason: outcome.refusal, ...(outcome.code ? { code: outcome.code } : {}) });
+    }
+    if (writtenAt !== null) {
+      // Withdraw only the approval this call wrote: one recorded since (an
+      // operator's click) has another approver or timestamp and is kept.
+      const sqlTime = (iso: string) => iso.slice(0, 19).replace("T", " ");
+      try {
+        const row = await getClawsPr(repo, number);
+        if (row?.mergeApprovedBy === approver && row.mergeApprovedAt !== null && sqlTime(row.mergeApprovedAt) === sqlTime(writtenAt)) {
+          await upsertClawsPr(repo, number, { mergeApprovedBy: null, mergeApprovedAt: null });
+        }
+      } catch (err) {
+        log.warn(`[server] ${repo}#${number}: failed to withdraw session ${sid}'s refused merge approval: ${err instanceof Error ? err.message : String(err)}`);
+        return jsonOk(c, { error: `${outcome.refusal} (and withdrawing the approval failed, so it is still recorded)`, ...(outcome.code ? { code: outcome.code } : {}) }, outcome.status);
+      }
+    }
+    return jsonOk(c, { error: outcome.refusal, ...(outcome.code ? { code: outcome.code } : {}) }, outcome.status);
+  });
+
+  /**
+   * `claws_publish_file`: pull one file out of this session's pod and keep it
+   * on the Claws side for the user to download from the session page. Session
+   * only, like the gate writes above: a headless agent has no session page.
+   */
+  app.post("/api/sessions/:sid/files", sessionOwnTokenMiddleware, async (c) => {
+    const sid = c.req.param("sid") ?? "";
+    if (!/^[a-f0-9]+$/.test(sid)) return jsonOk(c, { error: "Session not found" }, 404);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return jsonOk(c, { error: "Invalid JSON body" }, 400); }
+    const { path: podPath, name } = (body ?? {}) as { path?: unknown; name?: unknown };
+    if (typeof podPath !== "string" || !podPath.trim()) return jsonOk(c, { error: "path is required" }, 400);
+    if (name !== undefined && typeof name !== "string") return jsonOk(c, { error: "name must be a string" }, 400);
+    const displayName = sanitizeUploadFilename(name?.trim() || podPath);
+    const tooLarge = (size?: number) => jsonOk(c, {
+      error: `${size === undefined ? "File is too large" : `File is ${formatBytes(size)}`} — the per-file limit is 10 MB`,
+    }, 413);
+    const fetched = await getSessionBackend().fetchFile(sid, podPath);
+    if (!fetched.ok) {
+      switch (fetched.reason) {
+        case "not-found":
+        case "not-running": return jsonOk(c, { error: "Session not found or not running" }, 404);
+        case "file-not-found": return jsonOk(c, { error: `No file at ${podPath} in this session${fetched.detail ? ` (${fetched.detail})` : ""}` }, 404);
+        case "outside-home": return jsonOk(c, { error: "The file must be inside this session's home directory" }, 400);
+        case "too-large": return tooLarge(fetched.size);
+        case "unsupported": return jsonOk(c, { error: "This session's pod predates file publishing; end and revive the session to publish files" }, 409);
+        case "unavailable": return jsonOk(c, { error: `Session runtime unavailable${fetched.detail ? `: ${fetched.detail}` : ""}` }, 503);
+      }
+    }
+    const stored = await storeSessionFile(sid, displayName, fetched.stream);
+    if (!stored.ok) {
+      if (stored.reason === "too-large") return tooLarge();
+      return jsonOk(c, { error: "Failed to store the file" }, 500);
+    }
+    const view = describeSessionFile(stored.row);
+    log.info(`[server] Session ${sid}: published ${view.name} (${view.size} bytes) as ${view.id}`);
+    const renamed = view.name !== stored.requestedName;
+    if (renamed) log.info(`[server] Session ${sid}: ${stored.requestedName} was already published, stored as ${view.name}`);
+    return jsonOk(c, {
+      ok: true, id: view.id, name: view.name, size: view.size, url: view.url, page: clawsIssues.dashboardSessionUrl(sid),
+      ...(renamed ? {
+        renamed: true,
+        requested_name: stored.requestedName,
+        note: `A file named ${stored.requestedName} was already published in this session, so this one was published as ${view.name}. Give each revision its own descriptive name.`,
+      } : {}),
+    });
+  });
+
+  /**
+   * Planner tool submissions (`src/planner-tools.ts`). The run id is the only
+   * handle: it is minted per planner invocation by `withPlannerRun` and names
+   * one issue and stage, so these routes cannot write anywhere else. Nothing is
+   * published here — the refiner reads the submission once the run ends.
+   */
+  // Serves only in-process planner runs: an agent pod's runs live in the pod,
+  // which serves these same routes on its own loopback listener
+  // (`src/planner-run-listener.ts`).
+  app.post("/api/planner-runs/:id/plan", apiAuthMiddleware, plannerRuns.plannerRunHandler(plannerRuns.submitPlan));
+  app.post("/api/planner-runs/:id/outcome", apiAuthMiddleware, plannerRuns.plannerRunHandler(plannerRuns.submitOutcome));
+  app.post("/api/planner-runs/:id/step-back", apiAuthMiddleware, plannerRuns.plannerRunHandler(plannerRuns.submitStepBack));
+  app.post("/api/planner-runs/:id/followup", apiAuthMiddleware, plannerRuns.plannerRunHandler(plannerRuns.submitFollowupVerdict));
+  app.post("/api/planner-runs/:id/keep-plan", apiAuthMiddleware, plannerRuns.plannerRunHandler(plannerRuns.submitKeepPlan));
+  app.post("/api/planner-runs/:id/alert-triage", apiAuthMiddleware, plannerRuns.plannerRunHandler(plannerRuns.submitAlertTriage));
+
+  /**
+   * Open PRs for a managed repo, forge-aware. Backs the `claws_open_prs` MCP
+   * tool for the stdio server, which cannot import `github.js` (#3062).
+   */
+  app.get("/api/open-prs", apiAuthMiddleware, async (c) => {
+    const repo = c.req.query("repo") ?? "";
+    if (!repo) {
+      return jsonOk(c, { error: "repo is required" }, 400);
+    }
+    try {
+      const prs = await listOpenPrsForManagedRepo(repo);
+      if (!prs) {
+        return jsonOk(c, { error: `${repo} is not a repo Claws manages` }, 404);
+      }
+      return jsonOk(c, prs);
+    } catch (err) {
+      return jsonOk(c, { error: err instanceof Error ? err.message : String(err) }, 502);
+    }
+  });
+
+  /**
+   * A Forgejo Actions run's job logs as readable text, read with the bot token.
+   * Backs the `claws_forgejo_job_logs` MCP tool, so sessions read Forgejo CI
+   * failures with no token or capability grant (#clw_01M4BYY8SZ9CY5NBC20ZHAPXFW).
+   */
+  app.get("/api/forgejo/job-logs", apiAuthMiddleware, async (c) => {
+    const repo = c.req.query("repo") ?? "";
+    const runRaw = c.req.query("run") ?? "";
+    const jobRaw = c.req.query("job");
+    const allStepsRaw = c.req.query("all_steps");
+    const stepRaw = c.req.query("step");
+    const grep = c.req.query("grep");
+    const contextRaw = c.req.query("context");
+    if (!repo) return jsonOk(c, { error: "repo is required" }, 400);
+    if (!/^\d+$/.test(runRaw)) return jsonOk(c, { error: "run must be a non-negative integer (the run number in /actions/runs/<n>)" }, 400);
+    if (jobRaw !== undefined && !jobRaw.trim()) return jsonOk(c, { error: "job must be a 0-based job index or a job name" }, 400);
+    if (allStepsRaw !== undefined && allStepsRaw !== "true" && allStepsRaw !== "false") {
+      return jsonOk(c, { error: "all_steps must be true or false" }, 400);
+    }
+    if (stepRaw !== undefined && !stepRaw.trim()) return jsonOk(c, { error: "step must be a 0-based step index or part of a step name" }, 400);
+    if (grep !== undefined && (grep.length < 1 || grep.length > 200)) return jsonOk(c, { error: "grep must be 1-200 characters" }, 400);
+    if (contextRaw !== undefined && (!/^\d+$/.test(contextRaw) || Number(contextRaw) > 20)) {
+      return jsonOk(c, { error: "context must be an integer from 0 to 20" }, 400);
+    }
+    const run = Number(runRaw);
+    const job = jobRaw === undefined ? undefined : /^\d+$/.test(jobRaw) ? Number(jobRaw) : jobRaw;
+    const step = stepRaw === undefined ? undefined : /^\d+$/.test(stepRaw) ? Number(stepRaw) : stepRaw;
+    const context = contextRaw === undefined ? undefined : Number(contextRaw);
+    try {
+      const result = await fetchForgejoJobLogs({ repo, run, job, allSteps: allStepsRaw === "true", step, grep, context });
+      const text = await guardContent(result.text, { repo, source: `ci-log (run ${run})`, itemNumber: 0 });
+      return jsonOk(c, { text, truncated: result.truncated });
+    } catch (err) {
+      if (err instanceof ForgejoJobLogsError) return jsonOk(c, { error: err.message }, err.status);
+      return jsonOk(c, { error: err instanceof Error ? err.message : String(err) }, 502);
+    }
+  });
+
+  // Alert bridges' consolidated alert issue (docs/issue-tracker.md "Alert
+  // bridges"). Only ever `alertBridgeAuthMiddleware`, never
+  // `apiAuthMiddleware`: the per-repo bridge token reaches these routes
+  // and nothing else, and an agent token cannot reach them at all.
+  app.get("/api/alert-bridge/:owner/:name/issues", alertBridgeAuthMiddleware, alertBridge.listBridgeIssuesHandler);
+  app.post("/api/alert-bridge/:owner/:name/issues", alertBridgeAuthMiddleware, alertBridge.createBridgeIssueHandler);
+  app.patch("/api/alert-bridge/:owner/:name/issues/:id", alertBridgeAuthMiddleware, alertBridge.updateBridgeIssueHandler);
+  app.post("/api/alert-bridge/:owner/:name/alerts/events", alertBridgeAuthMiddleware, alertBridge.alertEventsHandler);
+
+  // Issue filers (docs/issue-tracker.md "Issue filers"). Only ever
+  // `issueFilerAuthMiddleware`, never `apiAuthMiddleware`: the per-repo filer
+  // token reaches these routes and nothing else, and no agent token or
+  // operator session reaches them at all.
+  app.get("/api/issue-filer/:owner/:name/issues", issueFilerAuthMiddleware, issueFiler.lookupFilerIssueHandler);
+  app.post("/api/issue-filer/:owner/:name/issues", issueFilerAuthMiddleware, issueFiler.createFilerIssueHandler);
+  app.patch("/api/issue-filer/:owner/:name/issues/:id", issueFilerAuthMiddleware, issueFiler.updateFilerIssueHandler);
+  app.post(
+    "/api/issue-filer/:owner/:name/issues/:id/attachments",
+    issueFilerAuthMiddleware,
+    bodyLimit({
+      maxSize: MAX_FILER_ATTACHMENT_BYTES,
+      onError: (c) => {
+        c.header("Content-Type", "application/json");
+        return c.body(JSON.stringify({ error: "File too large (max 5 MiB)" }), 413);
+      },
+    }),
+    issueFiler.uploadFilerAttachmentHandler,
+  );
+
+  // One-shot completions (docs/completion-api.md). Only ever
+  // `completionAuthMiddleware`, never `apiAuthMiddleware`: the per-repo
+  // completion token reaches this route and nothing else, and no agent token
+  // or operator session reaches it at all.
+  app.post(
+    COMPLETION_PROXIED_ROUTE,
+    completionAuthMiddleware,
+    completionBodyLimit,
+    completionHandler,
+  );
+
+  /**
+   * File a native issue. Backs the `claws_create_issue` MCP tool for both
+   * interactive sessions and headless agents (#3286) — the write path every
+   * new issue is filed through
+   * (docs/issue-tracker.md). Mirrors the `/issues` dashboard form's label
+   * rules; unlike the form, `repos` is required, since an agent-filed issue
+   * with none would sit unplanned with nothing pointing an implementer at it.
+   *
+   * Before filing it dedupes against open native issues (docs/issue-tracker.md
+   * "Dedupe on create"): an open issue with the same `dedupeKey` in the same
+   * primary repo is returned instead, for any caller; a strong similarity
+   * match (`issue-dedupe.ts`) is returned instead for a headless caller, and
+   * blocks a session caller until it passes `force: true`.
+   *
+   * `sessionId` in the body only attributes the issue (author, source, the
+   * dedupe reply): `apiAuthMiddleware` accepts a token every agent holds, so
+   * nothing proves the caller is that session. An up-front approval
+   * (`approveThrough`), which approves on the operator's behalf, is refused
+   * here and accepted only on `POST /api/sessions/:sid/issues`, behind the
+   * session's own token. A `requirements` field from an older session pod is
+   * ignored and logged: agent and session issues skip the requirements stage.
+   */
+  app.post("/api/issues", apiAuthMiddleware, (c) => createIssueFromRequest(c, null));
+
+  /**
+   * `POST /api/issues` for an interactive session, behind its own token
+   * (`sessionOwnTokenMiddleware`), so `:sid` is proven and the issue may be
+   * filed approved (`approveThrough`). The body's `sessionId` is ignored for `:sid`.
+   */
+  app.post("/api/sessions/:sid/issues", sessionOwnTokenMiddleware, async (c) => {
+    const sid = c.req.param("sid") ?? "";
+    if (!/^[a-f0-9]+$/.test(sid)) return jsonOk(c, { error: "Session not found" }, 404);
+    const live = await getSessionBackend().getLive(sid);
+    if (!live.ok) return jsonOk(c, { error: "Session not found" }, 404);
+    return createIssueFromRequest(c, sid);
+  });
+
+  /**
+   * The body of both issue-create routes. `verifiedSid` is the session the
+   * caller proved it is, or null on `POST /api/issues`, where only an
+   * unverified `sessionId` attribution is taken from the body.
+   */
+  async function createIssueFromRequest(c: Context<Env>, verifiedSid: string | null): Promise<Response> {
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return jsonOk(c, { error: "Invalid JSON body" }, 400); }
+    const { title, body: issueBody, repos: reposInput, labels: labelsInput, sessionId: claimedSessionId, autoPromote, dedupeKey: dedupeKeyInput, force, origin, requirements, approveThrough } = (body ?? {}) as {
+      title?: unknown; body?: unknown; repos?: unknown; labels?: unknown; sessionId?: unknown; autoPromote?: unknown;
+      dedupeKey?: unknown; force?: unknown; origin?: unknown; requirements?: unknown; approveThrough?: unknown;
+    };
+    const sessionId = verifiedSid ?? claimedSessionId;
+    if (autoPromote !== undefined && typeof autoPromote !== "boolean") {
+      return jsonOk(c, { error: "autoPromote must be a boolean when given" }, 400);
+    }
+    // How far the new issue is approved at filing (#clw_01M5VW14RKAAGS6VZ5PCKQXB9F):
+    // `plan` set before a plan exists is the plan's pre-approval.
+    if (approveThrough !== undefined && approveThrough !== null && !isApprovedThrough(approveThrough)) {
+      return jsonOk(c, { error: `approveThrough must be one of ${APPROVAL_GATES.join(", ")} when given` }, 400);
+    }
+    // An approval given up front is the operator's, so only an interactive
+    // session (whose operator said so), proven by its own token, may give
+    // one. A headless agent has no operator to ask; approving its own issue
+    // would skip every human gate (#clw_01M3BWP83BQRXE06NWW1GKYT2S).
+    const upFront = isApprovedThrough(approveThrough) && approveThrough !== "none" ? approveThrough : null;
+    if (upFront && !verifiedSid) {
+      return jsonOk(c, { error: "approveThrough can only be set from an interactive session, through /api/sessions/:sid/issues; a headless agent's issue waits for the usual gates" }, 400);
+    }
+    if (force !== undefined && typeof force !== "boolean") {
+      return jsonOk(c, { error: "force must be a boolean when given" }, 400);
+    }
+    // Agent and session issues skip the requirements stage, so a record an
+    // older session pod still sends is dropped rather than refusing the filing.
+    if (requirements !== undefined && requirements !== null) {
+      log.info(`[issues] ignoring a requirements record supplied with a new issue (${verifiedSid ? `session ${verifiedSid}` : "a headless agent"}): agent and session issues plan from their text`);
+    }
+    let dedupeKey: string | undefined;
+    if (dedupeKeyInput !== undefined && dedupeKeyInput !== null) {
+      dedupeKey = typeof dedupeKeyInput === "string" ? dedupeKeyInput.trim().toLowerCase() : "";
+      if (!DEDUPE_KEY_PATTERN.test(dedupeKey)) {
+        return jsonOk(c, { error: "dedupeKey must be 2-100 characters of a-z, 0-9, '.', '_' or '-', starting with a letter or digit" }, 400);
+      }
+    }
+    if (typeof title !== "string" || !title.trim()) {
+      return jsonOk(c, { error: "title must be a non-empty string" }, 400);
+    }
+    if (!Array.isArray(reposInput) || reposInput.length === 0 || !reposInput.every((r) => typeof r === "string")) {
+      return jsonOk(c, { error: "repos must be a non-empty array of repository full names" }, 400);
+    }
+    const managed = new Map((await listRepos()).map((r) => [r.fullName.toLowerCase(), r.fullName]));
+    const repos: string[] = [];
+    for (const raw of reposInput as string[]) {
+      const canonical = managed.get(raw.toLowerCase());
+      if (!canonical) return jsonOk(c, { error: `${raw} is not a repo Claws manages` }, 400);
+      repos.push(canonical);
+    }
+    // Same rule as the dashboard form: state labels are not offered, since
+    // lifecycle is set by moving the issue rather than by a label a caller
+    // sends. The retired gate labels are `approveThrough` now.
+    const labelsWanted = Array.isArray(labelsInput) ? labelsInput.filter((l): l is string => typeof l === "string") : [];
+    const labels = labelsWanted.filter((l) => l in config.LABEL_SPECS && !isStateLabel(l) && !(RETIRED_GATE_LABELS as readonly string[]).includes(l));
+    const ignoredLabels = labelsWanted.filter((l) => !labels.includes(l));
+    const fromSession = typeof sessionId === "string" && !!sessionId;
+    const authorLogin = fromSession
+      ? (config.ALLOWED_ACTORS[0] ?? clawsIssues.CLAWS_NATIVE_LOGIN)
+      : clawsIssues.CLAWS_NATIVE_LOGIN;
+    const trimmedTitle = title.trim();
+    const bodyText = typeof issueBody === "string" ? issueBody : "";
+    const primaryRepo = clawsIssues.primaryRepo({ repos });
+    const caller = {
+      title: trimmedTitle,
+      repos,
+      dedupeKey,
+      origin: typeof origin === "string" && /^[\w.-]+\/[\w.-]+#\S{1,40}$/.test(origin.trim())
+        ? origin.trim()
+        : fromSession ? `session ${sessionId as string}` : "a headless agent",
+    };
+    const keptResult = (kept: ClawsIssueRecord, matchedBy: "dedupeKey" | "similarity"): Record<string, unknown> => ({
+      deduplicated: true,
+      matchedBy,
+      id: kept.id,
+      ref: `#${kept.id}`,
+      url: clawsIssues.dashboardIssueUrl(kept.id),
+      title: kept.title,
+      repos: kept.repos,
+      primaryRepo: clawsIssues.primaryRepo(kept),
+      // The approval the kept issue actually holds: a requested `approveThrough` is not applied to it.
+      approvedThrough: kept.approved_through ?? "none",
+    });
+    // An alert inbox is never a dedupe match: a dedicated issue for one of its sections is separate.
+    const isInboxRecord = (r: { title: string; filed_title: string | null; labels: string[]; body: string; repos: string[] }): boolean =>
+      isAlertInbox({ title: r.title, filedTitle: r.filed_title, labels: r.labels, body: r.body }, getRepoConfig(clawsIssues.primaryRepo(r))?.alertBridge);
+    const result = await serialiseIssueCreate(async (): Promise<Record<string, unknown>> => {
+      // 1. The caller's own key names the work: honoured for every caller,
+      //    with no `force` bypass. An alert inbox never counts as the match.
+      if (dedupeKey) {
+        const kept = await clawsIssues.findOpenIssueByDedupeKey(primaryRepo, dedupeKey);
+        if (kept && !isInboxRecord(kept)) {
+          await postDedupeAuditComment(kept, caller);
+          return keptResult(kept, "dedupeKey");
+        }
+      }
+      // 2. Title similarity plus shared key terms against every open issue
+      //    touching these repos — skipped when the caller passed `force`.
+      //    A dedupeKey is a caller-declared identity, so two different keys are
+      //    two pieces of work (the alert bridge routes each alertname to the
+      //    issue holding its key): a keyed call never similarity-matches an
+      //    issue holding another key, for session and headless callers alike.
+      //    An issue with no key still matches, and the refiner keys it later.
+      //    Alert inboxes are never candidates, whatever their current title.
+      if (!force) {
+        // Filter the input, not the ranked output, so the top-N cut only sees
+        // eligible records.
+        const eligible = (await clawsIssues.listOpenIssuesTouching(repos)).filter(
+          (r) => !isInboxRecord(r) && (!dedupeKey || r.dedupe_key === null || r.dedupe_key === dedupeKey),
+        );
+        const candidates = findDuplicateCandidates({ title: trimmedTitle, body: bodyText, repos }, eligible);
+        const best = candidates[0];
+        if (best?.strong) {
+          const listed = candidates.map((m) => ({
+            id: m.record.id,
+            ref: `#${m.record.id}`,
+            url: clawsIssues.dashboardIssueUrl(m.record.id),
+            title: m.record.title,
+            repos: m.record.repos,
+            similarity: Math.round(m.similarity * 100) / 100,
+            sharedKeyTerms: m.sharedKeyTerms,
+          }));
+          if (fromSession) {
+            return {
+              created: false,
+              needsForce: true,
+              candidates: listed,
+              note: "An open issue looks like the same work. Reference it instead, or call again with force: true if this is different work.",
+            };
+          }
+          await postDedupeAuditComment(best.record, caller);
+          return { ...keptResult(best.record, "similarity"), candidates: listed };
+        }
+      }
+      // 3. Nothing open covers it: file it. An agent or session issue skips
+      //    the requirements stage: the dispatcher promotes it to Planning with
+      //    no record on its next tick (unless `autoPromote` is false), and the
+      //    planner plans from its text.
+      const id = await clawsIssues.createIssue({
+        title: trimmedTitle,
+        body: bodyText,
+        authorLogin,
+        repos,
+        labels,
+        source: fromSession ? "session" : "agent",
+        autoPromote,
+        dedupeKey,
+        ...(upFront && verifiedSid ? { approvedThrough: upFront, approvedBy: sessionApprover(verifiedSid) } : {}),
+      });
+      const created: Record<string, unknown> = { id, ref: `#${id}`, url: clawsIssues.dashboardIssueUrl(id), repos, labels, ignoredLabels, primaryRepo };
+      if (upFront) created.approvedThrough = upFront;
+      if (dedupeKey) created.dedupeKey = dedupeKey;
+      // Multi-repo issues (docs/issue-tracker.md "Repositories and the primary
+      // repository"): the primary repo owns planning, and one plan covers every
+      // named repo's PRs, run one at a time — no companion issues are filed.
+      if (repos.length > 1) {
+        created.note = `${primaryRepo} is this issue's primary repository: it owns planning, and one plan will cover the PRs needed across ${repos.join(", ")}, run one at a time, with no companion issues.`;
+      }
+      return created;
+    });
+    return jsonOk(c, result);
+  }
+
+  /**
+   * Record a friction note. Backs the `claws_note_friction` MCP tool: it
+   * stores one untriaged row and nothing else — no issue, comment, gate event
+   * or board change. Any pod token reaches it, so lengths are capped here.
+   */
+  app.post("/api/friction-notes", apiAuthMiddleware, async (c) => {
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return jsonOk(c, { error: "Invalid JSON body" }, 400); }
+    const { repo, category, text, reference, sessionId, taskId, origin } = (body ?? {}) as {
+      repo?: unknown; category?: unknown; text?: unknown; reference?: unknown; sessionId?: unknown; taskId?: unknown; origin?: unknown;
+    };
+    if (typeof repo !== "string" || !repo.trim()) return jsonOk(c, { error: "repo must be a repository full name" }, 400);
+    const canonical = (await listRepos()).find((r) => r.fullName.toLowerCase() === repo.trim().toLowerCase())?.fullName;
+    if (!canonical) return jsonOk(c, { error: `${repo} is not a repo Claws manages` }, 400);
+    if (typeof category !== "string" || !(FRICTION_CATEGORIES as readonly string[]).includes(category)) {
+      return jsonOk(c, { error: `category must be one of ${FRICTION_CATEGORIES.join(", ")}` }, 400);
+    }
+    const noteText = typeof text === "string" ? text.replace(/\s+/g, " ").trim() : "";
+    if (!noteText || noteText.length > FRICTION_TEXT_MAX) {
+      return jsonOk(c, { error: `text must be 1-${FRICTION_TEXT_MAX} characters` }, 400);
+    }
+    if (reference !== undefined && reference !== null && (typeof reference !== "string" || reference.trim().length > FRICTION_REFERENCE_MAX)) {
+      return jsonOk(c, { error: `reference must be at most ${FRICTION_REFERENCE_MAX} characters` }, 400);
+    }
+    const id = await insertFrictionNote({
+      repo: canonical,
+      category,
+      text: noteText,
+      reference: typeof reference === "string" && reference.trim() ? reference.trim() : null,
+      taskId: typeof taskId === "number" && Number.isInteger(taskId) && taskId > 0 ? taskId : null,
+      sessionId: typeof sessionId === "string" && sessionId ? sessionId.slice(0, 100) : null,
+      origin: typeof origin === "string" && origin ? origin.slice(0, 200) : null,
+    });
+    return jsonOk(c, { ok: true, id });
+  });
+
+  /**
+   * Comment on a native issue. Backs the `claws_comment_on_issue` MCP tool
+   * (#3286) — a session posts as the operator, with no "Automated by Claws"
+   * marker, so the refiner reads it as feedback exactly like a dashboard
+   * comment; a headless agent posts through the `github.ts` façade, which
+   * stamps the marker itself.
+   */
+  app.post("/api/issues/:id/comments", apiAuthMiddleware, async (c) => {
+    const loaded = await loadNativeIssue(c, { forWrite: true });
+    if (!loaded?.record) return jsonOk(c, { error: "Issue not found" }, 404);
+    let parsed: unknown;
+    try { parsed = await c.req.json(); } catch { return jsonOk(c, { error: "Invalid JSON body" }, 400); }
+    const { body: commentBody, sessionId } = (parsed ?? {}) as { body?: unknown; sessionId?: unknown };
+    if (typeof commentBody !== "string" || !commentBody.trim()) {
+      return jsonOk(c, { error: "body must be a non-empty string" }, 400);
+    }
+    const repo = eventRepo(loaded.record);
+    if (typeof sessionId === "string" && sessionId) {
+      await clawsIssues.commentOnIssue(repo, loaded.id, commentBody, config.ALLOWED_ACTORS[0] ?? clawsIssues.CLAWS_NATIVE_LOGIN);
+    } else {
+      await ghCommentOnIssue(repo, loaded.id, commentBody);
+    }
+    return jsonOk(c, { ok: true, id: loaded.id, url: clawsIssues.dashboardIssueUrl(loaded.id) });
+  });
+
+  /**
+   * Long-poll for Claws-originated GitHub state changes (#2832). Backs the
+   * `claws_wait_for_change` MCP tool, so a session driving the /ship skill can
+   * block until Claws acts instead of sleeping and re-polling `gh`. One
+   * request is held at most 270 s; the tool chains 240 s requests into a wait
+   * of up to an hour, so no single request outlives a proxy or fetch timeout.
+   * `interrupted: true` means this process is shutting down.
+   */
+  app.get("/api/events", apiAuthMiddleware, async (c) => {
+    const afterRaw = c.req.query("after");
+    let after: number | undefined;
+    if (afterRaw !== undefined && afterRaw !== "") {
+      const parsed = Number(afterRaw);
+      if (!Number.isInteger(parsed) || parsed < 0) {
+        return jsonOk(c, { error: "after must be a non-negative integer" }, 400);
+      }
+      after = parsed;
+    }
+
+    const split = (v: string | undefined): string[] =>
+      (v ?? "").split(",").map((p) => p.trim()).filter((p) => p.length > 0);
+
+    const items: config.IssueRef[] = [];
+    for (const raw of split(c.req.query("items"))) {
+      const ref = canonicalIssueRef(raw);
+      if (ref === null || (typeof ref === "number" && ref <= 0)) {
+        return jsonOk(c, { error: `items must be issue references (got "${raw}")` }, 400);
+      }
+      if (items.length < 20) items.push(ref);
+    }
+
+    // Each entry is `kind` or `kind:detail` (github-events.ts parseKindFilter).
+    const kinds: KindFilter[] = [];
+    for (const raw of split(c.req.query("kinds"))) {
+      const parsed = parseKindFilter(raw);
+      if (!parsed) {
+        const kind = raw.split(":")[0]!.trim();
+        const error = (GITHUB_EVENT_KINDS as string[]).includes(kind)
+          ? `empty detail in event kind "${raw}"`
+          : `unknown event kind "${kind}"`;
+        return jsonOk(c, { error }, 400);
+      }
+      kinds.push(parsed);
+    }
+
+    const timeoutRaw = Number(c.req.query("timeout") ?? "240");
+    const timeoutSec = Number.isFinite(timeoutRaw) ? Math.min(270, Math.max(0, timeoutRaw)) : 240;
+
+    const filter: EventFilter = {};
+    const repo = c.req.query("repo");
+    if (repo) filter.repo = repo;
+    if (items.length > 0) filter.items = items;
+    if (kinds.length > 0) filter.kinds = kinds;
+
+    return jsonOk(c, await waitForEvents(after, filter, timeoutSec * 1000));
+  });
+
+  /**
+   * claws-state MCP over streamable HTTP for k8s-pod sessions (#3056). No auth
+   * middleware: the handler accepts only the per-session bearer token for :id.
+   * A `claws_wait_for_change` call is held up to an hour, answered over SSE
+   * with a keepalive comment every 25 s (claws-state-http.ts) so no idle
+   * timeout between the pod and here fires; `server.requestTimeout` bounds
+   * only receiving the request, not the response.
+   */
+  app.post("/mcp/sessions/:id", createClawsStateMcpHandler(app));
+  app.get("/mcp/sessions/:id", () => mcpMethodNotAllowed());
+  app.delete("/mcp/sessions/:id", () => mcpMethodNotAllowed());
+
+  /**
+   * A session pod's exit report (#3311): the process's exit code and final
+   * output, POSTed by the pod's terminal server just before it exits so the
+   * output outlives the pod. No auth middleware: the backend accepts only the
+   * session's own terminal token. Never log the token.
+   */
+  app.post("/session-pods/:id/exit", async (c) => {
+    const id = c.req.param("id");
+    if (!/^[a-f0-9]+$/.test(id)) return c.body(null, 404);
+    const bearer = /^Bearer\s+(\S+)\s*$/.exec(c.req.header("authorization") ?? "");
+    if (!bearer) return c.body(null, 401);
+    let raw: string;
+    try {
+      // Streams with a running byte count, so a chunked body cannot be buffered past the cap.
+      raw = await readTextBody(c, SESSION_EXIT_REPORT_MAX_BYTES);
+    } catch {
+      return c.body(null, 413);
+    }
+    let parsed: z.infer<typeof SessionExitReportSchema>;
+    try {
+      const result = SessionExitReportSchema.safeParse(JSON.parse(raw));
+      if (!result.success) return c.body(null, 400);
+      parsed = result.data;
+    } catch {
+      return c.body(null, 400);
+    }
+    const outcome = await getSessionBackend().recordPodExit(id, bearer[1], parsed);
+    return c.body(null, outcome === "ok" ? 204 : outcome === "denied" ? 401 : 503);
+  });
+
+  // A session pod fetches the files attached on its New Session form before its agent starts.
+  app.get("/api/sessions/:sid/attachments/:aid", sessionOwnTokenMiddleware, async (c) => {
+    const sid = c.req.param("sid");
+    const aid = c.req.param("aid");
+    const row = isSessionAttachmentId(aid) ? await getSessionAttachment(aid) : undefined;
+    if (!row || row.session_id !== sid) return jsonOk(c, { error: "Attachment not found" }, 404);
+    let opened: Awaited<ReturnType<typeof openSessionAttachment>>;
+    try {
+      opened = await openSessionAttachment(row, c.req.raw.signal);
+    } catch (err) {
+      log.warn(`[server] Session ${sid}: could not read attachment ${aid}: ${err}`);
+      return jsonOk(c, { error: "Attachment store unavailable" }, 502);
+    }
+    if (!opened) return jsonOk(c, { error: "Attachment file missing" }, 404);
+    c.header("Content-Type", "application/octet-stream");
+    c.header("Content-Length", String(opened.size));
+    c.header("Cache-Control", "no-store");
+    return c.body(opened.body, 200);
+  });
+
+  /**
+   * The work row an agent-pod API request speaks for, or the error to answer
+   * with: 404 for a malformed :rowId, 401 unless the bearer's SHA-256 is the
+   * row's `agent_mcp_token_sha256` while that token is live, 503 when the
+   * database is unreachable. Never log the token.
+   */
+  async function authenticateAgentPod(c: Ctx): Promise<{ row: NonNullable<Awaited<ReturnType<typeof getWorkRow>>> } | { error: Response }> {
+    const rowIdParam = c.req.param("rowId") ?? "";
+    if (!/^[1-9][0-9]{0,15}$/.test(rowIdParam)) return { error: c.body(null, 404) };
+    const bearer = /^Bearer\s+(\S+)\s*$/.exec(c.req.header("authorization") ?? "");
+    if (!bearer) return { error: jsonOk(c, { error: "unauthorized" }, 401) };
+    let row: Awaited<ReturnType<typeof getWorkRow>>;
+    try {
+      row = await getWorkRow(Number(rowIdParam));
+    } catch {
+      // Nothing ran yet, so the pod may retry.
+      return { error: jsonOk(c, { error: "database unavailable" }, 503) };
+    }
+    if (!row?.agent_mcp_token_sha256 || !agentPodTokenLive(row)
+      || !safeCompare(hashAgentMcpToken(bearer[1]), row.agent_mcp_token_sha256)) {
+      return { error: jsonOk(c, { error: "unauthorized" }, 401) };
+    }
+    return { row };
+  }
+
+  /**
+   * The agent-pod ops API (#clw_01M386P9KPDEVV33TKY512HHBC): an agent pod's
+   * `db-remote.ts` calls one enumerated op from `agent-pod-ops.ts` per
+   * request, body `{ "args": [...] }`, reply `{ "result": ... }`. No auth
+   * middleware: only the bearer whose SHA-256 is row :rowId's
+   * `agent_mcp_token_sha256`, while that token is live, is accepted. Never
+   * log the token.
+   */
+  app.post("/agent-pods/:rowId/ops/:op", async (c) => {
+    const auth = await authenticateAgentPod(c);
+    if ("error" in auth) return auth.error;
+    const { row } = auth;
+    let raw: string;
+    try {
+      raw = await readTextBody(c, AGENT_POD_OPS_MAX_BYTES);
+    } catch {
+      return jsonOk(c, { error: "request body too large" }, 413);
+    }
+    let args: unknown;
+    try {
+      const parsed = decodeWire(raw);
+      args = typeof parsed === "object" && parsed !== null ? (parsed as { args?: unknown }).args : undefined;
+    } catch {
+      return jsonOk(c, { error: "invalid JSON" }, 400);
+    }
+    const outcome = await executeAgentPodOp(row, c.req.param("op"), args);
+    c.header("Content-Type", "application/json");
+    if (outcome.status !== 200) return c.body(JSON.stringify({ error: outcome.error }), outcome.status);
+    return c.body(encodeWire({ result: outcome.result }), 200);
+  });
+
+  /**
+   * A native issue attachment's bytes for an agent pod, whose HOME has no
+   * `issue-attachments/` (`db-remote.ts`' remoteAttachmentReader). Streamed,
+   * never through the JSON ops API. Same auth as the ops API and, like the
+   * `getClawsIssueAttachment` op, unscoped beyond it: the pod checks the row
+   * belongs to the issue it is processing before asking.
+   */
+  app.get("/agent-pods/:rowId/attachments/:attachmentId", async (c) => {
+    const auth = await authenticateAgentPod(c);
+    if ("error" in auth) return auth.error;
+    const parsed = parseAttachmentUrl(`/issues/${PENDING_URL_SEGMENT}/attachments/${c.req.param("attachmentId")}`);
+    if (!parsed) return textPlain(c, "attachment not found", 404);
+    const found = await readIssueAttachment(parsed.attachmentId);
+    if (!found) return textPlain(c, "attachment not found", 404);
+    let opened: Awaited<ReturnType<typeof openIssueAttachment>>;
+    try {
+      opened = await openIssueAttachment(found);
+    } catch (err) {
+      log.warn(`[server] Attachment ${found.row.id} could not be read for an agent pod: ${err}`);
+      return textPlain(c, "attachment store unavailable", 502);
+    }
+    if (!opened) return textPlain(c, "attachment file missing", 404);
+    // The raw stored type, as the in-process read returns: no browser renders this.
+    c.header("Content-Type", found.row.content_type);
+    c.header("Content-Length", String(opened.size));
+    c.header("X-Content-Type-Options", "nosniff");
+    c.header("Cache-Control", "no-store");
+    return c.body(opened.body, 200);
+  });
+
+  // ── Authenticated routes ──
+
+  app.post("/trigger/:job", authMiddleware, async (c) => {
+    const jobName = c.req.param("job");
+    const result = await controller.triggerJob(jobName);
+    // `queued`: the controller did not answer in time; it runs the trigger when it does.
+    const status = result === "started" ? 200 : result === "queued" ? 202 : result === "unknown" ? 404 : 409;
+    return jsonOk(c, { result }, status);
+  });
+
+  app.post("/pause/:job", authMiddleware, async (c) => {
+    const jobName = c.req.param("job");
+    const paused = await controller.pausedJobs();
+    let result: string;
+    if (paused.has(jobName)) {
+      if (!await controller.resumeJob(jobName)) {
+        return jsonOk(c, { result: "unknown" }, 404);
+      }
+      result = "resumed";
+    } else {
+      if (!await controller.pauseJob(jobName)) {
+        return jsonOk(c, { result: "unknown" }, 404);
+      }
+      result = "paused";
+    }
+    return jsonOk(c, { result });
+  });
+
+  app.post("/cancel", authMiddleware, async (c) => {
+    return jsonOk(c, { result: await controller.cancelCurrentTask() });
+  });
+
+  app.post("/api/verify/run", authMiddleware, async (c) => {
+    try {
+      const report = await runConnectivityVerification();
+      const wantsJson = (c.req.header("accept") ?? "").includes("application/json");
+      if (wantsJson) {
+        return jsonOk(c, report);
+      }
+      return c.redirect("/config#activation", 303);
+    } catch (err) {
+      return jsonOk(c, { error: String(err) }, 500);
+    }
+  });
+
+  // Claude accounts are database state (claude-accounts.ts), managed here on
+  // the web tier; the controller reads a change on its next refresh. No
+  // response ever carries a token.
+  const CLAUDE_ACCOUNT_LABEL_MAX = 64;
+  const readAccountLabel = (raw: unknown): string | null | undefined => {
+    if (raw === undefined || raw === null) return undefined;
+    if (typeof raw !== "string") return null;
+    const label = raw.trim();
+    return label.length > CLAUDE_ACCOUNT_LABEL_MAX ? null : label;
+  };
+  app.post("/api/claude-accounts", authMiddleware, async (c) => {
+    const body = await c.req.json<{ id?: unknown; label?: unknown }>().catch(() => ({}) as { id?: unknown; label?: unknown });
+    const id = typeof body.id === "string" ? body.id.trim() : "";
+    if (!CLAUDE_ACCOUNT_ID_RE.test(id)) {
+      return jsonOk(c, { ok: false, error: "Id must be 1–32 lowercase letters, digits or dashes, starting with a letter or digit" }, 400);
+    }
+    const label = readAccountLabel(body.label);
+    if (label === null) return jsonOk(c, { ok: false, error: `Label must be at most ${CLAUDE_ACCOUNT_LABEL_MAX} characters` }, 400);
+    await refreshClaudeAccounts();
+    if (findClaudeAccount(id)) return jsonOk(c, { ok: false, error: `A Claude account "${id}" already exists` }, 409);
+    try {
+      await insertClaudeAccount(id, label || id);
+    } catch (err) {
+      await refreshClaudeAccounts();
+      if (findClaudeAccount(id)) return jsonOk(c, { ok: false, error: `A Claude account "${id}" already exists` }, 409);
+      throw err;
+    }
+    await refreshClaudeAccounts();
+    log.info(`[claude-accounts] Added Claude account "${id}" from the dashboard`);
+    return jsonOk(c, { ok: true, account: findClaudeAccount(id) ?? { id, label: label || id } });
+  });
+  app.patch("/api/claude-accounts/:id", authMiddleware, async (c) => {
+    const id = c.req.param("id");
+    const body = await c.req.json<{ label?: unknown }>().catch(() => ({}) as { label?: unknown });
+    const label = readAccountLabel(body.label);
+    if (label === null || label === undefined) return jsonOk(c, { ok: false, error: `Label must be a string of at most ${CLAUDE_ACCOUNT_LABEL_MAX} characters` }, 400);
+    if (!(await updateClaudeAccountLabel(id, label || id))) return jsonOk(c, { ok: false, error: `Unknown Claude account "${id}"` }, 404);
+    await refreshClaudeAccounts();
+    log.info(`[claude-accounts] Relabelled Claude account "${id}" from the dashboard`);
+    return jsonOk(c, { ok: true, account: findClaudeAccount(id) ?? { id, label: label || id } });
+  });
+  app.delete("/api/claude-accounts/:id", authMiddleware, async (c) => {
+    const id = c.req.param("id");
+    if (!(await deleteClaudeAccount(id))) return jsonOk(c, { ok: false, error: `Unknown Claude account "${id}"` }, 404);
+    // Its token went with the row; its holds and auth-expired latch go too.
+    // Past tasks keep their recorded account_used.
+    await clearProviderHolds(accountKey(id));
+    await clearProviderHolds(authExpiredKey(id));
+    await refreshProviderHolds();
+    log.info(`[claude-accounts] Removed Claude account "${id}" from the dashboard`);
+    return jsonOk(c, { ok: true });
+  });
+
+  const startClaudeLoginFor = async (c: Context, account: string): Promise<Response> => {
+    // An account added on the web tier a moment ago must be startable here.
+    await refreshClaudeAccounts();
+    if (!findClaudeAccount(account)) return jsonOk(c, { ok: false, error: `Unknown Claude account "${account}"` }, 404);
+    const r = await startClaudeLogin(account);
+    return jsonOk(c, r, r.ok ? 200 : 500);
+  };
+  const submitClaudeLoginCodeFor = async (c: Context, account: string): Promise<Response> => {
+    const body = await c.req.json<{ code?: string }>().catch(() => ({}) as { code?: string });
+    const r = await submitClaudeLoginCode(account, body.code ?? "");
+    return jsonOk(c, r, r.ok ? 200 : 400);
+  };
+  app.post("/api/claude-auth/:account/start", authMiddleware, (c) => startClaudeLoginFor(c, c.req.param("account")));
+  app.post("/api/claude-auth/:account/code", authMiddleware, (c) => submitClaudeLoginCodeFor(c, c.req.param("account")));
+  // Pre-multi-account routes, mapped to the first account; kept for one release.
+  const firstClaudeAccount = async (): Promise<string | undefined> => {
+    if (claudeAccountsStale()) await refreshClaudeAccounts();
+    return claudeAccounts()[0]?.id;
+  };
+  const noClaudeAccount = (c: Context): Response => jsonOk(c, { ok: false, error: "No Claude account exists" }, 404);
+  app.post("/api/claude-auth/start", authMiddleware, async (c) => {
+    const account = await firstClaudeAccount();
+    return account ? startClaudeLoginFor(c, account) : noClaudeAccount(c);
+  });
+  app.post("/api/claude-auth/code", authMiddleware, async (c) => {
+    const account = await firstClaudeAccount();
+    return account ? submitClaudeLoginCodeFor(c, account) : noClaudeAccount(c);
+  });
+  app.get("/api/claude-auth/status", authMiddleware, async (c) => {
+    if (claudeAccountsStale()) await refreshClaudeAccounts();
+    return jsonOk(c, getClaudeLoginStatus());
+  });
+
+  app.post("/api/codex-auth/start", authMiddleware, async (c) => {
+    const r = await startCodexLogin();
+    return jsonOk(c, r, r.ok ? 200 : 500);
+  });
+  app.get("/api/codex-auth/status", authMiddleware, (c) => jsonOk(c, getCodexLoginStatus()));
+
+  // pi's per-provider readiness from `pi auth check --no-refresh`; never carries a credential.
+  app.get("/api/pi-auth/providers", authMiddleware, async (c) => jsonOk(c, await piCredentialStatuses()));
+
+  app.get("/api/providers", authMiddleware, async (c) => {
+    const [providers, { agentAuthExpired }] = await Promise.all([controller.providerStatus(), controller.integrations()]);
+    function status(provider: "claude" | "codex" | "opencode" | "pi") {
+      const until = providers[provider].rateLimitedUntil;
+      return {
+        rateLimited: until !== null,
+        rateLimitedUntil: until !== null ? new Date(until).toISOString() : null,
+        authExpired: agentAuthExpired[provider],
+      };
+    }
+    const iso = (t: number | null) => (t !== null ? new Date(t).toISOString() : null);
+    // Claude per account; `claude.rateLimited` is true only when every account with a token is held.
+    const accounts = Object.fromEntries(Object.entries(providers.claude.accounts ?? {}).map(([id, a]) => [id, {
+      label: a.label,
+      tokenPresent: a.tokenPresent,
+      authExpired: a.authExpired,
+      rateLimited: a.rateLimited,
+      rateLimitedUntil: iso(a.rateLimitedUntil),
+      tierRateLimitedUntil: Object.fromEntries(Object.entries(a.tierRateLimitedUntil).map(([tier, t]) => [tier, iso(t)])),
+      lastUsedAt: iso(a.lastUsedAt),
+    }]));
+    return jsonOk(c, { claude: { ...status("claude"), accounts }, codex: status("codex"), opencode: status("opencode"), pi: status("pi") });
+  });
+
+  app.post("/api/providers/claude/accounts/:account/clear-rate-limit", authMiddleware, async (c) => {
+    if (claudeAccountsStale()) await refreshClaudeAccounts();
+    const account = findClaudeAccount(c.req.param("account"));
+    if (!account) return jsonOk(c, { ok: false, error: "unknown account" }, 400);
+    const cleared = await controller.clearRateLimit("claude", account.id);
+    if (cleared === "queued") return jsonOk(c, { ok: true, cleared: false, result: "queued" }, 202);
+    return jsonOk(c, { ok: true, cleared });
+  });
+
+  // For `claude`, clears the provider-wide hold and every account's.
+  app.post("/api/providers/:provider/clear-rate-limit", authMiddleware, async (c) => {
+    const provider = c.req.param("provider");
+    if (provider !== "claude" && provider !== "codex" && provider !== "opencode" && provider !== "pi") {
+      return jsonOk(c, { ok: false, error: "unknown provider" }, 400);
+    }
+    const cleared = await controller.clearRateLimit(provider);
+    if (cleared === "queued") return jsonOk(c, { ok: true, cleared: false, result: "queued" }, 202);
+    return jsonOk(c, { ok: true, cleared });
+  });
+
+  app.get("/api/opencode/models", authMiddleware, async (c) => {
+    try {
+      return jsonOk(c, { models: await listOpenRouterSessionModels() });
+    } catch (err) {
+      log.warn(`[sessions] OpenRouter model catalogue unavailable: ${err instanceof Error ? err.message : String(err)}`);
+      return jsonOk(c, { error: "catalogue unavailable" }, 502);
+    }
+  });
+  app.post("/api/client-error", authMiddleware, async (c) => {
+    try {
+      const raw = await readTextBody(c, 8192);
+      const parsed = JSON.parse(raw);
+      const fingerprint = typeof parsed.fingerprint === "string" && parsed.fingerprint
+        ? `client-error: ${parsed.fingerprint.slice(0, 200)}`
+        : "client-error: unknown";
+      const message = typeof parsed.message === "string" ? parsed.message.slice(0, 500) : "unknown";
+      const stack = typeof parsed.stack === "string" ? parsed.stack.slice(0, 2000) : "";
+      const context = typeof parsed.context === "string" ? parsed.context.slice(0, 200) : "client";
+      const err = new Error(message);
+      err.stack = stack || `Error: ${message}`;
+      void reportError(fingerprint, `client-side JS error on ${context}`, err);
+    } catch {
+      // ignore malformed payloads
+    }
+    return c.body(null, 204);
+  });
+
+  app.get("/api/activation", authMiddleware, async (c) => {
+    const report = await loadLatestReport();
+    return jsonOk(c, {
+      state: config.ACTIVATION_STATE,
+      lastVerification: report ? { generatedAt: report.generatedAt, failures: report.checks.filter((ck) => !ck.ok).length } : null,
+    });
+  });
+
+  app.post("/api/activation", authMiddleware, async (c) => {
+    try {
+      const body = await readTextBody(c);
+      const parsed = JSON.parse(body) as { state?: string; confirm?: boolean };
+      if (!parsed.confirm) {
+        return jsonOk(c, { error: "confirm:true required" }, 400);
+      }
+      if (parsed.state !== "active" && parsed.state !== "staging" && parsed.state !== "verify-only") {
+        return jsonOk(c, { error: "state must be 'active', 'staging', or 'verify-only'" }, 400);
+      }
+      if (parsed.state === config.ACTIVATION_STATE) {
+        return jsonOk(c, { result: "unchanged", state: parsed.state });
+      }
+      await writeConfig({ activationState: parsed.state });
+      log.warn(`[activation] Flipped to ${parsed.state}`);
+      return jsonOk(c, { result: "flipped", state: parsed.state, restartRequired: true });
+    } catch (err) {
+      return jsonOk(c, { error: String(err) }, 500);
+    }
+  });
+
+  app.post("/queue/refresh", authMiddleware, async (c) => {
+    const jobs = ["issue-dispatcher", "pr-dispatcher"];
+    const results: Record<string, string> = {};
+    for (const name of jobs) {
+      results[name] = await controller.triggerJob(name);
+    }
+    return jsonOk(c, { results });
+  });
+
+  app.post("/queue/merge", authMiddleware, async (c) => {
+    try {
+      const body = await readTextBody(c);
+      const { repo, prNumber, confirmInfra, confirmManual } = RepoItemSchema.parse(JSON.parse(body));
+      const repoObj = await findConfiguredRepo(repo);
+      if (!repoObj) {
+        return jsonOk(c, { error: "Repository not configured" }, 403);
+      }
+      const manualWarning = await manualWarningFor(repo, prNumber);
+      if (manualWarning && !confirmManual) {
+        return jsonOk(c, { error: `${manualWarning}; reload the page and confirm` }, 409);
+      }
+      const infra = infraPathsIn(await getPRChangedFiles(repo, prNumber));
+      if (infra.length > 0 && !confirmInfra) {
+        return jsonOk(c, { error: `PR touches infrastructure (${infra.slice(0, 5).join(", ")}); reload the page and confirm to merge` }, 409);
+      }
+      const prFromList = (await listPRs(repoObj.fullName).catch(() => [])).find((p) => p.number === prNumber);
+      await recordMergeApproval(c, repo, prNumber);
+      await mergePR(repo, prNumber);
+      removeQueueItem(repo, prNumber);
+      try {
+        await finalizeMergedClawsPR(repoObj, prFromList ?? { number: prNumber, title: "", headRefName: "", body: undefined }, "dashboard");
+      } catch (err) {
+        log.warn(`[queue/merge] Post-merge cleanup failed for ${repo}#${prNumber}: ${err}`);
+      }
+      return jsonOk(c, { result: "merged" });
+    } catch (err) {
+      return jsonOk(c, { error: String(err) }, 500);
+    }
+  });
+
+  app.post("/queue/skip", authMiddleware, async (c) => {
+    try {
+      const body = await readTextBody(c);
+      const { repo, number } = RepoNumberSchema.parse(JSON.parse(body));
+      const items = [...(config.SKIPPED_ITEMS as Array<{ repo: string; number: config.IssueRef }>)];
+      if (!items.some((i) => i.repo === repo && i.number === number)) {
+        items.push({ repo, number });
+      }
+      await writeConfig({ skippedItems: items });
+      removeQueueItem(repo, number);
+      return jsonOk(c, { result: "ok" });
+    } catch (err) {
+      return jsonOk(c, { error: String(err) }, 500);
+    }
+  });
+
+  app.post("/queue/unskip", authMiddleware, async (c) => {
+    try {
+      const body = await readTextBody(c);
+      const { repo, number } = RepoNumberSchema.parse(JSON.parse(body));
+      const items = (config.SKIPPED_ITEMS as Array<{ repo: string; number: config.IssueRef }>).filter(
+        (i) => !(i.repo === repo && i.number === number),
+      );
+      await writeConfig({ skippedItems: items });
+      return jsonOk(c, { result: "ok" });
+    } catch (err) {
+      return jsonOk(c, { error: String(err) }, 500);
+    }
+  });
+
+  app.post("/queue/prioritize", authMiddleware, async (c) => {
+    try {
+      const body = await readTextBody(c);
+      const { repo, number } = RepoNumberSchema.parse(JSON.parse(body));
+      const items = [...(config.PRIORITIZED_ITEMS as Array<{ repo: string; number: config.IssueRef }>)];
+      if (!items.some((i) => i.repo === repo && i.number === number)) {
+        items.push({ repo, number });
+      }
+      await writeConfig({ prioritizedItems: items });
+      return jsonOk(c, { result: "ok" });
+    } catch (err) {
+      return jsonOk(c, { error: String(err) }, 500);
+    }
+  });
+
+  app.post("/queue/deprioritize", authMiddleware, async (c) => {
+    try {
+      const body = await readTextBody(c);
+      const { repo, number } = RepoNumberSchema.parse(JSON.parse(body));
+      const items = (config.PRIORITIZED_ITEMS as Array<{ repo: string; number: config.IssueRef }>).filter(
+        (i) => !(i.repo === repo && i.number === number),
+      );
+      await writeConfig({ prioritizedItems: items });
+      return jsonOk(c, { result: "ok" });
+    } catch (err) {
+      return jsonOk(c, { error: String(err) }, 500);
+    }
+  });
+
+  app.post("/queue/mark-refined", authMiddleware, async (c) => {
+    try {
+      const body = await readTextBody(c);
+      const parsed = RepoNumberSchema.safeParse(JSON.parse(body));
+      if (!parsed.success) throw new Error("Missing repo or number");
+      const { repo, number } = parsed.data;
+      if (!(await isConfiguredRepo(repo))) {
+        return jsonOk(c, { error: "Repository not configured" }, 403);
+      }
+      // The old Refined: approve the issue through Plan — the approval track's
+      // Plan gate, never lowering a Merge approval.
+      const result = await checkedApproval(repo, number, (current) => maxApproval(current, "plan"), sessionSubject(c));
+      if (!result.ok) return jsonOk(c, { error: result.error }, result.status);
+      removeQueueItem(repo, number);
+      return jsonOk(c, { result: "ok" });
+    } catch (err) {
+      return jsonOk(c, { error: String(err) }, 500);
+    }
+  });
+
+  app.post("/queue/priority-label", authMiddleware, async (c) => {
+    try {
+      const body = await readTextBody(c);
+      const parsed = PriorityLabelSchema.safeParse(JSON.parse(body));
+      if (!parsed.success) throw new Error("Missing repo, number or add");
+      const { repo, number, add } = parsed.data;
+      if (!(await isConfiguredRepo(repo))) {
+        return jsonOk(c, { error: "Repository not configured" }, 403);
+      }
+      if (add) {
+        await addLabel(repo, number, LABELS.priority);
+      } else {
+        await removeLabel(repo, number, LABELS.priority);
+      }
+      const rows = await listQueuedWork();
+      await Promise.all(
+        rows
+          .filter((r) => r.repo === repo && sameIssueRef(r.item_number, number))
+          .map((r) => setWorkPriority(r.id, add)),
+      );
+      return jsonOk(c, { result: "ok" });
+    } catch (err) {
+      return jsonOk(c, { error: String(err) }, 500);
+    }
+  });
+
+  app.post("/queue/mark-automerge", authMiddleware, async (c) => {
+    try {
+      const body = await readTextBody(c);
+      const parsed = MarkAutomergeSchema.safeParse(JSON.parse(body));
+      if (!parsed.success) throw new Error("Missing repo or number");
+      const { repo, number, alsoRefine, confirmManual } = parsed.data;
+      if (!(await isConfiguredRepo(repo))) {
+        return jsonOk(c, { error: "Repository not configured" }, 403);
+      }
+      const manualWarning = await manualWarningFor(repo, number);
+      if (manualWarning && !confirmManual) {
+        return jsonOk(c, { error: `${manualWarning}; reload the page and confirm` }, 409);
+      }
+      // A PR's approval is its row alone; an issue's is its stored approval,
+      // which Merge raises through Plan as well — so `alsoRefine` (Refine &
+      // Merge) needs no second write.
+      const isPr = await recordMergeApproval(c, repo, number);
+      if (!isPr) {
+        const result = await checkedApproval(repo, number, () => "merge", sessionSubject(c));
+        if (!result.ok) return jsonOk(c, { error: result.error }, result.status);
+        if (alsoRefine) removeQueueItem(repo, number);
+      }
+      return jsonOk(c, { result: "ok" });
+    } catch (err) {
+      return jsonOk(c, { error: String(err) }, 500);
+    }
+  });
+
+  app.post("/queue/mark-problematic", authMiddleware, async (c) => {
+    try {
+      const body = await readTextBody(c);
+      const parsed = RepoNumberSchema.safeParse(JSON.parse(body));
+      if (!parsed.success) throw new Error("Missing repo or number");
+      const { repo, number } = parsed.data;
+      if (!(await isConfiguredRepo(repo))) {
+        return jsonOk(c, { error: "Repository not configured" }, 403);
+      }
+      await addLabel(repo, number, LABELS.problematic);
+      removeQueueItem(repo, number);
+      return jsonOk(c, { result: "ok" });
+    } catch (err) {
+      return jsonOk(c, { error: String(err) }, 500);
+    }
+  });
+
+  app.post("/queue/unmark-problematic", authMiddleware, async (c) => {
+    try {
+      const body = await readTextBody(c);
+      const parsed = RepoPrNumberSchema.safeParse(JSON.parse(body));
+      if (!parsed.success) throw new Error("Missing repo or number");
+      const { repo, number } = parsed.data;
+      if (!(await isConfiguredRepo(repo))) {
+        return jsonOk(c, { error: "Repository not configured" }, 403);
+      }
+      if (!(await removeLabel(repo, number, LABELS.problematic))) {
+        return jsonOk(c, { error: `Failed to remove the ${LABELS.problematic} label` }, 500);
+      }
+      // Advance the budget floor too, otherwise the pre-existing attempts still
+      // inside the 24h window re-trip the breaker on the very next sweep.
+      await resetCIFixerBreakerGrants(repo, number);
+      return jsonOk(c, { result: "ok" });
+    } catch (err) {
+      return jsonOk(c, { error: String(err) }, 500);
+    }
+  });
+
+  // A PR hold is the row's manual_action_reason alone — no forge label — so
+  // this is how a human lifts it, besides moving the linked issue out of
+  // Blocked (#clw_01M4TABN7ZFQ3MG5KK85GFGWNK).
+  app.post("/queue/clear-manual-action", authMiddleware, async (c) => {
+    try {
+      const body = await readTextBody(c);
+      const parsed = RepoPrNumberSchema.safeParse(JSON.parse(body));
+      if (!parsed.success) throw new Error("Missing repo or number");
+      const { repo, number } = parsed.data;
+      if (!(await isConfiguredRepo(repo))) {
+        return jsonOk(c, { error: "Repository not configured" }, 403);
+      }
+      const reason = (await getClawsPr(repo, number))?.manualActionReason ?? null;
+      await clearPrHold(repo, number);
+      // The audit comment is best-effort: the hold is already lifted above.
+      if (reason !== null) {
+        try {
+          await ghCommentOnIssue(repo, number, `The hold recorded on this PR (\`${reason}\`) was cleared from the dashboard, so Claws will merge it under the usual rules.`);
+        } catch (err) {
+          log.warn(`[server] PR ${repo}#${number}: failed to post clear-manual-action audit comment: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      return jsonOk(c, { result: "ok" });
+    } catch (err) {
+      return jsonOk(c, { error: String(err) }, 500);
+    }
+  });
+
+  app.post("/jobs", authMiddleware, async (c) => {
+    const body = await readTextBody(c);
+    const params = parseFormBody(body);
+
+    try {
+      const repos = await listRepos();
+      const newDisabled: Record<string, string[]> = {};
+      const knownJobNames = new Set<string>(REPO_JOB_NAMES);
+      // Jobs actually registered on the scheduler. A name in neither this set
+      // nor REPO_JOB_NAMES is a job that no longer exists (#2936). Guarded on
+      // non-empty for the same reason the repos list is below: a degenerate
+      // view of the world must not wipe config.
+      const registeredJobNames = new Set((await controller.jobStates()).keys());
+      const droppedDead: string[] = [];
+      const droppedCovered: string[] = [];
+
+      for (const repo of repos) {
+        const disabledJobs: string[] = [];
+        const hostEntry = config.DISABLED_JOBS_BY_REPO[repo.fullName] ?? [];
+        // Jobs the repo's own claws.json disables render as disabled checkboxes
+        // that submit nothing; skip them so a locked cell is not mirrored into
+        // disabledJobsByRepo (#2885). A host entry naming the same job is now
+        // redundant — the file wins and locks it — so it is retired here (#2936).
+        const locked = new Set(config.getLockedJobsForRepo(repo.fullName));
+        for (const job of REPO_JOB_NAMES) {
+          if (listsJob([...locked], job)) {
+            if (hostEntry.includes(job)) droppedCovered.push(`${repo.fullName}:${job}`);
+            continue;
+          }
+          const fieldName = `${repo.fullName}::${job}`;
+          const checked = params[fieldName] === "true";
+          if (!checked) disabledJobs.push(job);
+        }
+        for (const job of hostEntry) {
+          if (knownJobNames.has(job) || disabledJobs.includes(job)) continue;
+          if (locked.has(job)) {
+            droppedCovered.push(`${repo.fullName}:${job}`);
+            continue;
+          }
+          if (registeredJobNames.size > 0 && !registeredJobNames.has(job)) {
+            droppedDead.push(`${repo.fullName}:${job}`);
+            continue;
+          }
+          // A real job the matrix does not list yet — carry it forward (#2625).
+          disabledJobs.push(job);
+        }
+        if (disabledJobs.length > 0) {
+          newDisabled[repo.fullName] = disabledJobs;
+        }
+      }
+
+      if (droppedDead.length > 0) {
+        log.info(`[jobs] Dropped disabledJobsByRepo entries for jobs that no longer exist: ${droppedDead.join(", ")}`);
+      }
+      if (droppedCovered.length > 0) {
+        log.info(`[jobs] Dropped disabledJobsByRepo entries already covered by the repo's claws.json: ${droppedCovered.join(", ")}`);
+      }
+
+      const existingDisabled = config.DISABLED_JOBS_BY_REPO;
+      if (repos.length === 0) {
+        // Degenerate discovery (an API outage, say) must not wipe the map.
+        for (const [repoFullName, jobs] of Object.entries(existingDisabled)) {
+          if (jobs.length > 0) newDisabled[repoFullName] = [...jobs];
+        }
+      } else {
+        // Entries for repos Claws no longer monitors are inert — no job runs on
+        // an unmonitored repo — and archived/renamed repos accumulate there
+        // forever otherwise. If such a repo comes back, its own claws.json is
+        // the source of truth (#2898).
+        const dropped = Object.keys(existingDisabled).filter((name) => !repos.some((r) => r.fullName === name));
+        if (dropped.length > 0) log.info(`[jobs] Dropped disabledJobsByRepo entries for unmonitored repos: ${dropped.join(", ")}`);
+      }
+
+      await writeConfig({ disabledJobsByRepo: newDisabled });
+
+      return c.redirect("/jobs?saved=1", 303);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      log.error(`Failed to save job toggles: ${message}`);
+      return c.redirect("/jobs", 303);
+    }
+  });
+
+  app.post("/config/remove-unknown-keys", authMiddleware, async (c) => {
+    const unknownKeys = Array.from(getUnknownConfigKeys());
+    if (unknownKeys.length > 0) {
+      try {
+        await removeConfigKeys(unknownKeys);
+        return c.redirect("/config?saved=1", 303);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        log.error(`Failed to remove unknown keys: ${message}`);
+        return c.redirect("/config", 303);
+      }
+    }
+    return c.redirect("/config", 303);
+  });
+
+  app.post("/config", authMiddleware, async (c) => {
+    const body = await readTextBody(c);
+    const params = parseFormBody(body);
+    const updates: Partial<ConfigFile> = {};
+
+    if (params["selfRepo"] !== undefined) updates.selfRepo = params["selfRepo"];
+    if (params["logRetentionDays"] !== undefined) {
+      const v = parseInt(params["logRetentionDays"], 10);
+      if (v > 0) updates.logRetentionDays = v;
+    }
+    if (params["logRetentionPerJob"] !== undefined) {
+      const v = parseInt(params["logRetentionPerJob"], 10);
+      if (v >= 0) updates.logRetentionPerJob = v;
+    }
+
+    if (params["slackWebhook"] !== undefined) updates.slackWebhook = params["slackWebhook"];
+    if (params["slackBotToken"] !== undefined) updates.slackBotToken = params["slackBotToken"];
+    if (params["slackIdeasChannel"] !== undefined) updates.slackIdeasChannel = params["slackIdeasChannel"];
+    if (params["whatsappAllowedNumbers"] !== undefined) {
+      updates.whatsappAllowedNumbers = params["whatsappAllowedNumbers"].split(",").map((s) => s.trim()).filter(Boolean);
+    }
+    if (params["openaiApiKey"] !== undefined) updates.openaiApiKey = params["openaiApiKey"];
+    if (params["oidcBaseUrl"] !== undefined) updates.oidcBaseUrl = params["oidcBaseUrl"];
+    if (params["oidcApplicationSlug"] !== undefined) updates.oidcApplicationSlug = params["oidcApplicationSlug"];
+    if (params["oidcClientId"] !== undefined) updates.oidcClientId = params["oidcClientId"];
+    if (params["oidcClientSecret"] !== undefined) updates.oidcClientSecret = params["oidcClientSecret"];
+    if (params["oidcRedirectUri"] !== undefined) updates.oidcRedirectUri = params["oidcRedirectUri"];
+    if (params["dashboardUrl"] !== undefined) updates.dashboardUrl = params["dashboardUrl"];
+    if (params["emailUser"] !== undefined) updates.emailUser = params["emailUser"];
+    if (params["emailAppPassword"] !== undefined) updates.emailAppPassword = params["emailAppPassword"];
+    if (params["emailRecipient"] !== undefined) updates.emailRecipient = params["emailRecipient"];
+
+    if (params["runners"] !== undefined) {
+      try {
+        const parsed = JSON.parse(params["runners"]);
+        if (Array.isArray(parsed)) updates.runners = parsed;
+      } catch {
+        // Invalid JSON — skip silently
+      }
+    }
+
+    if (params["macRunners"] !== undefined) {
+      try {
+        const parsed = JSON.parse(params["macRunners"]);
+        if (Array.isArray(parsed)) updates.macRunners = parsed;
+      } catch {
+        // Invalid JSON — skip silently
+      }
+    }
+    if (params["macRunnerHosts"] !== undefined) {
+      const knownHosts = params["macRunnerHosts"].split(",").map(s => s.trim()).filter(Boolean);
+      const base = Array.isArray(updates.macRunners)
+        ? updates.macRunners
+        : (MAC_RUNNERS as MacRunner[]).map(r => ({ ...r }));
+      for (const runner of base) {
+        if (knownHosts.includes(runner.host)) {
+          runner.enabled = params[`macRunnerEnabled_${runner.host}`] === "on";
+        }
+      }
+      updates.macRunners = base;
+    }
+    if (params["macRunnerRepos"] !== undefined) {
+      const submitted = params["macRunnerRepos"].split(",").map((s) => s.trim()).filter(Boolean);
+      // A repo whose own claws.json says `runners: ["macos"]` enrols itself, so
+      // the host entry is a redundant shadow of the file (#2936). Only a
+      // present, parsed file prunes anything — a failed fetch leaves the entry.
+      const covered = submitted.filter((r) => config.isRepoDeclaredMacRunner(r));
+      if (covered.length > 0) {
+        log.info(`[config] Dropped macRunnerRepos entries already covered by the repo's claws.json: ${covered.join(", ")}`);
+      }
+      updates.macRunnerRepos = submitted.filter((r) => !covered.includes(r));
+    }
+
+    const intervalUpdates: Record<string, number> = {};
+    for (const [key, value] of Object.entries(params)) {
+      if (key.startsWith("interval_")) {
+        const intKey = key.slice("interval_".length);
+        const v = parseInt(value, 10);
+        if (v > 0) intervalUpdates[intKey] = v * 60 * 1000;
+      }
+    }
+    if (Object.keys(intervalUpdates).length > 0) {
+      updates.intervals = intervalUpdates as ConfigFile["intervals"];
+    }
+
+    const scheduleUpdates: Record<string, number> = {};
+    for (const [key, value] of Object.entries(params)) {
+      if (key.startsWith("schedule_")) {
+        const schedKey = key.slice("schedule_".length);
+        const v = parseInt(value, 10);
+        if (v >= 0 && v <= 23) scheduleUpdates[schedKey] = v;
+      }
+    }
+    if (Object.keys(scheduleUpdates).length > 0) {
+      updates.schedules = scheduleUpdates as ConfigFile["schedules"];
+    }
+
+    const disabledAgents: string[] = [];
+    for (const name of VALID_AGENT_NAMES) {
+      if (params[`enabledAgent_${name}`] !== "true") {
+        disabledAgents.push(name);
+      }
+    }
+    updates.disabledAgents = disabledAgents;
+
+    if (params["openrouterApiKey"] !== undefined) updates.openrouterApiKey = params["openrouterApiKey"];
+    if (params["anthropicApiKey"] !== undefined) updates.anthropicApiKey = params["anthropicApiKey"];
+    if (params["opencodeSpendWarnUsd"] !== undefined && params["opencodeSpendWarnUsd"] !== "") {
+      const v = Number(params["opencodeSpendWarnUsd"]);
+      if (Number.isFinite(v) && v >= 0) updates.opencodeSpendWarnUsd = v;
+    }
+    if (params["ollamaBaseUrl"] !== undefined) updates.ollamaBaseUrl = params["ollamaBaseUrl"];
+    if (params["ollamaTimeoutMs"] !== undefined) {
+      const v = parseInt(params["ollamaTimeoutMs"], 10);
+      if (v > 0) updates.ollamaTimeoutMs = v * 1000;
+    }
+    if (params["ollamaConsecutiveFailuresBeforeDisable"] !== undefined) {
+      const v = parseInt(params["ollamaConsecutiveFailuresBeforeDisable"], 10);
+      if (v > 0) updates.ollamaConsecutiveFailuresBeforeDisable = v;
+    }
+    const ALL_PROVIDERS = ["claude", "codex", "opencode", "pi"] as const;
+    const aiProviders = {} as config.AiProviderConfig;
+    for (const p of ALL_PROVIDERS) {
+      const weight = Number(params[`providerWeight_${p}`]);
+      const finiteWeight = Number.isFinite(weight);
+      aiProviders[p] = {
+        enabled: params[`providerEnabled_${p}`] === "true" && finiteWeight,
+        weight: finiteWeight ? weight : config.DEFAULT_AI_PROVIDERS[p].weight,
+      };
+    }
+    updates.aiProviders = aiProviders;
+    if (params["providerRateLimitCooldownMs"] !== undefined) {
+      const v = parseInt(params["providerRateLimitCooldownMs"], 10);
+      if (v > 0) updates.providerRateLimitCooldownMs = v * 60 * 1000;
+    }
+    if (params["opencodeBestModel"] !== undefined) updates.opencodeBestModel = params["opencodeBestModel"];
+    if (params["opencodeAdequateModel"] !== undefined) updates.opencodeAdequateModel = params["opencodeAdequateModel"];
+    if (params["opencodeCheapModel"] !== undefined) updates.opencodeCheapModel = params["opencodeCheapModel"];
+    if (params["improvementIdentifierModel"] !== undefined) updates.improvementIdentifierModel = params["improvementIdentifierModel"];
+    if (params["claudeCheapModel"] !== undefined) updates.claudeCheapModel = params["claudeCheapModel"];
+    if (params["codexDefaultModel"] !== undefined) updates.codexDefaultModel = params["codexDefaultModel"];
+    if (params["codexLightModel"] !== undefined) updates.codexLightModel = params["codexLightModel"];
+    if (params["codexCheapModel"] !== undefined) updates.codexCheapModel = params["codexCheapModel"];
+    if (params["claudeFableModel"] !== undefined) updates.claudeFableModel = params["claudeFableModel"];
+    if (params["codexFableModel"] !== undefined) updates.codexFableModel = params["codexFableModel"];
+    if (params["opencodeFableModel"] !== undefined) updates.opencodeFableModel = params["opencodeFableModel"];
+    if (params["piFableModel"] !== undefined) updates.piFableModel = params["piFableModel"];
+    if (params["piBestModel"] !== undefined) updates.piBestModel = params["piBestModel"];
+    if (params["piAdequateModel"] !== undefined) updates.piAdequateModel = params["piAdequateModel"];
+    if (params["piCheapModel"] !== undefined) updates.piCheapModel = params["piCheapModel"];
+    if (params["reviewModelTier"] !== undefined) {
+      const tier = normalizeTier(params["reviewModelTier"]);
+      if (tier) updates.reviewModelTier = tier;
+    }
+
+    await writeConfig(updates);
+
+    return c.redirect("/config?saved=1", 303);
+  });
+
+  app.post("/whatsapp/unpair", authMiddleware, async (c) => {
+    await unpair();
+    return c.redirect("/whatsapp", 303);
+  });
+
+  app.get("/whatsapp/events", authMiddleware, async (c) => {
+    try {
+      const limitRaw = c.req.query("limit");
+      const limit = Math.min(parseInt(limitRaw ?? "50", 10) || 50, 200);
+      const events = await getRecentWhatsappEvents(limit);
+      return jsonOk(c, events);
+    } catch (err) {
+      return jsonOk(c, { error: String(err) }, 500);
+    }
+  });
+
+  // The explicit selection of a successful create becomes that repo
+  // combination's pre-ticked default next time. Agent logins follow the Agent
+  // select instead, and the always-forced cross-repo baseline is a disabled
+  // checkbox that never posts, so neither is remembered; an explicit forgejo
+  // tick for a repo selection it isn't forced on IS remembered like any other
+  // capability. A DB failure must not fail the create, which has already
+  // succeeded.
+  const rememberCapabilityDefaults = async (repos: string[], capabilities: string[]): Promise<void> => {
+    try {
+      await rememberSessionCapabilityDefaults(repos, capabilities.filter((id) => isRememberableCapability(id)));
+    } catch (err) {
+      log.warn(`[sessions] Could not remember capability defaults for ${repos.join(", ")}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+
+  // The agent (and, when it is an offered model rather than a custom id, the
+  // model) of a successful dashboard create becomes the next form's default.
+  const rememberAgentDefault = async (provider: SessionProvider, model: string): Promise<void> => {
+    try {
+      const offered = sessionModelsFor(provider).some((m) => m.id === model);
+      await rememberSessionAgentDefault(provider, offered ? model : null);
+    } catch (err) {
+      log.warn(`[sessions] Could not remember agent default ${provider}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+
+  app.post("/sessions/create", authMiddleware, async (c) => {
+    const body = await readTextBody(c);
+    const params = parseFormBody(body);
+    const repo = params["repo"] || null;
+    const rawMode = params["mode"] || "repo-zsh";
+    if (!SESSION_MODES.includes(rawMode as SessionMode)) {
+      return htmlError(c, 400, "Cannot create session", "Invalid mode", {
+        actions: [{ href: "/sessions", label: "← Sessions" }],
+      });
+    }
+    const mode = rawMode as SessionMode;
+    const rawProvider = params["provider"] || "claude";
+    if (!SESSION_PROVIDERS.includes(rawProvider as SessionProvider)) {
+      return htmlError(c, 400, "Cannot create session", "Invalid provider", {
+        actions: [{ href: "/sessions", label: "← Sessions" }],
+      });
+    }
+    const provider = rawProvider as SessionProvider;
+    // A login stored since this process last read the accounts keeps claude-auth.
+    if (claudeAccountsStale()) await refreshClaudeAccounts();
+    const capabilities = validCapabilityIds(parseFormBodyMulti(body, "capability"));
+    // Disabled <select>s are not submitted by the browser, so exactly one
+    // `model` key arrives even though the form renders one per provider.
+    const rawModel = params["model"] || "";
+    const model = rawModel === CUSTOM_MODEL_SENTINEL ? (params["modelCustom"] || "").trim() : rawModel.trim();
+    if (model && !isValidSessionModel(model)) {
+      return htmlError(c, 400, "Cannot create session", "Invalid model id", {
+        actions: [{ href: "/sessions", label: "← Sessions" }],
+      });
+    }
+    const initialPrompt = normalizeInitialPrompt(params["initialPrompt"]);
+    if (initialPrompt !== null && initialPrompt.length > MAX_SESSION_INITIAL_PROMPT_CHARS) {
+      return htmlError(c, 400, "Cannot create session", `Initial prompt is too long (max ${MAX_SESSION_INITIAL_PROMPT_CHARS.toLocaleString("en-US")} characters)`, {
+        actions: [{ href: "/sessions", label: "← Sessions" }],
+      });
+    }
+    // "zsh in repo" starts no agent and sends no first message, so its attachment control is disabled and stray ids are dropped.
+    const attachments = mode === "repo-zsh" ? [] : parseFormBodyMulti(body, "attachment");
+    const attachmentError = await checkSessionAttachments(c, attachments);
+    if (attachmentError) return attachmentError;
+    const result = await getSessionBackend().create({ repo, mode, capabilities, provider, model: model || null, initialPrompt: mode === "repo-zsh" ? null : initialPrompt, attachments });
+    if (!result.ok) {
+      if (result.reason === "shutting-down") {
+        const fields: Array<{ name: string; value: string }> = [];
+        if (repo) fields.push({ name: "repo", value: repo });
+        fields.push({ name: "mode", value: mode });
+        fields.push({ name: "provider", value: provider });
+        for (const cap of capabilities) fields.push({ name: "capability", value: cap });
+        if (model) fields.push({ name: "model", value: model });
+        if (initialPrompt) fields.push({ name: "initialPrompt", value: initialPrompt });
+        for (const id of attachments) fields.push({ name: "attachment", value: id });
+        return shutdownRetryError(c, "Cannot create session", "/sessions/create", fields);
+      }
+      const status = result.reason === "repo-required-for-mode" || result.reason === "capability-unsupported" || result.reason === "attachment-unavailable" ? 400
+        : result.reason === "repo-not-found" || result.reason === "repo-not-listed" ? 404
+        : result.reason === "backend-unavailable" ? 503
+        : 500;
+      return htmlError(c, status, "Cannot create session", describeCreateSessionError(result), {
+        actions: [{ href: "/sessions", label: "← Sessions" }],
+      });
+    }
+    if (repo) await rememberCapabilityDefaults([repo], capabilities);
+    if (mode !== "repo-zsh") await rememberAgentDefault(provider, model);
+    return c.redirect(`/sessions/${result.id}`, 303);
+  });
+
+  app.post("/sessions/create-multi", authMiddleware, async (c) => {
+    const body = await readTextBody(c);
+    const params = parseFormBody(body);
+    const repos = parseFormBodyMulti(body, "repo").filter(Boolean);
+    const rawProvider = params["provider"] || "claude";
+    if (!SESSION_PROVIDERS.includes(rawProvider as SessionProvider)) {
+      return htmlError(c, 400, "Cannot create session", "Invalid provider", {
+        actions: [{ href: "/sessions", label: "← Sessions" }],
+      });
+    }
+    const provider = rawProvider as SessionProvider;
+    // A login stored since this process last read the accounts keeps claude-auth.
+    if (claudeAccountsStale()) await refreshClaudeAccounts();
+    const capabilities = validCapabilityIds(parseFormBodyMulti(body, "capability"));
+    const rawModel = params["model"] || "";
+    const model = rawModel === CUSTOM_MODEL_SENTINEL ? (params["modelCustom"] || "").trim() : rawModel.trim();
+    if (model && !isValidSessionModel(model)) {
+      return htmlError(c, 400, "Cannot create session", "Invalid model id", {
+        actions: [{ href: "/sessions", label: "← Sessions" }],
+      });
+    }
+    const initialPrompt = normalizeInitialPrompt(params["initialPrompt"]);
+    if (initialPrompt !== null && initialPrompt.length > MAX_SESSION_INITIAL_PROMPT_CHARS) {
+      return htmlError(c, 400, "Cannot create session", `Initial prompt is too long (max ${MAX_SESSION_INITIAL_PROMPT_CHARS.toLocaleString("en-US")} characters)`, {
+        actions: [{ href: "/sessions", label: "← Sessions" }],
+      });
+    }
+    const attachments = parseFormBodyMulti(body, "attachment");
+    const attachmentError = await checkSessionAttachments(c, attachments);
+    if (attachmentError) return attachmentError;
+    const result = await getSessionBackend().createMulti({ repos, capabilities, provider, model: model || null, initialPrompt, attachments });
+    if (!result.ok) {
+      if (result.reason === "shutting-down") {
+        const fields: Array<{ name: string; value: string }> = [];
+        for (const r of repos) fields.push({ name: "repo", value: r });
+        fields.push({ name: "provider", value: provider });
+        for (const cap of capabilities) fields.push({ name: "capability", value: cap });
+        if (model) fields.push({ name: "model", value: model });
+        if (initialPrompt) fields.push({ name: "initialPrompt", value: initialPrompt });
+        for (const id of attachments) fields.push({ name: "attachment", value: id });
+        return shutdownRetryError(c, "Cannot create session", "/sessions/create-multi", fields);
+      }
+      const status = result.reason === "too-few-repos" || result.reason === "provider-unsupported" || result.reason === "capability-unsupported" || result.reason === "attachment-unavailable" ? 400
+        : result.reason === "repo-not-found" || result.reason === "repo-not-listed" ? 404
+        : result.reason === "backend-unavailable" ? 503
+        : 500;
+      return htmlError(c, status, "Cannot create session", describeCreateSessionError(result), {
+        actions: [{ href: "/sessions", label: "← Sessions" }],
+      });
+    }
+    await rememberCapabilityDefaults(repos, capabilities);
+    await rememberAgentDefault(provider, model);
+    return c.redirect(`/sessions/${result.id}`, 303);
+  });
+
+  app.post("/sessions/:id/kill", authMiddleware, async (c) => {
+    const id = c.req.param("id");
+    if (!/^[a-f0-9]+$/.test(id)) {
+      return textPlain(c, "Not found", 404);
+    }
+    const result = await getSessionBackend().end(id);
+    if (!result.ok) {
+      return result.reason === "unavailable"
+        ? textPlain(c, `Session runtime unavailable${result.detail ? `: ${result.detail}` : ""}`, 503)
+        : textPlain(c, "Session not found", 404);
+    }
+    await clearCapabilityRequestsForSession(id);
+    return c.redirect("/sessions", 303);
+  });
+
+  app.post("/sessions/:id/delete", authMiddleware, async (c) => {
+    const id = c.req.param("id");
+    if (!/^[a-f0-9]+$/.test(id)) {
+      return textPlain(c, "Not found", 404);
+    }
+    const result = await getSessionBackend().remove(id);
+    if (!result.ok) {
+      return result.reason === "unavailable"
+        ? textPlain(c, `Session runtime unavailable${result.detail ? `: ${result.detail}` : ""}`, 503)
+        : textPlain(c, "Session not found", 404);
+    }
+    await clearCapabilityRequestsForSession(id);
+    return c.redirect("/sessions", 303);
+  });
+
+  app.post("/sessions/:id/resume", authMiddleware, async (c) => {
+    const id = c.req.param("id");
+    if (!/^[a-f0-9]+$/.test(id)) {
+      return textPlain(c, "Not found", 404);
+    }
+    const result = await getSessionBackend().resume(id);
+    if (!result.ok) {
+      const status = result.reason === "shutting-down" || result.reason === "backend-unavailable" ? 503
+        : result.reason === "repo-not-found" || result.reason === "repo-not-listed" ? 404
+        : result.reason === "not-resumable" ? 409
+        : 500;
+      if ((c.req.header("accept") ?? "").includes("text/html")) {
+        if (result.reason === "shutting-down") {
+          return shutdownRetryError(c, "Cannot revive session", `/sessions/${id}/resume`, []);
+        }
+        return htmlError(c, status, "Cannot revive session", describeCreateSessionError(result), {
+          detail: id, actions: [{ href: "/sessions", label: "← All sessions" }],
+        });
+      }
+      return textPlain(c, `Cannot resume session: ${describeCreateSessionError(result)}`, status);
+    }
+    return c.redirect(`/sessions/${id}`, 303);
+  });
+
+  // Switch account (#clw_01M623AMK66JB6TBB4PP55Q2V6): relaunch the agent on another Claude account, conversation kept.
+  app.post("/sessions/:id/switch-account", authMiddleware, async (c) => {
+    const id = c.req.param("id");
+    if (!/^[a-f0-9]+$/.test(id)) return jsonOk(c, { error: "Not found" }, 404);
+    const result = await getSessionBackend().switchClaudeAccount(id);
+    if (!result.ok) {
+      if (result.reason === "invalid") return jsonOk(c, { error: result.detail }, 409);
+      if (result.reason === "unavailable") {
+        return jsonOk(c, { error: `Session runtime unavailable${result.detail ? `: ${result.detail}` : ""}` }, 503);
+      }
+      return jsonOk(c, { error: "Session not found" }, 404);
+    }
+    return jsonOk(c, { from: result.from, to: result.to });
+  });
+
+  const setDescriptionHandler = async (c: Ctx) => {
+    const id = c.req.param("id") ?? "";
+    if (!/^[a-f0-9]+$/.test(id)) return jsonOk(c, { error: "Not found" }, 404);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return jsonOk(c, { error: "Invalid JSON body" }, 400); }
+    const raw = (body as { description?: unknown } | null)?.description;
+    if (raw != null && typeof raw !== "string") return jsonOk(c, { error: "description must be a string" }, 400);
+    const result = await getSessionBackend().setDescription(id, typeof raw === "string" ? raw : "");
+    if (!result.ok) return jsonOk(c, { error: "Session not found" }, 404);
+    return jsonOk(c, { description: result.description });
+  };
+
+  app.post("/sessions/:id/description", authMiddleware, setDescriptionHandler);
+  app.post("/api/sessions/:id/description", apiAuthMiddleware, setDescriptionHandler);
+
+  app.get("/api/sessions/:id/startup", apiAuthMiddleware, async (c) => {
+    const id = c.req.param("id") ?? "";
+    if (!/^[a-f0-9]+$/.test(id)) return jsonOk(c, { error: "Not found" }, 404);
+    const result = await getSessionBackend().getStartupStatus(id);
+    if (!result.ok) {
+      return result.reason === "unavailable"
+        ? jsonOk(c, { error: "Session runtime unavailable", detail: result.detail ?? null }, 503)
+        : jsonOk(c, { error: "Not found" }, 404);
+    }
+    return jsonOk(c, result.status);
+  });
+
+  /**
+   * How a grant reached the agent (#3106): a waiting agent collected it, or
+   * Claws typed a notice into its terminal; `notifyFailure` when it could not;
+   * `agentNoticeQueued` when the agent is restarting and is told once it is back.
+   */
+  const agentNoticeFields = (notice: GrantNoticeOutcome) => ({
+    agentPickedUp: notice.agentPickedUp,
+    agentNotified: notice.agentNotified,
+    notifyFailure: notice.notifyFailure,
+    agentNoticeQueued: notice.agentNoticeQueued,
+  });
+
+  // Operator-only (#3072): never `apiAuthMiddleware`, whose INTERNAL_MCP_TOKEN
+  // every agent holds — an agent must not be able to grant itself access.
+  app.post("/sessions/:id/capabilities", authMiddleware, async (c) => {
+    const id = c.req.param("id");
+    if (!/^[a-f0-9]+$/.test(id)) return jsonOk(c, { error: "Not found" }, 404);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return jsonOk(c, { error: "Invalid JSON body" }, 400); }
+    const capability = (body as { capability?: unknown } | null)?.capability;
+    if (typeof capability !== "string" || !capability) return jsonOk(c, { error: "capability must be a non-empty string" }, 400);
+    const result = await getSessionBackend().grantCapability(id, capability);
+    if (!result.ok) {
+      if (result.reason === "invalid") return jsonOk(c, { error: result.detail }, 400);
+      if (result.reason === "unavailable") {
+        return jsonOk(c, { error: `Session runtime unavailable${result.detail ? `: ${result.detail}` : ""}` }, 503);
+      }
+      return jsonOk(c, { error: "Session not found" }, 404);
+    }
+    const outcome = { live: result.live, loadPath: result.loadPath, marker: result.marker, delayed: result.delayed, landed: result.landed, restarted: result.restarted };
+    // Resolve any pending request so its banner clears; the agent is told either way.
+    await recordCapabilityGrant(id, capability);
+    return jsonOk(c, { ...outcome, ...agentNoticeFields(await deliverGrantNotice(id, capability, result)) });
+  });
+
+  // Operator-only, like the grant: only `ssh:*` is revocable today.
+  app.delete("/sessions/:id/capabilities/:capability", authMiddleware, async (c) => {
+    const id = c.req.param("id");
+    if (!/^[a-f0-9]+$/.test(id)) return jsonOk(c, { error: "Not found" }, 404);
+    const capability = c.req.param("capability");
+    const result = await getSessionBackend().revokeCapability(id, capability);
+    if (!result.ok) {
+      if (result.reason === "invalid") return jsonOk(c, { error: result.detail }, 400);
+      if (result.reason === "unavailable") {
+        return jsonOk(c, { error: `Session runtime unavailable${result.detail ? `: ${result.detail}` : ""}` }, 503);
+      }
+      return jsonOk(c, { error: "Session not found" }, 404);
+    }
+    await clearCapabilityRequest(id, capability);
+    return jsonOk(c, { live: result.live, keysRemoved: result.keysRemoved });
+  });
+
+  // ── Agent-initiated capability requests (#3072) ──
+  // The agent asks through `claws_request_capability` (INTERNAL_MCP_TOKEN, so
+  // `apiAuthMiddleware`); only the operator's OIDC session may approve or deny.
+
+  const runtimeUnavailable = (c: Ctx, detail?: string) =>
+    jsonOk(c, { error: `Session runtime unavailable${detail ? `: ${detail}` : ""}` }, 503);
+
+  /** A capability the live session holds, described with how it is delivered now (see `SessionBackend.grantDelivery`). */
+  const grantedCapabilityResponse = async (c: Ctx, id: string, capability: string) => {
+    const delivery = await getSessionBackend().grantDelivery(id, capability);
+    if (!delivery.ok) {
+      return delivery.reason === "unavailable" ? runtimeUnavailable(c, delivery.detail) : jsonOk(c, { error: "Session not found" }, 404);
+    }
+    await markCapabilityGrantSeen(id, capability);
+    return jsonOk(c, describeGrantedCapability(capability, delivery, await getCapabilityRequest(id, capability)));
+  };
+
+  app.post("/api/sessions/:id/capability-requests", apiAuthMiddleware, async (c) => {
+    const id = c.req.param("id");
+    if (!/^[a-f0-9]+$/.test(id)) return jsonOk(c, { error: "Not found" }, 404);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return jsonOk(c, { error: "Invalid JSON body" }, 400); }
+    const { capability, reason } = (body ?? {}) as { capability?: unknown; reason?: unknown };
+    if (typeof capability !== "string" || !capability) return jsonOk(c, { error: "capability must be a non-empty string" }, 400);
+    if (typeof reason !== "string" || !reason.trim()) return jsonOk(c, { error: "reason must be a non-empty string" }, 400);
+    await markCapabilityPolled(id, capability);
+    const backend = getSessionBackend();
+    const live = await backend.getLive(id);
+    if (!live.ok && live.reason === "unavailable") return runtimeUnavailable(c, live.detail);
+    if (!live.ok || !live.session.alive) return jsonOk(c, { error: "Session not found" }, 404);
+    if (live.session.capabilities.includes(capability)) return grantedCapabilityResponse(c, id, capability);
+    const requestable = liveGrantableCapabilities(live.session.capabilities, backend.kind, live.session).map((cap) => cap.id);
+    if (!requestable.includes(capability)) {
+      return jsonOk(c, {
+        error: `${capability} is not requestable for this session. Requestable: ${requestable.length > 0 ? requestable.join(", ") : "none"}`,
+      }, 400);
+    }
+    const created = await requestCapability(id, capability, reason);
+    if (!created.ok) {
+      return jsonOk(c, { error: `This session already has ${MAX_PENDING_CAPABILITY_REQUESTS} pending capability requests — wait for the user to decide them` }, 429);
+    }
+    return jsonOk(c, describeCapabilityRequest(created.request));
+  });
+
+  app.get("/api/sessions/:id/capability-requests/:cap", apiAuthMiddleware, async (c) => {
+    const id = c.req.param("id");
+    const capability = c.req.param("cap");
+    if (!/^[a-f0-9]+$/.test(id)) return jsonOk(c, { error: "Not found" }, 404);
+    await markCapabilityPolled(id, capability);
+    const entry = await getCapabilityRequest(id, capability);
+    if (entry && entry.status !== "approved") return jsonOk(c, describeCapabilityRequest(entry));
+    const live = await getSessionBackend().getLive(id);
+    if (!live.ok && live.reason === "unavailable") return runtimeUnavailable(c, live.detail);
+    if (live.ok && live.session.alive && live.session.capabilities.includes(capability)) {
+      return grantedCapabilityResponse(c, id, capability);
+    }
+    return jsonOk(c, { error: `No request for ${capability} — request it again` }, 404);
+  });
+
+  app.get("/sessions/:id/capability-requests", authMiddleware, async (c) => {
+    const id = c.req.param("id");
+    if (!/^[a-f0-9]+$/.test(id)) return jsonOk(c, { error: "Not found" }, 404);
+    const live = await getSessionBackend().getLive(id);
+    return jsonOk(c, {
+      requests: (await listPendingCapabilityRequests(id)).map(describeCapabilityRequest),
+      ...(live.ok ? { summary: live.session.summary, pageTitle: sessionPageTitle(live.session) } : {}),
+    });
+  });
+
+  // `code` tells the dashboard a request that is already gone ("no-request",
+  // drop its banner) from a grant that failed ("session-not-found", show it).
+  const decideCapabilityRequestHandler = (approve: boolean) => async (c: Ctx) => {
+    const id = c.req.param("id") ?? "";
+    const capability = c.req.param("cap") ?? "";
+    if (!/^[a-f0-9]+$/.test(id)) return jsonOk(c, { error: "Not found" }, 404);
+    const result = await decideCapabilityRequest(id, capability, approve);
+    if (result.ok) {
+      return jsonOk(c, result.grant
+        ? { ...describeGrantedCapability(capability, result.grant, result.request), ...agentNoticeFields(result) }
+        : describeCapabilityRequest(result.request));
+    }
+    if (result.reason === "grant-failed") {
+      const { grant } = result;
+      if (grant.reason === "invalid") return jsonOk(c, { error: grant.detail }, 400);
+      if (grant.reason === "unavailable") return runtimeUnavailable(c, grant.detail);
+      return jsonOk(c, { error: "Session not found — it may have ended", code: "session-not-found" }, 404);
+    }
+    if (result.reason === "not-pending") return jsonOk(c, { error: "This request has already been decided" }, 409);
+    return jsonOk(c, { error: "No such capability request", code: "no-request" }, 404);
+  };
+
+  // Operator-only: never `apiAuthMiddleware`, or an agent could approve its own request.
+  app.post("/sessions/:id/capability-requests/:cap/approve", authMiddleware, decideCapabilityRequestHandler(true));
+  app.post("/sessions/:id/capability-requests/:cap/deny", authMiddleware, decideCapabilityRequestHandler(false));
+
+  // Self-reported agent status (#3083), set by the session's `claws_set_session_status` MCP tool.
+  const setAgentStatusHandler = async (c: Ctx) => {
+    const id = c.req.param("id") ?? "";
+    if (!/^[a-f0-9]+$/.test(id)) return jsonOk(c, { error: "Not found" }, 404);
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return jsonOk(c, { error: "Invalid JSON body" }, 400); }
+    const status = (body as { status?: unknown } | null)?.status;
+    if (!isSessionAgentStatus(status)) {
+      return jsonOk(c, { error: `status must be one of ${SESSION_AGENT_STATUSES.join(", ")}` }, 400);
+    }
+    const result = await getSessionBackend().setAgentStatus(id, status);
+    if (!result.ok) return jsonOk(c, { error: "Session not found" }, 404);
+    return jsonOk(c, { status: result.status, updatedAt: result.updatedAt });
+  };
+
+  app.post("/api/sessions/:id/status", apiAuthMiddleware, setAgentStatusHandler);
+
+  app.post("/sessions/:id/resummarize", authMiddleware, async (c) => {
+    const id = c.req.param("id");
+    if (!/^[a-f0-9]+$/.test(id)) return jsonOk(c, { error: "Not found" }, 404);
+    const result = await getSessionBackend().resummarize(id);
+    if (!result.ok) return jsonOk(c, { error: "Session not found or not running" }, 404);
+    return jsonOk(c, { description: result.description });
+  });
+
+  app.post(
+    "/sessions/:id/upload",
+    authMiddleware,
+    // Enforce the cap while the body streams in — a chunked request has no
+    // Content-Length to check, so without this the whole payload would be
+    // buffered by parseBody() before the backend's saveUpload() could reject it.
+    // Slack of 4096 bytes covers multipart boundary/header framing around an
+    // exactly-MAX_UPLOAD_BYTES file; the true per-file cap is still enforced
+    // where the session pod stores the file.
+    bodyLimit({
+      maxSize: MAX_UPLOAD_BYTES + 4096,
+      onError: (c) => {
+        c.header("Content-Type", "application/json");
+        return c.body(JSON.stringify({ error: "File too large (max 10 MB)" }), 413);
+      },
+    }),
+    async (c) => {
+      const id = c.req.param("id");
+      if (!/^[a-f0-9]+$/.test(id)) return jsonOk(c, { error: "Not found" }, 404);
+      const live = await checkUploadTarget(c, id);
+      if (live) return live;
+      let file: unknown;
+      try {
+        file = (await c.req.parseBody())["file"];
+      } catch (err) {
+        return jsonOk(c, { error: `Malformed upload: ${String(err)}` }, 400);
+      }
+      if (!(file instanceof File)) return jsonOk(c, { error: "Missing file field" }, 400);
+      const buf = Buffer.from(await file.arrayBuffer());
+      const result = await getSessionBackend().saveUpload(id, file.name, buf);
+      if (!result.ok) return uploadErrorResponse(c, result, "10 MB");
+      log.info(`[server] Session ${id}: stored upload ${result.path} (${buf.byteLength} bytes)`);
+      if (isAudioUpload(file.name, file.type)) {
+        if (!transcribeAvailable()) {
+          return jsonOk(c, { path: result.path, transcriptError: "Transcription is not configured (set CLAWS_WHISPER_LOCAL_URL, CLAWS_WHISPER_BASE_URL or OPENAI_API_KEY)" });
+        }
+        try {
+          const text = (await transcribe(buf, file.name || "voice-note.ogg", voiceVocabularyPrompt(await listRepos()))).trim();
+          if (!text) {
+            return jsonOk(c, { path: result.path, transcriptError: "Transcription produced no text" });
+          }
+          log.info(`[server] Session ${id}: transcribed ${file.name} (${text.length} chars)`);
+          return jsonOk(c, { path: result.path, transcript: text });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          log.warn(`[server] Session ${id}: transcription failed for ${file.name}: ${message}`);
+          return jsonOk(c, { path: result.path, transcriptError: `Transcription failed: ${message}` });
+        }
+      }
+      return jsonOk(c, { path: result.path });
+    },
+  );
+
+  app.post("/sessions/:id/upload-stream", authMiddleware, async (c) => {
+    const id = c.req.param("id");
+    if (!/^[a-f0-9]+$/.test(id)) return jsonOk(c, { error: "Not found" }, 404);
+
+    // Fast reject before reading a byte (or looking up the session) when the
+    // client declares an over-cap size.
+    const declared = Number(c.req.header("content-length") ?? "");
+    if (Number.isFinite(declared) && declared > MAX_LARGE_UPLOAD_BYTES) {
+      return jsonOk(c, { error: "File too large (max 1 GB)" }, 413);
+    }
+
+    const live = await checkUploadTarget(c, id);
+    if (live) return live;
+
+    const body = c.req.raw.body;
+    if (!body) return jsonOk(c, { error: "Missing request body" }, 400);
+    const name = c.req.query("name") ?? "upload";
+
+    const result = await getSessionBackend().saveUploadStream(
+      id,
+      name,
+      Readable.fromWeb(body as unknown as import("node:stream/web").ReadableStream<Uint8Array>),
+    );
+    if (!result.ok) return uploadErrorResponse(c, result, "1 GB");
+    log.info(`[server] Session ${id}: stored streamed upload ${result.path}`);
+    return jsonOk(c, { path: result.path });
+  });
+
+  // Files attached on a New Session form, staged before the session exists
+  // (session-attachments.ts). Same limits and wording as the upload routes above.
+  app.post(
+    "/sessions/attachments",
+    authMiddleware,
+    bodyLimit({
+      maxSize: MAX_UPLOAD_BYTES + 4096,
+      onError: (c) => {
+        c.header("Content-Type", "application/json");
+        return c.body(JSON.stringify({ error: "File too large (max 10 MB)" }), 413);
+      },
+    }),
+    async (c) => {
+      await sweepPendingSessionAttachments();
+      let file: unknown;
+      try {
+        file = (await c.req.parseBody())["file"];
+      } catch (err) {
+        return jsonOk(c, { error: `Malformed upload: ${String(err)}` }, 400);
+      }
+      if (!(file instanceof File)) return jsonOk(c, { error: "Missing file field" }, 400);
+      if (file.size === 0) return jsonOk(c, { error: `${file.name}: empty file or folder — not uploaded` }, 400);
+      const result = await stageSessionAttachment(file.name, Buffer.from(await file.arrayBuffer()), file.type);
+      if (!result.ok) return jsonOk(c, { error: describeUploadError(result, "10 MB") }, result.reason === "too-large" ? 413 : 500);
+      log.info(`[server] Staged session attachment ${result.row.id} (${result.row.size} bytes)`);
+      return jsonOk(c, { attachment: { id: result.row.id, name: result.row.filename, size: result.row.size } });
+    },
+  );
+
+  app.post("/sessions/attachments/stream", authMiddleware, async (c) => {
+    const declared = Number(c.req.header("content-length") ?? "");
+    if (Number.isFinite(declared) && declared > MAX_LARGE_UPLOAD_BYTES) {
+      return jsonOk(c, { error: "File too large (max 1 GB)" }, 413);
+    }
+    await sweepPendingSessionAttachments();
+    const body = c.req.raw.body;
+    if (!body) return jsonOk(c, { error: "Missing request body" }, 400);
+    const name = c.req.query("name") ?? "upload";
+    const result = await stageSessionAttachmentStream(
+      name,
+      Readable.fromWeb(body as unknown as import("node:stream/web").ReadableStream<Uint8Array>),
+      c.req.header("content-type"),
+    );
+    if (!result.ok) {
+      if (result.detail === "empty file") return jsonOk(c, { error: `${name}: empty file or folder — not uploaded` }, 400);
+      return jsonOk(c, { error: describeUploadError(result, "1 GB") }, result.reason === "too-large" ? 413 : 500);
+    }
+    log.info(`[server] Staged streamed session attachment ${result.row.id} (${result.row.size} bytes)`);
+    return jsonOk(c, { attachment: { id: result.row.id, name: result.row.filename, size: result.row.size } });
+  });
+
+  // Removes a still-pending staged file; one a session has claimed is the session's.
+  app.post("/sessions/attachments/:attachmentId/delete", authMiddleware, async (c) => {
+    const id = c.req.param("attachmentId");
+    const pending = isSessionAttachmentId(id) ? await findPendingSessionAttachments([id]) : null;
+    if (!pending) return jsonOk(c, { error: "Attachment not found" }, 404);
+    await deleteSessionAttachment(id);
+    return jsonOk(c, { ok: true });
+  });
+
+  app.post("/logs/:runId/cancel", authMiddleware, async (c) => {
+    const runId = c.req.param("runId");
+    if (!await getJobRun(runId)) {
+      return jsonOk(c, { error: "Run not found" }, 404);
+    }
+    const cancelled = await cancelJobRunIfRunning(runId);
+    if (!cancelled) {
+      return jsonOk(c, { result: "not-running" });
+    }
+    // The run is already marked cancelled; `queued` means its agent is killed once the controller answers.
+    return jsonOk(c, { result: await controller.cancelRun(runId) });
+  });
+
+  // ── GET routes ──
+
+  app.get("/reauth", authMiddleware, async (c) => {
+    if (claudeAccountsStale()) await refreshClaudeAccounts();
+    return htmlOk(c, buildReauthPage(getTheme(c), await loadOperatorAttentionCounts()));
+  });
+  // Kept so the /claude-auth links in already-filed [claws-error] issues still work.
+  app.get("/claude-auth", authMiddleware, (c) => c.redirect("/reauth", 302));
+
+  app.get("/api/status", authMiddleware, async (c) => {
+    // The controller's start, WhatsApp, email and login state, not this process's.
+    const integrations = await controller.integrations();
+    const controllerStartedAt = integrations.startedAt ?? startedAt;
+    const uptimeMs = Date.now() - new Date(controllerStartedAt).getTime();
+    const jobs = await jobStateRecord(controller);
+    const ws = await controller.workerStatus();
+    const cq = { pending: ws.queued, active: ws.running };
+    const runningTasks = await runningTaskViews();
+    const queueEntries = await queueEntryViews();
+    const latestRuns = await getLatestRunIdsByJob();
+    const schedInfo = await controller.jobScheduleInfo();
+    const pausedSet = await controller.pausedJobs();
+    const manualSet = await controller.manualOnlyJobs();
+    const jobSchedules: Record<string, { intervalMs?: number; scheduledHour?: number; lastCompletedAt: string | null; nextRunIn: number | null; manualOnly: boolean }> = {};
+    for (const name of Object.keys(jobs)) {
+      const sched = schedInfo.get(name);
+      const latest = latestRuns.get(name);
+      const lastCompletedAt = latest?.completedAt ? latest.completedAt + "Z" : null;
+      let nextRunIn: number | null = null;
+      if (!pausedSet.has(name) && sched) {
+        if (sched.scheduledHour !== undefined) {
+          nextRunIn = msUntilHour(sched.scheduledHour);
+        } else if (latest?.startedAt) {
+          nextRunIn = Math.max(0, new Date(latest.startedAt + "Z").getTime() + sched.intervalMs - Date.now());
+        } else {
+          nextRunIn = sched.intervalMs;
+        }
+      }
+      jobSchedules[name] = {
+        ...(sched?.scheduledHour !== undefined ? { scheduledHour: sched.scheduledHour } : { intervalMs: sched?.intervalMs }),
+        lastCompletedAt,
+        nextRunIn,
+        manualOnly: manualSet.has(name),
+      };
+    }
+    const totalQueueItems = (await controller.queueSnapshot()).items.length;
+
+    return jsonOk(c, {
+      status: "ok",
+      startedAt: controllerStartedAt,
+      uptime: Math.floor(uptimeMs / 1000),
+      jobs,
+      pausedJobs: [...pausedSet],
+      claudeQueue: { pending: cq.pending, active: cq.active },
+      capacity: queueCapacitySummary(queueCapacityView(ws)),
+      runningTasks,
+      queueEntries,
+      jobSchedules,
+      queueDepth: totalQueueItems,
+      slack: slackStatus(),
+      slackBot: { configured: isSlackBotConfigured() },
+      whatsapp: integrations.whatsapp,
+      email: integrations.email,
+      dmarc: {
+        ...getDmarcStatus(),
+        verdictCounts7d: await getDmarcVerdictCounts(new Date(Date.now() - 7 * 86400000).toISOString()),
+      },
+      homeAssistant: getHomeAssistantStatus(),
+    });
+  });
+
+  // The Board is the landing page (#clw_01M39XF6QQ3EF0JX48AT81FNPK); the
+  // Status page that used to live here moved to /status.
+  app.get("/", authMiddleware, (c) => c.redirect("/board", 302));
+
+  app.get("/status", authMiddleware, async (c) => {
+    const theme = getTheme(c);
+    const integrations = await controller.integrations();
+    const controllerStartedAt = integrations.startedAt ?? startedAt;
+    const uptimeMs = Date.now() - new Date(controllerStartedAt).getTime();
+    const runningTasks = await runningTaskViews();
+    const queueEntries = await queueEntryViews();
+    const dashQueueDepth = (await controller.queueSnapshot()).items.length;
+    const dashSnapshots = await getQueueSnapshots(24);
+    const dbLastUsed = await getLastUsedByProvider();
+    const providers = await controller.providerStatus();
+    function aiProviderStatus(provider: "claude" | "codex" | "opencode", configured: boolean) {
+      const rl = providers[provider].rateLimited;
+      const memLastUsed = providers[provider].lastUsedAt;
+      const dbLast = dbLastUsed[provider] ?? null;
+      const lastUsedAt = memLastUsed
+        ? new Date(memLastUsed).toISOString()
+        : dbLast;
+      const providerConfig = config.AI_PROVIDERS[provider] ?? config.DEFAULT_AI_PROVIDERS[provider];
+      return {
+        configured,
+        enabled: providerConfig.enabled !== false,
+        weight: providerConfig.weight,
+        rateLimited: rl,
+        rateLimitedUntil: providers[provider].rateLimitedUntil ?? undefined,
+        lastUsedAt,
+        isPrimary: false,
+      };
+    }
+    const clawsKeyConfigured = !!config.ANTHROPIC_API_KEY || !!config.OPENROUTER_API_KEY;
+    const opencodeCliAvailable = isOpenCodeBinaryAvailable();
+    const opencodeStatus = {
+      ...aiProviderStatus("opencode", clawsKeyConfigured || opencodeCliAvailable),
+      clawsKeyConfigured,
+      opencodeCliAvailable,
+    };
+    const aiProviders = {
+      anthropic: { ...aiProviderStatus("claude", true), authExpired: integrations.agentAuthExpired.claude },
+      openai: { ...aiProviderStatus("codex", true), authExpired: integrations.agentAuthExpired.codex },
+      opencode: opencodeStatus,
+    };
+
+    const ws = await controller.workerStatus();
+    const heartbeat = await controller.heartbeat();
+    const html = buildStatusPage(
+      VERSION,
+      Math.floor(uptimeMs / 1000),
+      { pending: ws.queued, active: ws.running },
+      slackStatus(),
+      { configured: isSlackBotConfigured() },
+      integrations.whatsapp,
+      integrations.email,
+      getHomeAssistantStatus(),
+      runningTasks,
+      theme,
+      controllerStartedAt,
+      dashQueueDepth,
+      dashSnapshots,
+      aiProviders,
+      queueEntries,
+      await loadOperatorAttentionCounts(),
+      heartbeat.alive ? undefined : { lastSeenAt: heartbeat.lastSeenAt },
+      queueCapacityView(ws),
+    );
+    return htmlOk(c, html);
+  });
+
+  app.get("/damp", authMiddleware, async (c) => {
+    const theme = getTheme(c);
+    const saved = c.req.query("saved") === "1";
+    const html = buildDampPage(await getDampTrendRows(), await getRecentDampReadings(200), theme, saved, await loadOperatorAttentionCounts());
+    return htmlOk(c, html);
+  });
+
+  app.get("/dmarc", authMiddleware, async (c) => {
+    const theme = getTheme(c);
+    const since7 = new Date(Date.now() - 7 * 86400000).toISOString();
+    const since30 = new Date(Date.now() - 30 * 86400000).toISOString();
+    const html = buildDmarcPage(
+      await getLatestDmarcReportsPerReporter(),
+      await getDmarcVerdictCounts(since7),
+      await getDmarcVerdictCounts(since30),
+      await getDmarcSourceIps(since30),
+      await getRecentDmarcRows(100),
+      theme,
+      await loadOperatorAttentionCounts(),
+    );
+    return htmlOk(c, html);
+  });
+
+  app.post("/damp/log", authMiddleware, bodyLimit({ maxSize: 1024 * 1024 }), async (c) => {
+    const body = await c.req.parseBody();
+    const readingDate = String(body["reading_date"] ?? "").trim();
+    const date = /^\d{4}-\d{2}-\d{2}$/.test(readingDate)
+      ? readingDate : new Date().toISOString().slice(0, 10);
+    const recordedAt = new Date().toISOString();
+    for (let i = 0; i < DAMP_POINTS.length; i++) {
+      const raw = String(body[`p${i}`] ?? "").trim();
+      if (raw === "") continue;
+      const value = Number(raw);
+      if (!Number.isFinite(value)) continue;
+      await upsertDampReading(DAMP_POINTS[i].location, DAMP_POINTS[i].point, value, date, recordedAt);
+    }
+    return c.redirect("/damp?saved=1", 303);
+  });
+
+  app.post("/damp/reading", authMiddleware, async (c) => {
+    try {
+      const body = JSON.parse(await readTextBody(c)) as {
+        index?: unknown; value?: unknown; reading_date?: unknown;
+      };
+      if (
+        typeof body.index !== "number" &&
+        (typeof body.index !== "string" || body.index.trim() === "")
+      ) {
+        return jsonOk(c, { error: "Bad index" }, 400);
+      }
+      const index = Number(body.index);
+      if (!Number.isInteger(index) || index < 0 || index >= DAMP_POINTS.length) {
+        return jsonOk(c, { error: "Bad index" }, 400);
+      }
+      const rd = String(body.reading_date ?? "").trim();
+      const date = /^\d{4}-\d{2}-\d{2}$/.test(rd) ? rd : new Date().toISOString().slice(0, 10);
+      const raw = String(body.value ?? "").trim();
+      if (raw === "") {
+        await deleteDampReading(DAMP_POINTS[index].location, DAMP_POINTS[index].point, date);
+        return jsonOk(c, { ok: true, cleared: true });
+      }
+      const value = Number(raw);
+      if (!Number.isFinite(value)) return jsonOk(c, { error: "Bad value" }, 400);
+      await upsertDampReading(DAMP_POINTS[index].location, DAMP_POINTS[index].point, value, date, new Date().toISOString());
+      return jsonOk(c, { ok: true });
+    } catch (err) {
+      log.error(`Failed to save damp reading: ${err}`);
+      return jsonOk(c, { error: "Save failed" }, 400);
+    }
+  });
+
+  app.get("/retro", authMiddleware, async (c) => {
+    const theme = getTheme(c);
+    const now = new Date();
+    const [repos, notes, counts] = await Promise.all([listRepos(), listUntriagedFrictionNotes(), countUntriagedFrictionNotesByRepoAndCategory()]);
+    const tasks = await getTasksByIds([...new Set(notes.map((n) => n.task_id).filter((id): id is number => id !== null))]);
+    const taskJobs = new Map(tasks.map((t) => [t.id, t.job_name]));
+    const [last, retrospectives] = await Promise.all([lastFrictionRetrospectiveAt(), listFrictionRetrospectives()]);
+    const repoViews = repos.map((r): RetroRepoView => ({
+      repo: r.fullName,
+      counts: counts.get(r.fullName) ?? new Map(),
+      notes: notes.filter((n) => n.repo === r.fullName),
+      disabled: config.isJobDisabledForRepo("friction-retrospective", r.fullName),
+    }));
+    const view: RetroPageView = {
+      nextDue: nextTimeBasedDue(last ? parseSqlTime(last) : null, now),
+      totalUntriaged: repoViews.filter((r) => !r.disabled).reduce((n, r) => n + r.notes.length, 0),
+      retrospectives,
+      repos: repoViews,
+      taskJobs,
+    };
+    return htmlOk(c, buildRetroPage(view, theme, await loadOperatorAttentionCounts()));
+  });
+
+  // Slack alerts link here: resolve a bridge repo's alertname to the Claws
+  // issue tracking it at click time, else fall back to the alerts page
+  // (docs/issue-tracker.md "Alert bridges").
+  app.get("/alerts/lookup", authMiddleware, async (c) => {
+    const repo = c.req.query("repo") ?? "";
+    const alertname = c.req.query("alertname") ?? "";
+    const id = repo ? await alertBridge.resolveAlertIssue(repo, alertname) : null;
+    log.info(`[alert-lookup] ${repo || "(no repo)"} ${alertname || "(no alertname)"}: ${id ? `redirected to ${id}` : "no issue; redirected to /alerts"}`);
+    return c.redirect(id ? `/issues/${encodeURIComponent(id)}` : "/alerts", 302);
+  });
+
+  // Every open alert issue, with the board column it sits in and whether that
+  // column waits on the operator (docs/product/dashboard-and-integrations.md).
+  app.get("/alerts", authMiddleware, async (c) => {
+    const theme = getTheme(c);
+    const records = await listOpenClawsAlerts();
+    const cards = records.map((record): AttentionCard => ({
+      repo: clawsIssues.primaryRepo(record), ref: record.id, labels: record.labels, lifecycle: record.lifecycle,
+      approvedThrough: record.approved_through, trackerId: record.id,
+    }));
+    const [columns, blockedReasons] = await Promise.all([
+      columnsForCards(cards),
+      getIssueBlockedReasons(records.map((record) => record.id)),
+    ]);
+    const lastSeenIso = (body: string): string | null => {
+      const seen = parseLastSeen(body);
+      const ms = seen ? Date.parse(seen) : NaN;
+      return Number.isNaN(ms) ? null : new Date(ms).toISOString();
+    };
+    const rows = records.map((record, i): AlertRow => {
+      const column = columns.get(flightKey(cards[i].repo, cards[i].ref)) ?? "planning";
+      return {
+        id: record.id,
+        title: record.title,
+        repo: cards[i].repo,
+        repos: record.repos,
+        createdAt: parseSqlTime(record.created_at).toISOString(),
+        updatedAt: lastSeenIso(record.body) ?? parseSqlTime(record.updated_at).toISOString(),
+        occurrences: parseOccurrenceCount(record.body),
+        column,
+        needsOperator: WAITING_COLUMNS.has(column),
+        blockedReason: blockedReasons.get(record.id) ?? null,
+      };
+    });
+    return htmlOk(c, buildAlertsPage(rows, theme, await loadOperatorAttentionCounts()));
+  });
+
+  app.get("/blog", authMiddleware, async (c) => {
+    const theme = getTheme(c);
+    const rawEntries = await listRepoDirectory(BLOG_REPO, BLOG_CONTENT_DIR);
+    const entries = rawEntries.filter((e) => e.type === "file" && e.name.endsWith(".md"));
+    const drafts = await listBlogDrafts(BLOG_REPO);
+    let flash: { text: string; error?: boolean } | undefined;
+    const pushed = c.req.query("pushed");
+    const error = c.req.query("error");
+    const discarded = c.req.query("discarded");
+    if (pushed) flash = { text: `Pushed PR #${pushed}` };
+    else if (discarded) flash = { text: `Discarded saved draft ${discarded}` };
+    else if (error === "badpath") flash = { text: "Invalid file path — must be a .md file under the blog content directory.", error: true };
+    else if (error === "repo") flash = { text: "The blog repo could not be reached — try again shortly.", error: true };
+    else if (error === "push") flash = { text: "Failed to push to PR — see server logs.", error: true };
+    const filter = c.req.query("filter") === "drafts" ? "drafts" : "all";
+    const repoDraft = await loadRepoDraftFlags(entries, (p) => fetchRepoFileWithSha(BLOG_REPO, p));
+    const prNumbers = [...new Set(drafts.map((d) => d.pr_number).filter((n): n is number => n != null))];
+    const prStates = new Map<number, string | null>();
+    await mapWithConcurrency(prNumbers, 4, async (n) => {
+      prStates.set(n, await getPRState(BLOG_REPO, n).catch(() => "UNKNOWN"));
+    });
+    // Open PRs on the blog repo count as drafts of the posts whose files they change.
+    const openPrs = await listPRs(BLOG_REPO).catch((err) => {
+      log.warn(`[blog] listPRs(${BLOG_REPO}) failed: ${err}`);
+      return [] as PR[];
+    });
+    const openPrFiles = new Map<number, OpenPrFiles>();
+    await mapWithConcurrency(openPrs, 4, async (pr) => {
+      const files = await getPRChangedFiles(BLOG_REPO, pr.number).catch((err) => {
+        log.warn(`[blog] getPRChangedFiles(${BLOG_REPO}#${pr.number}) failed: ${err}`);
+        return [] as string[];
+      });
+      openPrFiles.set(pr.number, { title: pr.title, files, updatedAt: pr.updatedAt });
+    });
+    const html = buildBlogListPage(entries, drafts, theme, flash, await loadOperatorAttentionCounts(), { repoDraft, prStates, openPrFiles, filter });
+    return htmlOk(c, html);
+  });
+
+  app.get("/blog/edit", authMiddleware, async (c) => {
+    const theme = getTheme(c);
+    const isNew = c.req.query("new") === "1";
+    if (isNew) {
+      const html = buildBlogEditPage("", "", "", true, theme, undefined, undefined, await loadOperatorAttentionCounts());
+      return htmlOk(c, html);
+    }
+    const path = c.req.query("path") ?? "";
+    if (!path) return c.redirect("/blog", 303);
+    if (!isValidBlogPath(path)) return c.redirect("/blog?error=badpath", 303);
+
+    // A live saved draft wins over repo content so cross-browser edits survive; a
+    // stale one (PR merged/closed/not found, or repo file changed) is never loaded
+    // silently — the repo version shows unless the operator asks for ?draft=1.
+    let repoUnchecked = false;
+    const file = await fetchRepoFileWithSha(BLOG_REPO, path).catch((err) => {
+      log.warn("blog edit: could not read the repo file", undefined, { repo: BLOG_REPO }, err);
+      repoUnchecked = true;
+      return null;
+    });
+    const draft = await getBlogDraft(BLOG_REPO, path);
+    if (!draft && !file) return c.redirect(repoUnchecked ? "/blog?error=repo" : "/blog", 303);
+    let content: string;
+    let baseSha: string;
+    let pr: { number: number } | undefined;
+    let draftInfo: BlogEditDraftInfo | undefined;
+    if (draft) {
+      if (draft.pr_number != null) pr = { number: draft.pr_number };
+      const prState = draft.pr_number != null
+        ? await getPRState(BLOG_REPO, draft.pr_number).catch(() => "UNKNOWN")
+        : null;
+      const liveness = draftLiveness(draft, file?.sha, prState);
+      draftInfo = { exists: true };
+      if (repoUnchecked) {
+        content = draft.content;
+        baseSha = draft.base_sha ?? "";
+      } else if (liveness.live) {
+        content = draft.content;
+        baseSha = draft.base_sha ?? "";
+      } else if (c.req.query("draft") === "1" || !file) {
+        content = draft.content;
+        baseSha = file?.sha ?? "";
+        draftInfo.stale = { reason: liveness.reason, loaded: true, prNumber: draft.pr_number, noRepoFile: !file };
+      } else {
+        content = file.content;
+        baseSha = file.sha;
+        draftInfo.stale = { reason: liveness.reason, loaded: false, prNumber: draft.pr_number };
+      }
+    } else {
+      content = file!.content;
+      baseSha = file!.sha;
+    }
+    const saved = c.req.query("saved") === "1";
+    const error = c.req.query("error");
+    let flash: { text: string; error?: boolean } | undefined;
+    if (saved) flash = { text: "Saved to Claws ✓" };
+    else if (repoUnchecked) flash = { text: "The blog repo could not be reached, so this saved draft was not checked against the repo version.", error: true };
+    else if (error === "push") flash = { text: "Failed to push to PR — see server logs.", error: true };
+    const html = buildBlogEditPage(path, content, baseSha, false, theme, pr, flash, await loadOperatorAttentionCounts(), draftInfo);
+    return htmlOk(c, html);
+  });
+
+  app.get("/blog/diff", authMiddleware, async (c) => {
+    const theme = getTheme(c);
+    const path = c.req.query("path") ?? "";
+    if (!isValidBlogPath(path)) return c.redirect("/blog?error=badpath", 303);
+    const draft = await getBlogDraft(BLOG_REPO, path);
+    if (!draft) return c.redirect("/blog", 303);
+    // Diff against the repo file at the draft's own path, else the post's repo file
+    // with the same slug (its date may have changed before publishing), else empty.
+    let againstPath: string | null = null;
+    let repoUnchecked = false;
+    const onRepoError = (err: unknown) => {
+      log.warn("blog diff: could not read the repo file", undefined, { repo: BLOG_REPO }, err);
+      repoUnchecked = true;
+      return null;
+    };
+    let against = await fetchRepoFileWithSha(BLOG_REPO, path).catch(onRepoError);
+    if (against) {
+      againstPath = path;
+    } else {
+      const slug = blogSlug(path);
+      const match = ((await listRepoDirectory(BLOG_REPO, BLOG_CONTENT_DIR).catch(onRepoError)) ?? [])
+        .filter((e) => e.type === "file" && e.name.endsWith(".md") && blogSlug(e.path) === slug)
+        .sort((a, b) => (a.name < b.name ? 1 : a.name > b.name ? -1 : 0))[0];
+      if (match) {
+        against = await fetchRepoFileWithSha(BLOG_REPO, match.path).catch(onRepoError);
+        if (against) againstPath = match.path;
+      }
+    }
+    if (repoUnchecked) return c.redirect("/blog?error=repo", 303);
+    const prState = draft.pr_number != null
+      ? await getPRState(BLOG_REPO, draft.pr_number).catch(() => "UNKNOWN")
+      : null;
+    const liveness = draftLiveness(draft, againstPath === path ? against?.sha : undefined, prState);
+    const diff = lineDiff(against?.content ?? "", draft.content);
+    const html = buildBlogDiffPage(
+      draft,
+      againstPath ? { path: againstPath } : null,
+      diff,
+      theme,
+      liveness.live ? undefined : liveness.reason,
+      await loadOperatorAttentionCounts(),
+    );
+    return htmlOk(c, html);
+  });
+
+  // Discard a Claws-saved draft. Only the stored row is removed; nothing is written to the blog repo.
+  app.post("/blog/discard", authMiddleware, async (c) => {
+    const body = await c.req.parseBody();
+    const path = String(body["path"] ?? "").trim();
+    if (!isValidBlogPath(path)) return c.redirect("/blog?error=badpath", 303);
+    await deleteBlogDraft(BLOG_REPO, path);
+    const name = path.split("/").pop() ?? path;
+    return c.redirect("/blog?discarded=" + encodeURIComponent(name), 303);
+  });
+
+  app.post("/blog/save", authMiddleware, bodyLimit({ maxSize: 1024 * 1024 }), async (c) => {
+    const body = await c.req.parseBody();
+    const action = String(body["action"] ?? "");
+    const path = String(body["path"] ?? "").trim();
+    const baseSha = String(body["base_sha"] ?? "");
+    const content = String(body["content"] ?? "");
+    const isNew = String(body["new"] ?? "") === "1";
+    const theme = getTheme(c);
+
+    // Path validation is the only guard on the single repo write path. Re-render the
+    // form with the submitted content instead of redirecting, so a bad path never
+    // discards a post the user just wrote.
+    if (!isValidBlogPath(path)) {
+      const flash = { text: "Invalid file path — must be a .md file under the blog content directory.", error: true };
+      const html = buildBlogEditPage(path, content, baseSha, isNew, theme, undefined, flash, await loadOperatorAttentionCounts());
+      return htmlOk(c, html);
+    }
+
+    const titleMatch = content.match(/^title:\s*['"]?(.+?)['"]?\s*$/m);
+    const title = titleMatch ? titleMatch[1] : null;
+
+    // Re-saving over a draft whose PR merged, closed or vanished drops that PR
+    // pointer, so the saved draft becomes live again instead of staying stale.
+    const prior = await getBlogDraft(BLOG_REPO, path);
+    if (prior?.pr_number != null) {
+      const state = await getPRState(BLOG_REPO, prior.pr_number).catch(() => "UNKNOWN");
+      if (state !== "OPEN" && state !== "UNKNOWN") await clearBlogDraftPR(BLOG_REPO, path);
+    }
+
+    await upsertBlogDraft(BLOG_REPO, path, content, baseSha || null, title, new Date().toISOString());
+
+    if (action === "push") {
+      try {
+        const slug = path.split("/").pop()!.replace(/\.md$/, "");
+        const message = `blog: update ${slug}`;
+        const b64 = Buffer.from(content, "utf8").toString("base64");
+
+        const draft = await getBlogDraft(BLOG_REPO, path);
+        if (draft?.pr_number != null && draft.pr_branch) {
+          const state = await getPRState(BLOG_REPO, draft.pr_number);
+          if (state === "OPEN") {
+            const onBranch = await fetchRepoFileWithSha(BLOG_REPO, path, draft.pr_branch);
+            if (onBranch?.content === content) {
+              // Nothing changed since the last push — don't create an empty commit.
+              return c.redirect("/blog?pushed=" + draft.pr_number, 303);
+            }
+            await putRepoFile(BLOG_REPO, draft.pr_branch, path, b64, message, onBranch?.sha);
+            await setBlogDraftPushed(BLOG_REPO, path, draft.pr_number, draft.pr_branch);
+            return c.redirect("/blog?pushed=" + draft.pr_number, 303);
+          }
+          // PR merged, closed, or deleted — stale pointer, fall through to a fresh PR.
+          log.info(`[blog] recorded PR #${draft.pr_number} for ${path} is ${state ?? "missing"}; opening a new PR`);
+          await clearBlogDraftPR(BLOG_REPO, path);
+        }
+
+        const base = await getDefaultBranch(BLOG_REPO);
+        const branch = `claws/blog-${slug}-${Date.now()}`;
+        await createBranchRef(BLOG_REPO, branch, base);
+        const existing = await fetchRepoFileWithSha(BLOG_REPO, path, base);
+        await putRepoFile(BLOG_REPO, branch, path, b64, message, existing?.sha);
+        const pr = await createPR(BLOG_REPO, branch, message, "Authored via the Claws blog editor.");
+        await setBlogDraftPushed(BLOG_REPO, path, pr, branch);
+        return c.redirect("/blog?pushed=" + pr, 303);
+      } catch (err) {
+        log.error(`[blog] push to PR failed for ${path}: ${String(err)}`);
+        return c.redirect("/blog/edit?path=" + encodeURIComponent(path) + "&error=push", 303);
+      }
+    }
+
+    return c.redirect("/blog/edit?path=" + encodeURIComponent(path) + "&saved=1", 303);
+  });
+
+  app.get("/jobs", authMiddleware, async (c) => {
+    const theme = getTheme(c);
+    const repos = await listRepos();
+    repos.sort((a, b) => a.fullName.localeCompare(b.fullName));
+    const saved = c.req.query("saved") === "1";
+    const locked = Object.fromEntries(repos.map((r) => [r.fullName, config.getLockedJobsForRepo(r.fullName)]));
+    const jobs = await jobStateRecord(controller);
+    const runningTasks = await runningTaskViews();
+    const heartbeat = await controller.heartbeat();
+    const html = buildJobsMatrixPage(repos, config.DISABLED_JOBS_BY_REPO, saved, theme, locked, {
+      jobs,
+      runningTasks,
+      latestRuns: await getLatestRunIdsByJob(),
+      paused: await controller.pausedJobs(),
+      scheduleInfo: await controller.jobScheduleInfo(),
+      staleController: heartbeat.alive ? undefined : { lastSeenAt: heartbeat.lastSeenAt },
+    }, await loadOperatorAttentionCounts());
+    return htmlOk(c, html);
+  });
+
+  app.get("/prs", authMiddleware, async (c) => {
+    const query = parsePrsQuery((k) => c.req.query(k));
+    const theme = getTheme(c);
+    const repos = await listRepos();
+    const perRepo = await mapWithConcurrency(repos, 8, async (r) => {
+      const prs = await listPRs(r.fullName, { staleOk: true }).catch(() => []);
+      const [statuses, clawsPrs] = await Promise.all([
+        loadPRRowStatuses(r.fullName, prs, { staleOk: true }),
+        listClawsPrs(r.fullName).catch(() => []),
+      ]);
+      const prRows = new Map(clawsPrs.map((row) => [row.prNumber, row]));
+      return Promise.all(prs.map(async (pr) => {
+        const prRow = prRows.get(pr.number);
+        const approvalExempt = await isApprovalExempt(r.fullName, pr, prRow).catch(() => false);
+        const approvalHoldReason = approvalExempt ? null : await getApprovalHoldReason(r.fullName, pr).catch(() => null);
+        return { repo: r.fullName, pr, status: statuses.get(pr.number), prRow, approvalExempt, approvalHoldReason: approvalHoldReason ?? undefined };
+      }));
+    });
+    // Database only, batched by issue; a failed read costs the warnings, not the page.
+    const [warnings, prSessions] = await Promise.all([
+      loadManualActionWarnings(perRepo.flat().flatMap((row) => row.prRow ? [manualWarningRow(row.prRow)] : []))
+        .catch((err) => { log.warn(`[prs] manual-action warnings: ${err}`); return new Map<string, string>(); }),
+      listLivePrStartedSessions().catch((err) => { log.warn(`[prs] active sessions: ${err}`); return new Map<string, string>(); }),
+    ]);
+    const rows = perRepo.flat().map((row) => {
+      const manualWarning = warnings.get(`${row.repo}#${row.pr.number}`);
+      const activeSession = prSessions.get(prSessionRef(row.repo, row.pr.number));
+      return { ...row, ...(manualWarning ? { manualWarning } : {}), ...(activeSession ? { activeSession } : {}) };
+    });
+    const snapshot = await controller.queueSnapshot();
+    return htmlOk(c, buildAllPRsPage(rows, snapshot.items, theme, query, await loadOperatorAttentionCounts()));
+  });
+
+  /**
+   * The latest plan of every open native issue, for the collapsed plan block
+   * on board cards and `/issues` rows. Best-effort: a failed read costs the
+   * plan blocks, not the page.
+   */
+  async function loadLatestPlans(page: string): Promise<Map<string, ClawsIssuePlanRow>> {
+    return await clawsIssues.getLatestPlansForOpenIssues().catch((err) => {
+      log.warn(`[${page}] plans: ${err}`);
+      return new Map<string, ClawsIssuePlanRow>();
+    });
+  }
+
+  /**
+   * The plan block for `ref`, or undefined for a forge issue or a native one
+   * with no plan yet. Only the Requirement section (else the first) is
+   * rendered, to keep a board of ~100 cards small.
+   */
+  function planPreviewFor(ref: config.IssueRef, plans: Map<string, ClawsIssuePlanRow>): PlanPreview | undefined {
+    if (!isNativeIssue(ref)) return undefined;
+    const row = plans.get(String(canonicalIssueRef(ref)));
+    if (!row) return undefined;
+    const sections = planParser.parsePlanSections(row.body);
+    if (sections.length === 0) return undefined;
+    const requirement = sections.find((s) => planParser.isWhatChangesTitle(s.title)) ?? sections.find((s) => s.title.toLowerCase() === "requirement") ?? sections[0];
+    return {
+      summary: `${sections.length} section${sections.length === 1 ? "" : "s"}`,
+      requirementHtml: renderMarkdown(requirement.markdown),
+      url: `/issues/${encodeURIComponent(row.issue_id)}#plan`,
+    };
+  }
+
+  /**
+   * The idea block for a board card: the latest requirements version's
+   * Requirement part when there is one, else the start of the issue body. The
+   * board renders it only on a card in Drafting or Requirements review.
+   */
+  function ideaPreviewFor(row: ClawsIssueRequirementsRow | undefined, body: string, url: string): IdeaPreview {
+    if (row) {
+      return {
+        summary: `Requirements v${row.version} · ${row.kind} — ${row.title}`,
+        html: renderMarkdown(row.requirement),
+        url,
+      };
+    }
+    return { summary: "Idea", html: `<p>${escapeHtml(ideaExcerpt(body))}</p>`, url };
+  }
+
+  app.get("/issues", authMiddleware, async (c) => {
+    const theme = getTheme(c);
+    const repos = await listRepos();
+    const plans = await loadLatestPlans("issues");
+    const [perRepo, unassignedIssues, openNative] = await Promise.all([
+      mapWithConcurrency(repos, 8, async (r) =>
+        (await listOpenIssues(r.fullName).catch(() => [])).map((issue) => ({ repo: r.fullName, issue, plan: planPreviewFor(issue.number, plans) })),
+      ),
+      clawsIssues.listUnassignedOpenIssues().catch(() => []),
+      listOpenClawsIssues({}).catch(() => []),
+    ]);
+    const toRow = (i: NativeIssueRecord): UnassignedIssueRow => ({
+      id: i.id,
+      title: i.title,
+      authorLogin: i.author_login,
+      updatedAt: clawsIssues.toIso(i.updated_at),
+      repos: i.repos,
+      plan: planPreviewFor(i.id, plans),
+    });
+    const unassigned: UnassignedIssueRow[] = unassignedIssues.map(toRow);
+    const configured = new Set(repos.map((r) => r.fullName.toLowerCase()));
+    const orphaned: UnassignedIssueRow[] = openNative
+      .filter((i) => i.repos.length > 0 && !i.repos.some((r) => configured.has(r.toLowerCase())))
+      .map(toRow);
+    // A Blocked row only waiting on other work in flight reads Queued, as on
+    // the board. A forge issue's tracker id is its shadow's.
+    const shadowStages = await clawsIssues.getOpenShadowStages()
+      .catch((err) => { log.warn(`[issues] shadow stages: ${err}`); return new Map<string, { id: string }>(); });
+    const rows = perRepo.flat().map((row) => ({
+      ...row,
+      trackerId: isNativeIssue(row.issue.number)
+        ? String(canonicalIssueRef(row.issue.number))
+        : shadowStages.get(`${row.repo}\u0000${String(row.issue.number)}`)?.id,
+    }));
+    const blockedIds = rows
+      .filter((row) => row.issue.labels.some((l) => l.name === LABELS.blocked))
+      .map((row) => row.trackerId)
+      .filter((id): id is string => !!id);
+    const queued = new Set((await issuesQueued(blockedIds)).keys());
+    const snapshot = await controller.queueSnapshot();
+    return htmlOk(c, buildAllIssuesPage(rows, snapshot.items, theme, unassigned, config.SKIPPED_ITEMS, orphaned, await loadOperatorAttentionCounts(), repos.map((r) => r.fullName), queued));
+  });
+
+  // ── Kanban board (docs/issue-tracker.md#board) ──
+  //
+  // A column is derived from the issue's labels on every render, never stored,
+  // so the board and the pipeline cannot disagree. `/board/move` is the inverse
+  // map: it applies the labels that put an issue in the column it was dropped
+  // into, through the same façade the /issues row buttons use.
+  //
+  // `operator-attention.ts` repeats this route's column-input assembly for the
+  // nav's Issues count; a change to how a card's column is derived here must
+  // be mirrored there.
+
+  // Everything the board renders, for `/board` and for its poller's
+  // `/api/board`; `repoFilter` is `?repo=`, `""` for every repository. `/board`
+  // passes `staleOk` so a reload renders from cached forge lists; the poller
+  // stays strict like every `/api` path.
+  async function loadBoardView(repoFilter: string, opts?: StaleReadOptions): Promise<BoardPageView> {
+    const repos = await listRepos();
+    const plans = await loadLatestPlans("board");
+    // The requirements columns and Planning carry no label: a forge card's
+    // stage comes off its shadow. A card in `ideas` sits in Requirements review
+    // when its latest requirements version has no human feedback since, and in
+    // Drafting otherwise — read here on every render, so a comment moves the
+    // card back with no edit to the issue. All best-effort — a failed
+    // requirements read costs the chip and puts every `ideas` card in Drafting,
+    // a failed feedback read leaves cards with a version in Requirements
+    // review, and a failed shadow read puts forge cards in Drafting.
+    const [shadowStages, requirements] = await Promise.all([
+      clawsIssues.getOpenShadowStages().catch((err) => { log.warn(`[board] shadow stages: ${err}`); return new Map<string, { id: string; lifecycle: IssueLifecycle; approvedThrough: ApprovedThrough; hasPlannedPrs: boolean }>(); }),
+      clawsIssues.getLatestRequirementsForOpenIssues().catch((err) => { log.warn(`[board] requirements: ${err}`); return null; }),
+    ]);
+    const feedbackPending = requirements === null
+      ? new Set<string>()
+      : await clawsIssues.getRequirementsFeedbackPending(requirements).catch((err) => { log.warn(`[board] requirements feedback: ${err}`); return new Set<string>(); });
+    const requirementsReview = (trackerId: string | undefined): boolean =>
+      !!trackerId && !!requirements?.has(trackerId) && !feedbackPending.has(trackerId);
+    const requirementsVersion = (trackerId: string | undefined): number | null | undefined =>
+      requirements === null ? undefined : (trackerId ? requirements.get(trackerId)?.version ?? null : null);
+    const requirementsRow = (trackerId: string | undefined): ClawsIssueRequirementsRow | undefined =>
+      trackerId ? requirements?.get(trackerId) : undefined;
+    // The board's cheap has-a-plan hint for the plan rule's pre-flight — no
+    // per-card comment fetch. A native card has a stored plan version; a forge
+    // card's shadow is in `awaiting-plan-review` (set when a plan is posted),
+    // or has a stored PR list. `/board/move` re-checks against the real plan
+    // either way.
+    const hasPlanHint = (ref: config.IssueRef, shadow?: { lifecycle: IssueLifecycle; hasPlannedPrs: boolean }): boolean =>
+      isNativeIssue(ref)
+        ? plans.has(String(canonicalIssueRef(ref)))
+        : shadow?.lifecycle === "awaiting-plan-review" || !!shadow?.hasPlannedPrs;
+    const since = new Date(Date.now() - DONE_WINDOW_HOURS * 60 * 60 * 1000);
+    // Each open forge card's tracker id, keyed by `flightKey`, for the
+    // awaiting-operator read below; a native card's ref is its own.
+    const cardTrackerIds = new Map<string, string>();
+    // One repository's API failure must not empty the whole board — but a
+    // silently short board reads as an empty backlog, so the count of sources
+    // that came back incomplete is rendered with it. A fetch that failed and
+    // one that hit the open-issue cap are the same thing to a reader: cards
+    // that should be on the board are not.
+    const incomplete = new Set<string>();
+    const orNone = (source: string) => (err: unknown): never[] => {
+      log.warn(`[board] ${source}: ${err}`);
+      incomplete.add(source);
+      return [];
+    };
+    const perRepo = await mapWithConcurrency(repos, 8, async (r) => {
+      const [open, closed] = await Promise.all([
+        listOpenIssues(r.fullName, opts).catch(orNone(r.fullName)),
+        // Only native issues fill the Done column: a forge's closed issues
+        // would cost an extra API round trip per repo on every page load, and
+        // the forge already shows them.
+        clawsIssues.listClosedIssuesSince(r.fullName, since, DONE_COLUMN_LIMIT).catch(orNone(r.fullName)),
+      ]);
+      // A dependency bot's tracking issue (Renovate's Dependency Dashboard) is
+      // never imported, so it stays on the forge — but it is not work, and
+      // must not sit in Drafting.
+      const work = open.filter((issue) => isNativeIssue(issue.number) || !isDependencyBotAuthor(issue));
+      const cards: BoardCard[] = work.map((issue) => {
+        const shadow = issue.lifecycle ? undefined : shadowStages.get(`${r.fullName}\u0000${String(issue.number)}`);
+        const trackerId = isNativeIssue(issue.number) ? String(canonicalIssueRef(issue.number)) : shadow?.id;
+        if (trackerId) cardTrackerIds.set(flightKey(r.fullName, issue.number), trackerId);
+        // A forge issue the importer has not moved yet has no plan anyone can
+        // review: no agent acts on it until it is native, so whatever its
+        // forge labels say, the card offers no plan gate.
+        const awaitingImport = awaitingImportReason(r.fullName, issue) !== null;
+        return {
+        repo: r.fullName,
+        ref: issue.number,
+        title: issue.title,
+        labels: issue.labels.map((l) => l.name),
+        lifecycle: issue.lifecycle ?? shadow?.lifecycle,
+        approvedThrough: issue.approvedThrough ?? shadow?.approvedThrough ?? "none",
+        requirementsVersion: requirementsVersion(trackerId),
+        requirementsReview: requirementsReview(trackerId),
+        url: config.issueUrl(r.fullName, issue.number),
+        plan: awaitingImport ? undefined : planPreviewFor(issue.number, plans),
+        hasPlan: awaitingImport ? false : hasPlanHint(issue.number, shadow),
+        ...(awaitingImport ? { awaitingImport, importHold: issueImporter.importHoldReason(r.fullName, String(issue.number)) } : {}),
+        idea: ideaPreviewFor(requirementsRow(trackerId), issue.body, config.issueUrl(r.fullName, issue.number)),
+        updatedAt: issue.updatedAt,
+        // Native issues only; a forge card's age chip approximates from `updatedAt`.
+        stageSince: issue.stageSince,
+        repos: issue.repos,
+        };
+      });
+      // The closed cards are kept apart with the time they were closed: the
+      // query's limit is per repository, so the column is bounded globally
+      // below rather than at 50 × however many repositories Claws manages.
+      const done = closed.map((record) => ({
+        closedAt: record.closed_at ?? "",
+        card: {
+          repo: r.fullName,
+          ref: record.id,
+          title: record.title,
+          labels: record.labels,
+          closed: true,
+          stateReason: record.state_reason ?? undefined,
+          url: config.issueUrl(r.fullName, record.id),
+          updatedAt: clawsIssues.toIso(record.updated_at),
+          stageSince: record.closed_at ? clawsIssues.toIso(record.closed_at) : undefined,
+          repos: [...record.repos].sort(),
+        } satisfies BoardCard,
+      }));
+      return { cards, done };
+    });
+    // Newest first across every repository, then cut to the one bound the
+    // 8-hour window is paired with — the same order `listClosedIssuesSince`
+    // applies within a repository, so the column reads the same either way.
+    //
+    // `?repo=` is applied here rather than only in `buildBoardPage`, which
+    // filters what it is handed: cutting the merged list first would hand a
+    // filtered board whatever few of that repository's cards survived a global
+    // top-50 spread across every other one — possibly none, with nothing on the
+    // page to say cards were dropped. Filtering first makes the cap bound the
+    // column that is actually rendered. Every other column is unfiltered here
+    // because nothing cuts it.
+    const done = perRepo
+      .flatMap((r) => r.done)
+      .filter((d) => !repoFilter || d.card.repo === repoFilter || d.card.repos?.includes(repoFilter))
+      .sort((a, b) => (a.closedAt < b.closedAt ? 1 : a.closedAt > b.closedAt ? -1 : 0))
+      .slice(0, DONE_COLUMN_LIMIT)
+      .map((d) => d.card);
+    // Native issues with no repo never come through listOpenIssues, which
+    // lists an issue under its primary repo; they sit in Drafting until one
+    // is assigned. A multi-repo issue is a normal card under its primary repo, and matches the `?repo=` filter for every repo it names.
+    const unassigned: BoardCard[] = (await clawsIssues.listUnassignedOpenIssues().catch(orNone("unassigned issues"))).map((issue) => ({
+      repo: "",
+      ref: issue.id,
+      title: issue.title,
+      labels: issue.labels,
+      lifecycle: issue.lifecycle,
+      approvedThrough: issue.approved_through ?? "none",
+      requirementsVersion: requirementsVersion(issue.id),
+      requirementsReview: requirementsReview(issue.id),
+      url: config.issueUrl("", issue.id),
+      plan: planPreviewFor(issue.id, plans),
+      hasPlan: hasPlanHint(issue.id),
+      idea: ideaPreviewFor(requirementsRow(issue.id), issue.body, config.issueUrl("", issue.id)),
+      updatedAt: clawsIssues.toIso(issue.updated_at),
+      stageSince: clawsIssues.toIso(issue.stage_changed_at ?? issue.updated_at),
+    }));
+    // Operator-set model-plan cells, summarised on the card. Best-effort: a
+    // failed read costs the summary line, not the board. An unassigned card has
+    // no repo to key on, so it matches its native id in any repo — a `clw_…`
+    // id is unique fleet-wide.
+    const explicitPlans = new Map<string, IssueModelPlanRow[]>();
+    for (const row of await listExplicitIssueModelPlanRows().catch((err) => { log.warn(`[board] model plans: ${err}`); return []; })) {
+      for (const key of [`${row.repo}\u0000${row.issue_ref}`, `\u0000${row.issue_ref}`]) {
+        explicitPlans.set(key, [...(explicitPlans.get(key) ?? []), row]);
+      }
+    }
+    const withModelPlan = (card: BoardCard): BoardCard => {
+      const summary = summarizeModelPlanCells(explicitPlans.get(`${card.repo}\u0000${card.ref}`) ?? []);
+      return summary ? { ...card, modelPlan: summary } : card;
+    };
+    const boardSessions = await listLiveBoardStartedSessions().catch((err) => { log.warn(`[board] active sessions: ${err}`); return new Map<string, string>(); });
+    const withActiveSession = (card: BoardCard): BoardCard => {
+      const id = boardSessions.get(String(card.ref));
+      return id ? { ...card, activeSession: id } : card;
+    };
+    // Backlog cards are off the board (#3293): split out here so they never
+    // render; `/backlog` lists them. Open cards only — Done is closed, and
+    // `columnFor` reads `closed` first.
+    // The collapsed Backlog tray shows how many there are under `?repo=`.
+    const onBoard: BoardCard[] = [];
+    let backlogCount = 0;
+    const backlogNativeIds: string[] = [];
+    for (const card of [...perRepo.flatMap((r) => r.cards), ...unassigned]) {
+      if (columnFor({ labels: card.labels, unassigned: !card.repo }) !== BACKLOG_DESTINATION) onBoard.push(card);
+      else if (!repoFilter || card.repo === repoFilter || card.repos?.includes(repoFilter)) {
+        backlogCount++;
+        if (isClawsIssueId(card.ref)) backlogNativeIds.push(String(card.ref));
+      }
+    }
+    // The tray names the nearest day a parked issue comes back.
+    const backlogNextReturn = [...(await getIssueBacklogUntil(backlogNativeIds)
+      .catch((err) => { log.warn(`[board] backlog return dates: ${err}`); return new Map<string, string>(); })).values()]
+      .sort()[0] ?? null;
+    // The derived columns (In progress, Awaiting merge) read each
+    // open card's running implementer and open `claws_prs` rows. Best-effort
+    // inside `loadBoardFlights`: a failed read leaves cards out of flight
+    // rather than failing the page. Backlog outranks flight in `columnFor`, so
+    // the split above needs none of it.
+    const flights = await loadBoardFlights(onBoard);
+    // An issue whose every PR step has merged and whose plan's operator step
+    // is open sits in Awaiting merge with an "Awaiting operator" chip.
+    const trackerIdOf = (card: BoardCard): string | undefined =>
+      card.repo ? cardTrackerIds.get(flightKey(card.repo, card.ref)) : String(card.ref);
+    const onBoardIds = onBoard.map(trackerIdOf).filter((id): id is string => !!id);
+    const awaitingOperator = await issuesAwaitingOperator(onBoardIds)
+      .catch((err) => { log.warn(`[board] awaiting operator: ${err}`); return new Map<string, { position: number; title: string }>(); });
+    // Why Claws parked a Blocked card for a human, shown on the card.
+    const blockedReasons = await getIssueBlockedReasons(onBoardIds)
+      .catch((err) => { log.warn(`[board] blocked reasons: ${err}`); return new Map<string, string>(); });
+    // A Blocked card only waiting on other work in flight is in Queued, with
+    // what it waits on. Best-effort inside `issuesQueued`.
+    const queued = await issuesQueued(onBoardIds);
+    // A design change waiting for re-approval puts its card in Awaiting plan
+    // review with a "Needs decision" chip. Best-effort, like the flight.
+    const reapprovalPending = await listPendingReapprovalIssueIds(onBoardIds)
+      .catch((err) => { log.warn(`[board] pending re-approvals: ${err}`); return new Set<string>(); });
+    // Approved requirements fill the approval track's Reqs gate.
+    // Best-effort: a failed read leaves the gate to the column.
+    const approvedRequirements = await listRequirementsApprovedIssueIds(onBoardIds)
+      .catch((err) => { log.warn(`[board] approved requirements: ${err}`); return new Set<string>(); });
+    // Overlay each open PR row with the same cached bulk status the repo page
+    // and All PRs read, so the card's chips agree with them. A repository
+    // whose fetch fails gets no overlay and its chips read the stored stage.
+    const prRepos = [...new Set([...flights.values()].flatMap((f) => f.openPrs.map((pr) => pr.repo)))];
+    const liveStatuses = new Map<string, Map<number, PRRepoStatus>>();
+    await mapSettledWithConcurrency(prRepos, 8, async (repo) => {
+      liveStatuses.set(repo, await listPRStatuses(repo, opts));
+    });
+    const withFlight = (card: BoardCard): BoardCard => {
+      const trackerId = trackerIdOf(card);
+      const step = trackerId ? awaitingOperator.get(trackerId) : undefined;
+      if (step) {
+        // Same sources as the `claws-awaiting-operator` comment: the step's title and the plan's manual-actions section.
+        const planRow = isNativeIssue(card.ref) ? plans.get(String(canonicalIssueRef(card.ref))) : undefined;
+        const section = planRow ? planParser.findManualActionsSection(planRow.body) : null;
+        card = {
+          ...card,
+          awaitingOperator: true,
+          operatorStep: {
+            summary: `Operator step ${step.position} · ${step.title}`,
+            html: renderMarkdown(section?.body || "_See the plan's manual-actions section._"),
+            url: card.url,
+          },
+        };
+      }
+      const blockedReason = trackerId ? blockedReasons.get(trackerId) : undefined;
+      if (blockedReason) card = { ...card, blockedReason, blockedReasonHtml: renderMarkdown(displayBlockedReason(blockedReason)) };
+      const queuedReason = trackerId ? queued.get(trackerId) : undefined;
+      if (queuedReason) card = { ...card, queued: true, queuedReason, queuedReasonHtml: renderMarkdown(displayBlockedReason(queuedReason)) };
+      if (trackerId && reapprovalPending.has(trackerId)) card = { ...card, reapprovalPending: true };
+      if (trackerId && approvedRequirements.has(trackerId)) card = { ...card, requirementsApproved: true };
+      const flight = flights.get(flightKey(card.repo, card.ref));
+      if (!flight) return card;
+      const openPrs = flight.openPrs.map((row) => boardCardPr(row, liveStatuses.get(row.repo)?.get(row.prNumber)));
+      return { ...card, flight: { ...flight, openPrs } };
+    };
+    return {
+      cards: [...onBoard.map(withFlight), ...done].map(withModelPlan).map(withActiveSession),
+      // What Claws manages, not what the cards happen to mention: the `?repo=`
+      // cut above and the Done column's row cap both drop cards, and a
+      // repository that lost all of its would otherwise drop out of the filter
+      // that is hiding it, leaving "All repositories" the only way back to it.
+      repoOptions: repos.map((r) => r.fullName),
+      repoFilter,
+      // The warning is about the board in front of the operator, so it counts
+      // only the sources that board renders from. Under `?repo=` that is the
+      // one repository: the others contribute no card either way, and counting
+      // them would put the one incomplete source that matters inside a larger
+      // number. The unassigned list is in the same position — its cards carry
+      // `repo: ""`, so a `?repo=` filters every one of them away.
+      incompleteSources: repoFilter ? (incomplete.has(repoFilter) ? 1 : 0) : incomplete.size,
+      backlogCount,
+      backlogNextReturn,
+    };
+  }
+
+  app.get("/board", authMiddleware, async (c) => {
+    const theme = getTheme(c);
+    const view = await loadBoardView(c.req.query("repo") ?? "", { staleOk: true });
+    return htmlOk(c, buildBoardPage(view, theme, await loadOperatorAttentionCounts()));
+  });
+
+  // The Board page polls this to keep its cards, columns and nav counts current
+  // while it stays open (#clw_01M59YYPDF6SQS5RR4JSFDZGJQ).
+  app.get("/api/board", authMiddleware, async (c) => {
+    const view = await loadBoardView(c.req.query("repo") ?? "");
+    return c.json(renderBoardRefresh(view, await loadOperatorAttentionCounts()));
+  });
+
+  /**
+   * Move a native issue to `target` — the one write behind a board move, a
+   * backlog Promote and the issue page's Status buttons. Any move into
+   * Planning with no recorded approval yet is the promotion, recording
+   * `approvedBy` as the approver of the latest requirements version —
+   * decided on approval state rather than on the column the issue came from,
+   * so a drag through Blocked or Approved on the way to Planning still
+   * records one; any move into `ideas` (Drafting or Requirements review) is the demotion, which clears the
+   * approval and skips a queued planner run. An *entry* move (`isEntry`, the
+   * backlog Promote or a dependency release) is the one exception, whatever
+   * its target: it restores the issue to a column it already earned —
+   * Planning because it has a plan or approved requirements, Drafting or Requirements review because
+   * it has neither — not because anyone is approving or demoting anything
+   * now, so it is always a plain lifecycle write. Everything else is a
+   * plain lifecycle write too.
+   *
+   * A promotion approves the *latest* requirements version, so this can rename
+   * the issue even on a re-plan drag back into Planning — not only on the
+   * first promotion out of Drafting or Requirements review — when that version's title differs from the
+   * issue's; `promoteClawsIssue` keeps the title it was filed under in
+   * `filed_title`. That is intentional: the latest version is the one the
+   * approval is actually for.
+   *
+   * `promoteIssue`'s write is a compare-and-swap on `record.lifecycle`, so it
+   * throws when the issue changed lifecycle since the caller read it —
+   * `applyBoardMove`'s catch turns that into a 500 with `partial: true`
+   * rather than answering 200 for a move that did not happen.
+   */
+  async function moveNativeLifecycle(
+    owner: string,
+    record: NonNullable<Awaited<ReturnType<typeof clawsIssues.getIssue>>>,
+    target: IssueLifecycle,
+    approvedBy: string | undefined,
+    isEntry: boolean,
+    reason?: string,
+  ): Promise<void> {
+    if (target === "blocked") {
+      // Throws `BlockedReasonRequiredError` for a blank reason, before any write.
+      await clawsIssues.blockIssue(owner, record.id, reason ?? "");
+    } else if (isEntry) {
+      await clawsIssues.setLifecycle(owner, record.id, target);
+    } else if (target === "planning" && record.requirements_approved_at == null) {
+      const promoted = await clawsIssues.promoteIssue(record.id, approvedBy ?? clawsIssues.CLAWS_NATIVE_LOGIN, record.lifecycle);
+      if (!promoted) throw new Error(`${record.id} changed lifecycle since it was read — try the move again`);
+    } else if (target === "ideas") {
+      await clawsIssues.demoteIssue(record.id);
+    } else {
+      await clawsIssues.setLifecycle(owner, record.id, target);
+    }
+  }
+
+  /**
+   * Whether the issue has a plan — the input to the board's plan rule
+   * (`planRefusal`, docs/refinements/issue-flow.md "The board"). A native
+   * issue has one when it has a stored plan version; a forge issue when its
+   * live comments hold a Claws plan comment. The forge read is a live API call
+   * and can throw; the caller answers that as "nothing changed".
+   */
+  async function issueHasPlan(owner: string, ref: config.IssueRef, native: boolean): Promise<boolean> {
+    if (native) return (await clawsIssues.listPlans(String(ref))).length > 0;
+    return planParser.findPlanComment(await getIssueComments(owner, ref)) !== null;
+  }
+
+  /**
+   * A move into Planning for an issue that already has a plan is a re-plan:
+   * queue the planner to revise the posted plan against the current issue and
+   * requirements. `processRefinement` sets `awaiting-plan-review` when it posts,
+   * so the issue returns to plan review on its own; the plan it replaced stays
+   * as a previous version. Without this the dispatcher sees an unchanged plan
+   * with no feedback and the card sits in Planning with nothing running.
+   * Best-effort: the move has already landed, so a failed enqueue is logged.
+   */
+  async function replanAfterPlanningMove(owner: string, ref: config.IssueRef, labels: readonly string[]): Promise<void> {
+    if (isAgentDisabled("planner")) return;
+    const where = owner ? `${owner}#${ref}` : `#${ref}`;
+    try {
+      await worker.enqueue(AGENT_KINDS.ISSUE_REFINER_REPLAN, owner, ref, {
+        priority: hasPriorityLabel(labels.map((name) => ({ name }))),
+      });
+      log.info(`[board] ${where}: moved to Planning with a plan — queued a re-plan`);
+    } catch (err) {
+      log.warn(`[board] ${where}: failed to enqueue a re-plan after a move to Planning: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /**
+   * Move one issue to a board column or the backlog, with every refusal
+   * `POST /board/move` documents. Shared by that route, `POST /board/bulk-move`
+   * and `POST /backlog/promote` (#3293), so a bulk move is exactly N single
+   * moves. Answers the status and JSON body the single route sends as-is.
+   *
+   * A move into Approved or Awaiting plan review writes the issue's stored
+   * approval (`applyIssueApproval`, #clw_01M5VW14RKAAGS6VZ5PCKQXB9F) beside
+   * the plan-review lifecycle: Approved raises it to Plan (never lowering a
+   * Merge approval), Awaiting plan review lowers it to Requirements.
+   */
+  async function applyBoardMove(repo: string, ref: config.IssueRef, to: string, opts?: { entry?: boolean; approvedBy?: string; until?: string | null; reason?: string }): Promise<{ status: number; body: Record<string, unknown> }> {
+    // Whether a write has been *issued* — not whether one returned — which is
+    // what the catch below turns into a status. Issued rather than returned
+    // because a write that throws may still have landed: `closeIssue` commits
+    // the native state before it emits its events, a `gh` failure can surface
+    // after the edit took server-side, and the removals all start before any of
+    // them is awaited. A flag that meant "returned" would answer 503 "nothing
+    // changed" for a move that had already closed or relabelled the issue,
+    // which is the one lie it exists to prevent. The other direction — a 500
+    // for a first write that in fact wrote nothing — costs the operator a
+    // reload.
+    let wrote = false;
+    try {
+      if (!isBoardDestination(to)) return { status: 400, body: { error: `Unknown column: ${to}` } };
+      let move = transitionFor(to);
+      // The columns no label change can produce — say so rather than silently
+      // doing nothing, so the card snaps back with a reason.
+      if (!move) return { status: 409, body: { error: DERIVED_COLUMN_REJECTION } };
+      // Every issue entering Blocked carries a reason; refused before anything reads or writes.
+      const blockedReason = opts?.reason?.trim() ?? "";
+      if (to === "blocked" && !blockedReason) return { status: 400, body: { error: BLOCKED_REASON_REQUIRED } };
+
+      const native = isClawsIssueId(ref);
+      // A return date is a native Backlog park only; checked before anything reads or writes.
+      let until: string | null | undefined;
+      if (opts?.until !== undefined) {
+        if (to !== BACKLOG_DESTINATION || !native) return { status: 400, body: { error: "A return date is only accepted when moving a native issue to the backlog" } };
+        const parsedUntil = parseBacklogUntil(opts.until);
+        if (!parsedUntil.ok) return { status: 400, body: { error: parsedUntil.error } };
+        until = parsedUntil.until;
+      }
+      // A native issue's record says how many repositories own it — one half of
+      // the state no label change touches.
+      const record = native ? await clawsIssues.getIssue(ref) : undefined;
+      // A well-formed native id the store has never heard of. Left to fall
+      // through, the state read below throws and answers 503 — "try again" for
+      // a condition no retry can fix — so name what is actually wrong.
+      if (native && !record) return { status: 404, body: { error: "No such issue" } };
+      // A native issue none of whose repos is configured any more may only be
+      // closed; the configured-repo checks are skipped for that one write.
+      const orphaned = !!record && await orphanedRepos(record.repos);
+      if (orphaned && record && !move.close) {
+        return { status: 403, body: { error: orphanedRejection(record.repos) } };
+      }
+      // An unassigned native issue has no repository to check; everything else
+      // must name one Claws manages, exactly as the queue actions do.
+      if (!orphaned && (repo ? !(await isConfiguredRepo(repo)) : !native)) {
+        return { status: 403, body: { error: "Repository not configured" } };
+      }
+      // A repo Claws manages is not necessarily *this issue's* repo. Labelling
+      // through another one would tag `label-added`/`issue-closed` at a
+      // repository the issue has nothing to do with, waking that repository's
+      // `claws_wait_for_change` waiters.
+      if (repo && record && !record.repos.includes(repo)) {
+        return { status: 403, body: { error: "Repository not configured" } };
+      }
+      const unassigned = !!record && record.repos.length === 0;
+      // The repository every write below goes through. Resolved from the record
+      // rather than taken off the wire, because an assigned native ref may
+      // arrive with `repo: ""` — the card for one carries its repository, but
+      // the gate above falls through on an empty string, so passing it on would
+      // let a hand-sent `{repo: "", ref: <native id>}` write to an issue whose
+      // only repository Claws does not manage. Resolving first puts that
+      // repository back through `isConfiguredRepo`, so this route gates on the
+      // allowlist like every other dashboard mutation. A multi-repo issue
+      // resolves to its primary repo, which owns its labels. An unassigned
+      // issue has no repository to resolve and keeps `""`, which is what the
+      // façade wants: `claws-issues.ts` then emits for each repo on the record.
+      const owner = (record && clawsIssues.primaryRepo(record)) || repo;
+      if (!orphaned && owner !== repo && !(await isConfiguredRepo(owner))) {
+        return { status: 403, body: { error: "Repository not configured" } };
+      }
+      // The other half: whether the issue is closed *already*, and which labels
+      // it is really holding. Read rather than taken from the card — nothing
+      // re-renders the board, so a tab left open outlives the issue cache by
+      // hours and can still show an issue in a PR column long after its PR merged
+      // and closed it. The labels ride along on the same read; they decide the
+      // landing column below and which writes are worth making. The issue's
+      // flight — its running implementer and open PR rows — is read beside
+      // them, for the same reason; `loadIssueFlight` never throws.
+      const flightRead = loadIssueFlight(owner, ref);
+      // The requirements columns and Planning carry no label, so a forge issue's stage is read off
+      // its shadow; a native issue's is on its record. An entry move only takes
+      // the forge issue out of the backlog and leaves its stage to the shadow
+      // sync, so it needs no shadow and never writes one.
+      const shadowId = native ? null : await resolveTrackerId(owner, ref);
+      const shadowRecord = shadowId ? await clawsIssues.getIssue(shadowId) : undefined;
+      // An entry move (the backlog's Promote) asks for the requirements
+      // columns but lands the issue wherever `entryLifecycle` says: Planning
+      // once it has a plan or approved requirements, which need no second
+      // promotion. A forge issue with no shadow yet has nothing to check and
+      // stays in Drafting.
+      let target: BoardDestination = to;
+      const entryRecord = record ?? shadowRecord;
+      if (opts?.entry && isRequirementsColumn(to) && entryRecord) {
+        target = destinationForLifecycle(clawsIssues.entryLifecycle(entryRecord, (await clawsIssues.listPlans(entryRecord.id)).length > 0));
+        move = transitionFor(target)!;
+      }
+      // A forge issue's Blocked reason lives on its shadow, so a drop into
+      // Blocked with no shadow to hold it is refused like a lifecycle move.
+      const forgeBlocks = !native && !move.close && move.add.includes(LABELS.blocked);
+      if (!native && (move.lifecycle || forgeBlocks) && !shadowId && !opts?.entry) {
+        return { status: 409, body: { error: "Claws has not synced this issue yet — try again in a few minutes." } };
+      }
+      const lifecycle = record?.lifecycle ?? shadowRecord?.lifecycle;
+      const approvedThrough: ApprovedThrough = record?.approved_through ?? shadowRecord?.approved_through ?? "none";
+      let state: IssueState;
+      let labels: string[];
+      try {
+        ({ state, labels } = await getIssueState(owner, ref));
+      } catch (err) {
+        // For a forge ref this is a live API call, so it can fail on its own.
+        // Nothing has been written yet, so it must not fall through to the
+        // catch below: a 500 here means a *half-applied* move and would strand
+        // the card. 503 is in the client's "refused, nothing changed" set.
+        log.warn(`[board] state of ${owner ? `${owner}#${ref}` : `#${ref}`}: ${err}`);
+        return { status: 503, body: { error: "Could not read the issue's current state — try again." } };
+      }
+      const closedAlready = state === "CLOSED";
+      // The façade has no forge reopen, so applying a column's labels to a
+      // closed forge issue would leave it in Done holding a label that says
+      // otherwise. The client refuses this too, but only for the cards it
+      // closed itself; a stale card only the route can catch.
+      if (closedAlready && !native && !move.close) {
+        return { status: 409, body: { error: FORGE_REOPEN_REJECTION } };
+      }
+      // A drop into Planning for a design change pending re-approval is its
+      // promotion: it approves the change, so the card lands wherever that
+      // leaves it rather than in Planning — reported as such instead of the
+      // `landsIn` 409.
+      const reapprovalId = record?.id ?? shadowId;
+      if (target === "planning" && !opts?.entry && !closedAlready && reapprovalId && await hasPendingReapproval(reapprovalId)) {
+        wrote = true;
+        if (!(await promoteReapproval(reapprovalId, opts?.approvedBy ?? clawsIssues.CLAWS_NATIVE_LOGIN))) {
+          throw new Error(`${reapprovalId} changed lifecycle since it was read — try the move again`);
+        }
+        const after = await getIssueState(owner, ref);
+        const afterRecord = await clawsIssues.getIssue(reapprovalId);
+        const landed = columnFor({ labels: after.labels, lifecycle: afterRecord?.lifecycle, approvedThrough: afterRecord?.approved_through, unassigned, ...(await loadIssueFlight(owner, ref)) });
+        return { status: 200, body: { result: "ok", column: landed } };
+      }
+      // The plan rule: Approved and Awaiting plan review need a plan, and a
+      // move into Planning re-plans an issue that has one. Read only for those
+      // three targets, and never for an entry move, whose target is settled by
+      // `entryLifecycle` and which never re-plans.
+      let hasPlan = false;
+      if (!opts?.entry && (target === "approved" || target === "awaiting-plan-review" || target === "planning")) {
+        try {
+          hasPlan = await issueHasPlan(owner, ref, native);
+        } catch (err) {
+          // Nothing has been written yet — the same "refused, nothing changed"
+          // answer as a failed state read above.
+          log.warn(`[board] plan of ${owner ? `${owner}#${ref}` : `#${ref}`}: ${err}`);
+          return { status: 503, body: { error: "Could not read the issue's current state — try again." } };
+        }
+        const refusal = planRefusal(target, hasPlan);
+        if (refusal) return { status: 409, body: { error: refusal } };
+      }
+      // The route's contract: answer `ok` only for a move that lands where it
+      // was asked to. `transitionFor` cannot promise that on its own, since it
+      // declares only the labels the board owns while `columnFor` also reads
+      // the issue's flight, `closed` and `unassigned` — an unassigned native issue
+      // takes the labels and stays in Drafting, and an issue with a running
+      // implementer or an open PR keeps it through every move. So the landing
+      // column is computed from the issue's live labels and flight. `closed` is
+      // what the move itself does and nothing else: a closed *forge* issue out of
+      // Done was refused above, and a closed *native* one is reopened below, so
+      // neither reaches this line still closed. Were that reopen ever dropped,
+      // this would have to read `closedAlready` again or the landing column would
+      // go silently wrong.
+      // Backlog outranks the flight, so the landing check below would let an
+      // issue in flight leave the board; refuse it explicitly.
+      const flight = await flightRead;
+      if (to === BACKLOG_DESTINATION) {
+        const refusal = backlogRefusal(flight);
+        if (refusal) return { status: 409, body: { error: refusal } };
+      }
+      // Drafting or Requirements review is decided by the issue's requirements
+      // state, which no move changes — read only for a move into either
+      // requirements column, the one place the answer is used.
+      const requirementsReview = isRequirementsColumn(target)
+        ? await clawsIssues.isAwaitingRequirementsReview(record?.id ?? shadowId)
+        : false;
+      const landing = columnAfterMove(move, { labels, closed: move.close, unassigned, lifecycle, approvedThrough, requirementsReview, ...flight });
+      // Promote/bulk-promote only mean "take it out of the backlog" — any
+      // landing other than Backlog itself (e.g. an issue with an open PR) is a
+      // success, reported as the column it actually landed in. A drop into
+      // either requirements column that lands in the other has landed too.
+      const landed = opts?.entry && isRequirementsColumn(to) ? landing !== BACKLOG_DESTINATION : landsIn(landing, target);
+      if (!landed) {
+        // Landing in a derived column means the issue's flight outranks the
+        // target, which is the fact DERIVED_COLUMN_REJECTION already states in
+        // the operator's own terms — better than "that move lands in in-progress",
+        // which does not say why or what to do about it.
+        const reason = unassigned
+          ? UNASSIGNED_REJECTION
+          : isDerivedColumn(landing)
+            ? DERIVED_COLUMN_REJECTION
+            : `That move lands in ${landing}, not ${to}.`;
+        return { status: 409, body: { error: reason } };
+      }
+
+      // Everything below this line writes — but not every path through it does:
+      // a relabelling move whose labels the issue already holds writes nothing at
+      // all, and a 500 for that would send the operator off to reload a board
+      // that is right. So the flag goes up per write rather than once for the
+      // whole block, and always *before* the write is issued — see its
+      // declaration for why "issued" is the meaning that matters.
+      if (move.close) {
+        wrote = true;
+        await closeIssue(owner, ref, "not_planned");
+      } else {
+        // Dragging out of Done reopens — but only a native issue, since the
+        // façade has no forge reopen; the closed forge issue was refused above.
+        if (native && closedAlready) {
+          wrote = true;
+          await clawsIssues.reopenIssue(ref);
+        }
+      }
+      // Approved and Awaiting plan review are one lifecycle told apart by the
+      // stored approval, written first: raising it from Ideas is the promotion,
+      // which the lifecycle write below then moves on from. Approved never
+      // lowers a Merge approval.
+      if (move.approval && !opts?.entry) {
+        const approval = approvalForMove(move, approvedThrough);
+        if (approval !== undefined && approval !== approvedThrough) {
+          wrote = true;
+          const written = await applyIssueApproval(owner, ref, approval, opts?.approvedBy ?? clawsIssues.CLAWS_NATIVE_LOGIN);
+          if (!written.ok) throw new Error(written.error);
+        }
+      }
+      // The requirements columns are both lifecycle `ideas`; every other
+      // non-derived column is its own lifecycle.
+      const targetLifecycle = move.lifecycle ?? target;
+      if (!move.close && native && record && isIssueLifecycle(targetLifecycle)) {
+        // A native issue stores its lifecycle in one field, so the move is one
+        // write rather than an add-then-remove label pair — there is no
+        // half-applied state for it to leave behind. Skipped when the field
+        // already holds it, for the same reason a held label is skipped below.
+        if (record.lifecycle !== targetLifecycle) {
+          wrote = true;
+          await moveNativeLifecycle(owner, record, targetLifecycle, opts?.approvedBy, !!opts?.entry, blockedReason);
+        }
+      } else if (!move.close) {
+        // The target's label first: a removal that then fails leaves the
+        // *outranking* old label in place, so the issue is still in the column
+        // the card came from and the client's revert tells the truth. Adding
+        // last would leave a half-applied move holding no lifecycle label at
+        // all — Drafting, Requirements review or Planning, which is neither end of the drag.
+        //
+        // A label the issue already holds is skipped: `ensureLabel` plus a
+        // `gh issue edit` to end up where it started, and a no-op `label-added`
+        // event waking that repository's waiters. `removeLabel` already declines
+        // the inverse case internally.
+        for (const label of move.add) {
+          if (labels.includes(label)) continue;
+          wrote = true;
+          await addLabel(owner, ref, label);
+        }
+        // Only the labels the issue is actually holding. The common Planning →
+        // Approved drag otherwise fires a `removeLabel` for `Blocked` and
+        // `Backlog` when it holds neither, and on the GitHub path each one is a
+        // `fetchLiveLabels` `gh api` subprocess spawn before it decides there is
+        // nothing to do.
+        const toRemove = move.remove.filter((label) => labels.includes(label));
+        if (toRemove.length > 0) wrote = true;
+        // The removals are independent of each other and each one costs its own
+        // live-label round trip, so they go together rather than in series.
+        // Settled rather than `Promise.all`, which rejects at the first failure
+        // while its siblings keep running and removing labels: the outcome that
+        // decides the answer would be the one thrown away.
+        const removed = await mapSettledWithConcurrency(
+          toRemove,
+          toRemove.length,
+          async (label) => removeLabel(owner, ref, label),
+        );
+        // A removal that failed leaves a label that outranks the one just
+        // added, so the card would sit in a column the issue is not in — say
+        // so rather than answering `ok`, exactly as /queue/unmark-problematic
+        // does. A removal that *threw* is the same story with no confirmation
+        // either way, so it is reported here rather than escaping to the catch
+        // below, where its siblings' outcomes would be lost.
+        const failedAt = removed.findIndex((r) => r.status === "rejected" || !r.value);
+        if (failedAt >= 0) {
+          const outcome = removed[failedAt];
+          // Indexed into `toRemove`, which is what was handed to the map:
+          // `move.remove` is a superset in the usual case, so indexing it would
+          // name a label the route never tried to remove.
+          const label = toRemove[failedAt];
+          if (outcome.status === "rejected") {
+            log.warn(`[board] remove ${label} on ${owner ? `${owner}#${ref}` : `#${ref}`}: ${outcome.reason}`);
+          }
+          return { status: 500, body: { error: `Failed to remove the ${label} label — the board may be stale, reload it`, partial: true } };
+        }
+        // A forge issue's lifecycle lives on its shadow, mirroring
+        // `moveNativeLifecycle`: a drop into Planning with no recorded
+        // approval yet promotes it, a drop into Drafting or Requirements review
+        // demotes it, and a drop into Planning that is already approved or
+        // into either plan-review column (whose approval is written above) is
+        // a plain lifecycle write. Moves into the label-carried columns
+        // (Blocked, Backlog) leave the shadow to the shadow sync instead.
+        if (shadowId && move.lifecycle && !opts?.entry && lifecycle !== move.lifecycle) {
+          wrote = true;
+          if (move.lifecycle === "planning" && shadowRecord?.requirements_approved_at == null) {
+            const promoted = await clawsIssues.promoteIssue(shadowId, opts?.approvedBy ?? clawsIssues.CLAWS_NATIVE_LOGIN, lifecycle!);
+            if (!promoted) throw new Error(`${shadowId} changed lifecycle since it was read — try the move again`);
+          } else if (move.lifecycle === "ideas") {
+            await clawsIssues.demoteIssue(shadowId);
+          } else {
+            await clawsIssues.setShadowLifecycle(shadowId, move.lifecycle);
+          }
+        }
+        // A drop into Blocked records its reason on the shadow now, beside the
+        // stage, rather than leaving the stage to the next sync — which would
+        // stamp a stage change after the reason and hide it, as
+        // `issue-handback.ts` does for Claws' own parks.
+        if (shadowId && forgeBlocks) {
+          wrote = true;
+          await clawsIssues.setShadowLifecycle(shadowId, "blocked");
+          await setIssueBlockedReason(shadowId, blockedReason);
+        }
+      }
+      if (until !== undefined && record) {
+        wrote = true;
+        if (!(await setClawsIssueBacklogUntil(record.id, until))) throw new Error(`${record.id} left the Backlog before its return date was saved`);
+      }
+      // Even a card already sitting in Planning: a hand-sent move is how a card
+      // stuck there with a plan and nothing running gets unstuck.
+      if (target === "planning" && hasPlan) await replanAfterPlanningMove(owner, ref, labels);
+      // The column the issue is in now, so the client places the card rather
+      // than assuming the drop landed. A close always records `not_planned`
+      // (the issue page's Close as completed control is the only way to
+      // record `completed` by hand), so the client can label the card without
+      // a second round trip.
+      return { status: 200, body: { result: "ok", column: landing, ...(move.close ? { stateReason: "not_planned" } : {}) } };
+    } catch (err) {
+      // `partial` is the client's instruction to leave the card where it was
+      // dropped and reload, so it is set only for a move that may be
+      // half-applied. It rides in the body rather than on the status, because
+      // this route is not the only producer of a 500 on this URL — Hono's
+      // `app.onError` answers one, with no JSON body, for anything that throws
+      // around the handler, an expired session's middleware first among them.
+      // A client reading the status alone would call that a half-applied move
+      // and leave the card in a column nothing wrote.
+      return { status: wrote ? 500 : 503, body: { error: String(err), partial: wrote } };
+    }
+  }
+
+  app.post("/board/move", authMiddleware, async (c) => {
+    // Read and parse outside the `try`: this route's `partial: true` means a
+    // *half-applied* move, which the client answers by leaving the card where
+    // it was dropped and telling the operator to reload. A truncated or
+    // non-JSON body wrote nothing, so it must not borrow that meaning — it is a
+    // 400 like any other malformed request, and the card snaps back.
+    let raw: unknown;
+    try {
+      raw = JSON.parse(await readTextBody(c));
+    } catch {
+      return jsonOk(c, { error: "Malformed request body" }, 400);
+    }
+    const parsed = BoardMoveSchema.safeParse(raw);
+    if (!parsed.success) return jsonOk(c, { error: "Missing repo, ref or column" }, 400);
+    const { status, body } = await applyBoardMove(parsed.data.repo, parsed.data.ref, parsed.data.to, { approvedBy: sessionSubject(c), until: parsed.data.until, reason: parsed.data.reason });
+    // The card's approval track was rendered for the old column, so a landed
+    // move carries the re-rendered one, as `/board/approve-through` does; the
+    // client then needs no poll to bring it up to date. Done and Backlog
+    // cards show no track. A failed re-read answers without one, and the
+    // client polls instead.
+    if (status === 200 && body.column !== "done" && body.column !== "backlog") {
+      try {
+        const after = await loadApprovalTrackInput(parsed.data.repo, parsed.data.ref);
+        if (after) return jsonOk(c, { ...body, track: renderApprovalTrack(after) }, status);
+      } catch (err) {
+        log.warn(`[board] approval state of ${parsed.data.repo}#${parsed.data.ref} after the move: ${err}`);
+      }
+    }
+    return jsonOk(c, body, status);
+  });
+
+  // Bulk send-to-backlog from the board and bulk promote from the backlog
+  // (#3293): each item is exactly one `applyBoardMove`, and the answer is 200
+  // with one result per item, in order, carrying that move's own status.
+  app.post("/board/bulk-move", authMiddleware, async (c) => {
+    let raw: unknown;
+    try {
+      raw = JSON.parse(await readTextBody(c));
+    } catch {
+      return jsonOk(c, { error: "Malformed request body" }, 400);
+    }
+    const parsed = BoardBulkMoveSchema.safeParse(raw);
+    if (!parsed.success) {
+      return jsonOk(c, { error: `Expected { to: "backlog" | "ideas", items: [{ repo, ref }] } with 1–${BULK_MOVE_LIMIT} items` }, 400);
+    }
+    const { to, items } = parsed.data;
+    const results = await mapWithConcurrency(items, 4, async (item) => {
+      const { status, body } = await applyBoardMove(item.repo, item.ref, to === "ideas" ? "requirements-review" : to, { entry: to === "ideas", approvedBy: sessionSubject(c) });
+      return { repo: item.repo, ref: item.ref, status, ...body };
+    });
+    return jsonOk(c, { results });
+  });
+
+  // A merge approval, not a lifecycle, so unlike `/board/move` it moves no
+  // card. Nothing on the board posts here any more — the approval track's
+  // Merge gate goes through `/board/approve-through` — but the route stays for
+  // any client that still does. On: the issue is approved through Merge, where
+  // the approval track offers it (`checkedApproval`), and
+  // each of its open PR rows records who approved and when
+  // (`merge_approved_by` / `merge_approved_at`, from the session's identity).
+  // Off: a Merge approval drops to Plan and the row columns are cleared.
+  // `setIssueAutomerge` is the write.
+  app.post("/board/automerge", authMiddleware, async (c) => {
+    let raw: unknown;
+    try {
+      raw = JSON.parse(await readTextBody(c));
+    } catch {
+      return jsonOk(c, { error: "Malformed request body" }, 400);
+    }
+    const parsed = BoardAutomergeSchema.safeParse(raw);
+    if (!parsed.success) return jsonOk(c, { error: "Missing repo, ref or on" }, 400);
+    const { repo, ref, on } = parsed.data;
+    if (!(await isConfiguredRepo(repo))) {
+      return jsonOk(c, { error: "Repository not configured" }, 403);
+    }
+    const result = await setIssueAutomerge(repo, ref, on, sessionSubject(c));
+    if (!result.ok) return jsonOk(c, { error: result.error }, result.status);
+    return jsonOk(c, { result: "ok", on });
+  });
+
+  /**
+   * The approval track's input for one issue, read live — its labels, flight,
+   * lifecycle, stored approval (a native record's, or a forge issue's shadow's)
+   * and requirements state — with the column `columnFor` derives
+   * from them, so `POST /board/approve-through` checks a click against the
+   * track as it stands and answers with the track after its writes. `repo` is
+   * the issue's primary repository. Null for a native id the store has never
+   * heard of. A forge issue with no tracker record yet reads as awaiting
+   * import, which leaves every gate read-only.
+   */
+  async function loadApprovalTrackInput(repo: string, ref: config.IssueRef): Promise<(ApprovalTrackInput & { repos: string[] | null }) | null> {
+    const native = isClawsIssueId(ref);
+    const record = native ? await clawsIssues.getIssue(ref) : undefined;
+    if (native && !record) return null;
+    const owner = (record && clawsIssues.primaryRepo(record)) || repo;
+    const trackerId = record?.id ?? await resolveTrackerId(owner, ref);
+    const tracked = record ?? (trackerId ? await clawsIssues.getIssue(trackerId) : undefined);
+    const [{ state, labels }, flight, hasPlan] = await Promise.all([
+      getIssueState(owner, ref),
+      loadIssueFlight(owner, ref),
+      issueHasPlan(owner, ref, native),
+    ]);
+    const lifecycle = tracked?.lifecycle;
+    const [requirementsReview, reapprovalPending, awaitingOperator, queued] = await Promise.all([
+      (lifecycle ?? "ideas") === "ideas" ? clawsIssues.isAwaitingRequirementsReview(trackerId) : Promise.resolve(false),
+      trackerId ? hasPendingReapproval(trackerId) : Promise.resolve(false),
+      trackerId ? issuesAwaitingOperator([trackerId]).then((m) => m.has(trackerId)) : Promise.resolve(false),
+      trackerId ? issuesQueued([trackerId]).then((m) => m.has(trackerId)) : Promise.resolve(false),
+    ]);
+    const awaitingImport = !native && !trackerId;
+    const approvedThrough: ApprovedThrough = tracked?.approved_through ?? "none";
+    const column = columnFor({
+      labels,
+      closed: state === "CLOSED",
+      unassigned: !!record && record.repos.length === 0,
+      lifecycle,
+      approvedThrough,
+      requirementsReview,
+      ...flight,
+      awaitingOperator,
+      reapprovalPending,
+      awaitingImport,
+      queued,
+    });
+    return {
+      repo: owner,
+      ref,
+      column,
+      labels,
+      lifecycle,
+      approvedThrough,
+      requirementsApproved: tracked?.requirements_approved_at != null,
+      hasPlan,
+      reapprovalPending,
+      awaitingOperator,
+      awaitingImport,
+      openPrs: flight.openPrs,
+      repos: record ? record.repos : null,
+    };
+  }
+
+  /**
+   * Write issue `repo#ref`'s approval as `by`, checked against the approval
+   * track derived from its live state as a gate click is — the one guard for
+   * every surface that writes an approval outside the board's own gate
+   * route (the session `approval` route, `/queue/mark-refined`,
+   * `/queue/mark-automerge`, `/board/automerge`), since
+   * `applyIssueApproval` checks nothing. `target` maps the current approval
+   * to the one to store. Raising needs the target gate to offer `approve` —
+   * so an issue in Drafting, with no requirements, cannot be approved past
+   * them — and lowering from Merge to Plan needs the Merge gate's
+   * `withdraw`; lowering to Requirements is always allowed. An unchanged
+   * value writes nothing, except Merge restated while an open PR row lacks
+   * its merge approval, which `applyIssueApproval` writes onto it. A native
+   * issue promotes as the dashboard's own. A native issue is written through
+   * its primary repo, so `repo` must be one of its repos and the primary one
+   * managed, as `/board/approve-through` checks (403 otherwise).
+   */
+  async function checkedApproval(
+    repo: string,
+    ref: config.IssueRef,
+    target: (current: ApprovedThrough) => ApprovedThrough,
+    by: string,
+  ): Promise<{ ok: true; through: ApprovedThrough; openPrs: number } | { ok: false; status: ContentfulStatusCode; error: string }> {
+    let before: Awaited<ReturnType<typeof loadApprovalTrackInput>>;
+    try {
+      before = await loadApprovalTrackInput(repo, ref);
+    } catch (err) {
+      log.warn(`[approval] approval state of ${repo}#${ref}: ${err}`);
+      return { ok: false, status: 503, error: "Could not read the issue's current state — try again." };
+    }
+    if (!before) return { ok: false, status: 404, error: "Issue not found" };
+    if (before.repos && !before.repos.includes(repo)) return { ok: false, status: 403, error: "Repository not configured" };
+    if (before.repo !== repo && !(await isConfiguredRepo(before.repo))) return { ok: false, status: 403, error: "Repository not configured" };
+    const current = before.approvedThrough ?? "none";
+    const through = target(current);
+    const record = isClawsIssueId(ref) ? await clawsIssues.getIssue(ref) : undefined;
+    const promote = record ? { promote: () => promoteNative(record, record.id, by) } : {};
+    if (through === current) {
+      // Merge restated: approve any open PR row left without it (a refused
+      // single-PR approval, say), so the gate does not read approved while one waits.
+      if (through === "merge" && (before.openPrs ?? []).some((pr) => !pr.mergeApprovedAt)) {
+        const result = await applyIssueApproval(before.repo, ref, through, by, promote);
+        if (!result.ok) return { ok: false, status: result.status as ContentfulStatusCode, error: result.error };
+        return { ok: true, through, openPrs: result.openPrs };
+      }
+      return { ok: true, through, openPrs: before.openPrs?.length ?? 0 };
+    }
+    const track = deriveApprovalTrack(before);
+    const raising = approvalRank(through) > approvalRank(current);
+    // Raising to Requirements past a Reqs gate the column already fills
+    // records what the issue has; nothing to refuse.
+    const view = raising
+      ? track.gates.find((g) => g.gate === through)
+      : through === "plan" ? track.gates.find((g) => g.gate === "merge") : undefined;
+    const offered = !view || view.action === (raising ? "approve" : "withdraw")
+      || (raising && through === "requirements" && view.state === "approved");
+    if (!offered) {
+      return { ok: false, status: 409, error: `${view!.label} cannot be ${raising ? "approved" : "withdrawn"} here: ${view!.title}` };
+    }
+    const result = await applyIssueApproval(before.repo, ref, through, by, promote);
+    if (!result.ok) return { ok: false, status: result.status as ContentfulStatusCode, error: result.error };
+    return { ok: true, through, openPrs: result.openPrs };
+  }
+
+  // The approval track's one write (#clw_01M5VRB6Q607S256SQ8NDC5AHT), for the
+  // board card and the issue page alike: approve the issue through `gate` and
+  // every earlier one, or (`withdraw`) take a pre-approval back from `gate`
+  // onward. One `applyIssueApproval` write of the stored approval
+  // (#clw_01M5VW14RKAAGS6VZ5PCKQXB9F): Reqs raises it to Requirements, which
+  // promotes the issue out of Requirements review; Plan raises it to Plan
+  // (approving the plan in Awaiting plan review, pre-approving it before);
+  // Merge to Merge. Withdrawing Plan lowers it to Requirements, withdrawing
+  // Merge to Plan. Answers `{result, column, track}`, `track` being the
+  // re-rendered control. The click is checked against the track derived from
+  // the issue's live state, so a stale card cannot approve a gate that no
+  // longer offers it. A failed write answers 500 with `partial: true`, like
+  // `/board/move`.
+  app.post("/board/approve-through", authMiddleware, async (c) => {
+    let raw: unknown;
+    try {
+      raw = JSON.parse(await readTextBody(c));
+    } catch {
+      return jsonOk(c, { error: "Malformed request body" }, 400);
+    }
+    const parsed = ApproveThroughSchema.safeParse(raw);
+    if (!parsed.success) return jsonOk(c, { error: "Missing repo, ref or gate" }, 400);
+    const { repo, ref, gate } = parsed.data;
+    const withdraw = !!parsed.data.withdraw;
+    if (gate === "requirements" && withdraw) {
+      return jsonOk(c, { error: "Approved requirements cannot be withdrawn — comment on the issue to revise them." }, 400);
+    }
+    if (!(await isConfiguredRepo(repo))) return jsonOk(c, { error: "Repository not configured" }, 403);
+    let before: Awaited<ReturnType<typeof loadApprovalTrackInput>>;
+    try {
+      before = await loadApprovalTrackInput(repo, ref);
+    } catch (err) {
+      log.warn(`[board] approval state of ${repo}#${ref}: ${err}`);
+      return jsonOk(c, { error: "Could not read the issue's current state — try again." }, 503);
+    }
+    if (!before) return jsonOk(c, { error: "No such issue" }, 404);
+    // A native issue is written through its primary repo, which must be one of
+    // its own and one Claws manages, as `applyBoardMove` checks.
+    if (before.repos && !before.repos.includes(repo)) return jsonOk(c, { error: "Repository not configured" }, 403);
+    if (before.repo !== repo && !(await isConfiguredRepo(before.repo))) return jsonOk(c, { error: "Repository not configured" }, 403);
+    const track = deriveApprovalTrack(before);
+    const view = track.gates.find((g) => g.gate === gate)!;
+    if (view.action !== (withdraw ? "withdraw" : "approve")) {
+      // The live track goes with the refusal, so the card stops offering it.
+      return jsonOk(c, { error: `${view.label} cannot be ${withdraw ? "withdrawn" : "approved"} here: ${view.title}. Reload to see the issue's current state.`, track: renderApprovalTrack(before) }, 409);
+    }
+    const owner = before.repo;
+    const who = sessionSubject(c);
+    const through: ApprovedThrough = withdraw
+      ? (gate === "plan" ? "requirements" : withdrawMergeTarget(before.approvedThrough ?? "none"))
+      : maxApproval(before.approvedThrough ?? "none", gate);
+    // A native issue's promotion is the dashboard's own, which also re-plans
+    // one that kept its plan; a forge issue's shadow takes the default.
+    const record = isClawsIssueId(ref) ? await clawsIssues.getIssue(ref) : undefined;
+    const result = await applyIssueApproval(owner, ref, through, who, record ? { promote: () => promoteNative(record, record.id, who) } : {});
+    if (!result.ok) {
+      // A 500 is a write that threw part-way; anything else refused before writing.
+      return jsonOk(c, { error: result.error, ...(result.status === 500 ? { partial: true } : {}) }, result.status);
+    }
+    log.info(`[board] ${owner}#${ref}: ${withdraw ? "withdrew" : "approved through"} ${gate} for ${who}`);
+    // Every write landed: a failed re-read is not a partial write, so it
+    // answers without a track and the client reloads the card.
+    let after: Awaited<ReturnType<typeof loadApprovalTrackInput>> = null;
+    try {
+      after = await loadApprovalTrackInput(owner, ref);
+    } catch (err) {
+      log.warn(`[board] approval state of ${owner}#${ref} after the write: ${err}`);
+    }
+    if (!after) return jsonOk(c, { result: "ok" });
+    return jsonOk(c, { result: "ok", column: after.column, track: renderApprovalTrack(after) });
+  });
+
+  /**
+   * The provider, model and capabilities the New session form would
+   * pre-select for `repos` right now. Reads the remembered defaults only; the
+   * dashboard's one-click starts never write them.
+   */
+  async function sessionFormDefaultsFor(repos: string[]): Promise<{ provider: SessionProvider; model: string | null; capabilities: string[] }> {
+    const agentDefaults = await loadSessionAgentDefaults();
+    const providers = await controller.providerStatus();
+    const provider: SessionProvider = repos.length > 1 ? defaultMultiSessionProvider(agentDefaults.lastProvider, providers) : defaultSessionProvider(agentDefaults.lastProvider, providers);
+    const model = rememberedSessionModel(provider, agentDefaults.models[provider]) || null;
+    let remembered = new Map<string, string[]>();
+    try {
+      remembered = await getAllSessionCapabilityDefaults();
+    } catch (err) {
+      log.warn(`[sessions] Could not load remembered capability defaults: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return { provider, model, capabilities: preselectedSessionCapabilities(repos, remembered, provider) };
+  }
+
+  /**
+   * The problem a PR-started session's first message points at, highest
+   * priority first (see `PrSessionFocus`); null when the PR has none. The CI
+   * fixer's gave-up record is in memory, so after a restart such a PR reads as
+   * plain failing CI.
+   */
+  function prSessionFocus(repo: string, pr: PR, row: ClawsPrRecord | null, status: PRRowStatus | undefined): PrSessionFocus {
+    if (hasManualAction(row)) return { kind: "manual-action", reason: row!.manualActionReason! };
+    if (isProblematic(row)) return { kind: "problematic" };
+    if (ciFixerGaveUpOnHead(repo, pr.number, pr.headRefOid ?? row?.headSha)) return { kind: "ci-fix-exhausted" };
+    if (row?.ciBlockedReason) return { kind: "ci-blocked", reason: row.ciBlockedReason };
+    if (status?.checkStatus === "failing") return { kind: "ci-failing" };
+    if (status?.checkStatus === "held") return { kind: "ci-held" };
+    return null;
+  }
+
+  /**
+   * The problem an issue-started session's first message points at (see
+   * `IssueSessionFocus`); null when the issue looks healthy.
+   */
+  function issueSessionFocus(blocked: boolean, blockedReason: string | null, openPrs: readonly ClawsPrRecord[], lastTask: Task | null): IssueSessionFocus {
+    if (blocked) return { kind: "blocked", reason: blockedReason };
+    const stalled = openPrs.find((pr) => isStalledPr({ stage: pr.stage, needsHumanReview: pr.needsHumanReview, ciBlockedReason: pr.ciBlockedReason }));
+    if (stalled) {
+      return { kind: "stalled-pr", repo: stalled.repo, number: stalled.prNumber, reason: stalled.ciBlockedReason ?? "Claws gave up fixing its CI" };
+    }
+    const held = openPrs.find((pr) => hasManualAction(pr));
+    if (held) return { kind: "manual-action", repo: held.repo, number: held.prNumber, reason: held.manualActionReason! };
+    if (lastTask?.status === "failed") return { kind: "failed-work", job: lastTask.job_name, failureReason: lastTask.outcome };
+    return null;
+  }
+
+  /**
+   * Starts the interactive session behind both the board card's Start session
+   * button and the issue page's Create Session button: the issue's repos
+   * (primary first), the agent, model and capabilities the New session form
+   * would pre-select, the issue's brief and the opening message naming its
+   * stage and problem. The two origins differ only in the brief's first line
+   * and `spawned_from`. Nothing is remembered; the audit comment (issue page
+   * only) is the caller's.
+   */
+  async function startIssueSession(
+    record: NonNullable<Awaited<ReturnType<typeof clawsIssues.getIssue>>>,
+    id: string,
+    origin: "board" | "issue-page",
+  ): Promise<
+    | { ok: true; id: string; url: string; provider: SessionProvider; model: string | null; repos: string[] }
+    | { ok: false; status: ContentfulStatusCode; error: string }
+  > {
+    const primary = record.repos.length > 0 ? clawsIssues.primaryRepo(record) : "";
+    const repos = primary ? [primary, ...record.repos.filter((r) => r !== primary)] : [];
+    for (const repo of repos) {
+      if (!(await isConfiguredRepo(repo))) return { ok: false, status: 403, error: "Repository not configured" };
+    }
+    const { provider, model, capabilities } = await sessionFormDefaultsFor(repos);
+    const mode: SessionMode = repos.length === 0 ? "home-claude" : "worktree-claude";
+
+    const plans = await clawsIssues.listPlans(id);
+    const brief = buildSessionBrief({
+      issueId: id,
+      title: record.title,
+      url: clawsIssues.dashboardIssueUrl(id),
+      body: record.body,
+      planBody: plans.length > 0 ? plans[plans.length - 1]!.body : null,
+      instructions: null,
+      startedBy: null,
+      origin,
+    });
+    const bestEffort = async <T>(what: string, read: () => Promise<T>, fallback: T): Promise<T> => {
+      try {
+        return await read();
+      } catch (err) {
+        log.warn(`[server] could not read the ${what} of issue ${id} for its session: ${err}`);
+        return fallback;
+      }
+    };
+    const blocked = record.lifecycle === "blocked";
+    const [stage, blockedReason, flight, lastTask] = await Promise.all([
+      bestEffort("stage", () => stageForIssue(record), null),
+      blocked ? bestEffort("blocked reason", async () => (await getIssueBlockedReasons([id])).get(id) ?? null, null) : null,
+      primary ? bestEffort("flight", () => loadIssueFlight(primary, id), null) : null,
+      primary ? bestEffort("recent tasks", async () => (await getRecentTasksForRepo(primary)).find((t) => t.item_number === id) ?? null, null) : null,
+    ]);
+    const focus = issueSessionFocus(blocked, blockedReason, flight?.openPrs ?? [], lastTask);
+    const spawn = {
+      brief,
+      spawnedBySession: null,
+      spawnedForIssue: id,
+      spawnedFrom: origin === "issue-page" ? ("issue-page" as const) : null,
+      title: issueSessionTitle(record.title),
+      initialPrompt: buildIssueOpeningMessage({ issueId: id, title: record.title, stageTitle: stage?.stage_title ?? null, repos, focus }),
+    };
+    const backend = getSessionBackend();
+    const result = repos.length > 1
+      ? await backend.createMulti({ repos, capabilities, provider, model, ...spawn })
+      : await backend.create({ repo: repos[0] ?? null, mode, capabilities, provider, model, ...spawn });
+    if (!result.ok) return { ok: false, status: createSessionErrorStatus(result), error: describeCreateSessionError(result) };
+    log.info(`[sessions] ${origin === "board" ? "Board" : "Issue page"} started session ${result.id} for issue ${id} (provider: ${provider}, model: ${model ?? "default"}, repos: ${repos.join(", ") || "none"}, capabilities: ${capabilities.join(", ") || "none"}, focus: ${focus?.kind ?? "none"})`);
+    return { ok: true, id: result.id, url: clawsIssues.dashboardSessionUrl(result.id), provider, model, repos };
+  }
+
+  // The board's Start session button: an interactive session for a native
+  // issue with all its repos, primary first, and the agent, model and
+  // capabilities the New session form would pre-select for that combination
+  // (docs/product/dashboard-and-integrations.md). Nothing is remembered — the
+  // form's defaults change only on a form submission — and no audit comment is
+  // posted; the row's `spawned_for_issue` records the link.
+  app.post("/board/start-session", authMiddleware, async (c) => {
+    let raw: unknown;
+    try {
+      raw = JSON.parse(await readTextBody(c));
+    } catch {
+      return jsonOk(c, { error: "Malformed request body" }, 400);
+    }
+    const parsed = BoardStartSessionSchema.safeParse(raw);
+    if (!parsed.success) return jsonOk(c, { error: "Missing repo or ref" }, 400);
+    const { ref } = parsed.data;
+    if (!isNativeIssue(ref)) return jsonOk(c, { error: "Only a Claws-native issue can be started as a session" }, 400);
+    const id = ref;
+    const record = await clawsIssues.getIssue(id);
+    if (!record || record.kind === "shadow") return jsonOk(c, { error: "Issue not found" }, 404);
+    const started = await startIssueSession(record, id, "board");
+    if (!started.ok) {
+      const error = started.status === 403 ? started.error : `Cannot create session: ${started.error}`;
+      return jsonOk(c, { error }, started.status);
+    }
+    return jsonOk(c, { ok: true, id: started.id, url: started.url });
+  });
+
+  // A board card's Approve infra merge button (#clw_01M5WBG6JZ8P3PCYVCQ3PS9BBS):
+  // the operator's deliberate approval of one infrastructure PR's merge, bound
+  // to the head whose plan summary the card showed. A PR that has moved since
+  // is refused with a fresh line, so the operator reviews the new head first.
+  // Records the ordinary merge approval too (an infra approval is a superset
+  // of one), then tries the merge through every auto-merger gate. A refusal
+  // keeps the approval so the sweep finishes it once the other gates pass;
+  // new commits make it stale. Answers the re-rendered infra line for the card.
+  app.post("/board/infra-approve", authMiddleware, async (c) => {
+    let raw: unknown;
+    try {
+      raw = JSON.parse(await readTextBody(c));
+    } catch {
+      return jsonOk(c, { error: "Malformed request body" }, 400);
+    }
+    const parsed = BoardInfraApproveSchema.safeParse(raw);
+    if (!parsed.success) return jsonOk(c, { error: "Missing repo, ref, pull request or head" }, 400);
+    const { repo, ref, prRepo, prNumber, headSha: seenSha } = parsed.data;
+    if (!(await isConfiguredRepo(repo))) return jsonOk(c, { error: "Repository not configured" }, 403);
+    const repoObj = await findConfiguredRepo(prRepo);
+    if (!repoObj) return jsonOk(c, { error: "Repository not configured" }, 403);
+    const name = `${prRepo}#${prNumber}`;
+    // The line for `head`: `infraPrLine` shows Tofu counts only when the
+    // cached `listPRStatuses` evidence was read for that head.
+    const line = async (head: string): Promise<string> => {
+      const fresh = await getClawsPr(prRepo, prNumber).catch(() => null);
+      if (!fresh) return "";
+      const live = (await listPRStatuses(prRepo).catch(() => new Map<number, PRRepoStatus>())).get(prNumber);
+      return infraPrLine(boardCardPr({ ...fresh, headSha: head }, live));
+    };
+    let headSha: string;
+    try {
+      const row = await getClawsPr(prRepo, prNumber);
+      if (!row) return jsonOk(c, { error: `No Claws record for ${name}` }, 404);
+      const flight = await loadIssueFlight(repo, ref);
+      if (!flight.openPrs.some((p) => p.repo === prRepo && p.prNumber === prNumber)) {
+        return jsonOk(c, { error: `${name} is not an open PR of ${repo}#${String(ref)}` }, 409);
+      }
+      if ((await getPRState(prRepo, prNumber)) !== "OPEN") return jsonOk(c, { error: `${name} is not open` }, 409);
+      if (infraPathsIn(await getPRChangedFiles(prRepo, prNumber)).length === 0) {
+        return jsonOk(c, { error: `${name} is not an infrastructure PR` }, 409);
+      }
+      headSha = await getPRHeadSHA(prRepo, prNumber);
+      if (headSha !== seenSha) {
+        return jsonOk(c, {
+          error: `${name} moved to ${headSha.slice(0, 7)}; review the new plan and approve again`,
+          line: await line(headSha),
+        }, 409);
+      }
+      const who = sessionSubject(c);
+      await writeMergeApproval(prRepo, prNumber, who, { keepExisting: true });
+      await upsertClawsPr(prRepo, prNumber, {
+        infraMergeApprovedBy: who,
+        infraMergeApprovedAt: new Date().toISOString(),
+        infraMergeApprovedSha: headSha,
+      });
+      log.info(`[board] Infra merge of ${name} approved by ${who} for head ${headSha.slice(0, 7)} (issue ${repo}#${String(ref)})`);
+    } catch (err) {
+      return jsonOk(c, { error: `Could not record the infra merge approval: ${err instanceof Error ? err.message : String(err)}` }, 500);
+    }
+    const pr = (await listPRs(repoObj.fullName).catch(() => [] as PR[])).find((p) => p.number === prNumber);
+    if (!pr) {
+      return jsonOk(c, { ok: true, merged: false, reason: "Claws merges it on its next sweep", line: await line(headSha) });
+    }
+    let result: Awaited<ReturnType<typeof attemptMerge>>;
+    try {
+      result = await attemptMerge(repoObj, pr, { mergedBy: "dashboard", notify: false });
+    } catch (err) {
+      return jsonOk(c, { error: `Approval recorded, but the merge failed: ${err instanceof Error ? err.message : String(err)}`, line: await line(headSha) }, 502);
+    }
+    if (result.merged) return jsonOk(c, { ok: true, merged: true, line: await line(headSha) });
+    return jsonOk(c, { ok: true, merged: false, reason: result.message, code: result.code, line: await line(headSha) });
+  });
+
+  // The PRs page's Start session button: an interactive session for one open
+  // PR's repository, set up like a board start (same form defaults, nothing
+  // remembered, nothing posted on the forge). Its first message has the agent
+  // gather context read-only, pointed at the PR's obvious problem when it has
+  // one, and wait; the row's `spawned_for_pr` records the link
+  // (docs/product/dashboard-and-integrations.md).
+  app.post("/prs/start-session", authMiddleware, async (c) => {
+    let raw: unknown;
+    try {
+      raw = JSON.parse(await readTextBody(c));
+    } catch {
+      return jsonOk(c, { error: "Malformed request body" }, 400);
+    }
+    const parsed = RepoPrNumberSchema.safeParse(raw);
+    if (!parsed.success) return jsonOk(c, { error: "Missing repo or number" }, 400);
+    const { repo, number } = parsed.data;
+    if (!(await isConfiguredRepo(repo))) return jsonOk(c, { error: "Repository not configured" }, 403);
+    let pr: PR | undefined;
+    try {
+      pr = (await listPRs(repo)).find((p) => p.number === number);
+    } catch (err) {
+      log.warn(`[sessions] PR start-session could not list ${repo}'s PRs: ${err instanceof Error ? err.message : String(err)}`);
+      return jsonOk(c, { error: "Could not read the pull request" }, 502);
+    }
+    if (!pr) return jsonOk(c, { error: "Pull request not found or not open" }, 404);
+    const [statuses, prRow] = await Promise.all([
+      loadPRRowStatuses(repo, [pr]),
+      getClawsPr(repo, number).catch((err) => {
+        log.warn(`[sessions] PR start-session could not read ${repo}#${number}'s claws_prs row: ${err instanceof Error ? err.message : String(err)}`);
+        return null;
+      }),
+    ]);
+    const qi = (await controller.queueSnapshot()).items.find((i) => i.repo === repo && i.number === number);
+    const status = resolvePRStatus({ repo, pr, status: statuses.get(number) }, qi);
+    const issueId = prRow?.issueId ?? null;
+    const input = {
+      repo,
+      number,
+      title: pr.title,
+      branch: pr.headRefName,
+      url: config.prUrl(repo, number),
+      issueId,
+      issueUrl: issueId ? clawsIssues.dashboardIssueUrl(issueId) : null,
+      focus: prSessionFocus(repo, pr, prRow, status),
+    };
+    const { provider, model, capabilities } = await sessionFormDefaultsFor([repo]);
+    const result = await getSessionBackend().create({
+      repo,
+      mode: "worktree-claude",
+      capabilities,
+      provider,
+      model,
+      brief: buildPrSessionBrief(input),
+      spawnedBySession: null,
+      spawnedForIssue: issueId,
+      spawnedForPr: prSessionRef(repo, number),
+      title: prSessionTitle(number, pr.title),
+      initialPrompt: buildPrOpeningMessage(input),
+    });
+    if (!result.ok) {
+      const status = createSessionErrorStatus(result);
+      return jsonOk(c, { error: `Cannot create session: ${describeCreateSessionError(result)}` }, status);
+    }
+    log.info(`[sessions] PRs page started session ${result.id} for ${repo}#${number} (provider: ${provider}, model: ${model ?? "default"}, focus: ${input.focus?.kind ?? "none"}, issue: ${issueId ?? "none"}, capabilities: ${capabilities.join(", ") || "none"})`);
+    return jsonOk(c, { ok: true, id: result.id, url: clawsIssues.dashboardSessionUrl(result.id) });
+  });
+
+  /**
+   * Apply (`on`) or withdraw the merge approval for the issue `repo#ref`:
+   * approve it through Merge, or lower a Merge approval to Plan
+   * (`applyIssueApproval`, which writes or clears every open PR row's
+   * approval, recording `approvedBy`). Withdrawing never raises: an issue
+   * approved short of Merge restates its approval only to clear PR rows a
+   * single-PR approval left, and with none left it writes nothing — a
+   * restated Requirements approval would promote an issue still in Ideas.
+   * Answers how many open PRs it touched; with none, the next PR Claws opens
+   * for the issue inherits the approval.
+   */
+  async function setIssueAutomerge(repo: string, ref: config.IssueRef, on: boolean, approvedBy: string): Promise<GateWriteResult & { openPrs?: number }> {
+    // Approving is checked against the track like any gate click.
+    if (on) return await checkedApproval(repo, ref, () => "merge", approvedBy);
+    let current: ApprovedThrough;
+    let openPrs: ClawsPrRecord[];
+    try {
+      current = (await readIssueApproval(repo, ref)).approvedThrough;
+      openPrs = atLeast(current, "merge") ? [] : (await loadIssueFlight(repo, ref)).openPrs;
+    } catch (err) {
+      log.warn(`[approval] approval state of ${repo}#${ref}: ${err}`);
+      return { ok: false, status: 503, error: "Could not read the issue's current state — try again." };
+    }
+    if (!atLeast(current, "merge") && !openPrs.some((pr) => pr.mergeApprovedAt)) return { ok: true, openPrs: 0 };
+    // Off clears every approved row, a partial Merge's single-PR approvals included.
+    const result = await applyIssueApproval(repo, ref, withdrawMergeTarget(current), approvedBy, { clearMergeRows: true });
+    return result.ok ? { ok: true, openPrs: result.openPrs } : { ok: false, status: result.status as ContentfulStatusCode, error: result.error };
+  }
+
+  // ── Backlog (docs/issue-tracker.md#backlog) ──
+  //
+  // Backlog issues are off the board; this is where they are listed, with the
+  // day a parked one returns, and where a human promotes them back to
+  // Drafting, Requirements review or Planning. The one automated exit is a
+  // return date passing (`backlog-until.ts`'s sweep in the issue dispatcher).
+
+  app.get("/backlog", authMiddleware, async (c) => {
+    const theme = getTheme(c);
+    const repos = await listRepos();
+    const query = parseBacklogQuery((k) => c.req.query(k));
+    const incomplete = new Set<string>();
+    const orNone = (source: string) => (err: unknown): never[] => {
+      log.warn(`[backlog] ${source}: ${err}`);
+      incomplete.add(source);
+      return [];
+    };
+    const perRepo = await mapWithConcurrency(repos, 8, async (r) => {
+      const open = await listOpenIssues(r.fullName, { staleOk: true }).catch(orNone(r.fullName));
+      return open.map((issue): BacklogRow => ({
+        repo: r.fullName,
+        ref: issue.number,
+        title: issue.title,
+        labels: issue.labels.map((l) => l.name),
+        url: config.issueUrl(r.fullName, issue.number),
+        updatedAt: issue.updatedAt ?? "",
+        createdAt: issue.createdAt ?? "",
+        author: issue.author.login,
+        repos: issue.repos,
+      }));
+    });
+    // An unassigned issue reads as Drafting whatever its lifecycle (see
+    // `columnFor`), so the filter below drops these; they are fetched so the
+    // page agrees with the board by construction rather than by assumption.
+    const unassigned = (await clawsIssues.listUnassignedOpenIssues().catch(orNone("unassigned issues"))).map((issue): BacklogRow => ({
+      repo: "",
+      ref: issue.id,
+      title: issue.title,
+      labels: issue.labels,
+      url: config.issueUrl("", issue.id),
+      updatedAt: clawsIssues.toIso(issue.updated_at),
+      createdAt: clawsIssues.toIso(issue.created_at),
+      author: issue.author_login,
+    }));
+    const listed = [...perRepo.flat(), ...unassigned]
+      .filter((r) => columnFor({ labels: r.labels, unassigned: !r.repo }) === BACKLOG_DESTINATION);
+    const untilById = await getIssueBacklogUntil(listed.filter((r) => isClawsIssueId(r.ref)).map((r) => String(r.ref)))
+      .catch((err) => { log.warn(`[backlog] return dates: ${err}`); return new Map<string, string>(); });
+    const rows = listed.map((r) => ({ ...r, until: untilById.get(String(r.ref)) ?? null }));
+    return htmlOk(c, buildBacklogPage({
+      rows,
+      repoOptions: repos.map((r) => r.fullName),
+      query,
+      incompleteSources: query.repo ? (incomplete.has(query.repo) ? 1 : 0) : incomplete.size,
+    }, theme, await loadOperatorAttentionCounts()));
+  });
+
+  // The backlog page's form: a row's own Promote button sends `only`, the
+  // bulk button every ticked `item`. Works without JavaScript.
+  app.post("/backlog/promote", authMiddleware, async (c) => {
+    const body = await readTextBody(c);
+    const params = parseFormBody(body);
+    const only = params["only"];
+    const values = only ? [only] : parseFormBodyMulti(body, "item");
+    const returnTo = params["return_to"] ?? "";
+    const back = /^\/backlog(?:\?[^\s]*)?$/.test(returnTo) ? returnTo : "/backlog";
+    const backAction = { actions: [{ href: back, label: "← Backlog" }] };
+    if (values.length === 0) {
+      return htmlError(c, 400, "Nothing to promote", "Tick at least one issue, or use a row's Promote button.", backAction);
+    }
+    if (values.length > BULK_MOVE_LIMIT) {
+      return htmlError(c, 400, "Too many issues", `Promote at most ${BULK_MOVE_LIMIT} issues at a time.`, backAction);
+    }
+    // `<repo>#<ref>`, split on the last `#`: a repo name never holds one.
+    const items = values.map((value) => {
+      const at = value.lastIndexOf("#");
+      const ref = at >= 0 ? canonicalIssueRef(value.slice(at + 1)) : null;
+      return { value, repo: at >= 0 ? value.slice(0, at) : "", ref };
+    });
+    const results = await mapWithConcurrency(items, 4, async (item) => {
+      if (item.ref === null) return { value: item.value, status: 400, error: "Not an issue reference" };
+      const { status, body: res } = await applyBoardMove(item.repo, item.ref, "requirements-review", { entry: true, approvedBy: sessionSubject(c) });
+      return { value: item.value, status, error: typeof res["error"] === "string" ? res["error"] : undefined };
+    });
+    const failed = results.filter((r) => r.status !== 200 || r.error);
+    if (failed.length > 0) {
+      const promoted = results.length - failed.length;
+      return htmlError(
+        c,
+        409,
+        "Some issues were not promoted",
+        `${promoted} of ${results.length} promoted.`,
+        { detail: failed.map((r) => `${r.value}: ${r.error ?? `HTTP ${r.status}`}`).join("\n"), ...backAction },
+      );
+    }
+    return c.redirect(back, 303);
+  });
+
+  // ── Claws-native issue tracker (docs/issue-tracker.md) ──
+  //
+  // `/issues/new` is registered before `/issues/:id` so the literal path wins
+  // over the parameter. Every mutation goes through the `github.ts` façade so a
+  // native issue gets the same events and label semantics as a forge one —
+  // except the comment form, which must post as the operator rather than as
+  // Claws, or the refiner would read its own marker and skip the feedback.
+
+  app.get("/issues/new", authMiddleware, async (c) => {
+    const repos = await listRepos();
+    return htmlOk(c, buildNewIssuePage(repos.map((r) => r.fullName), getTheme(c), await loadOperatorAttentionCounts(), c.req.query("repo")));
+  });
+
+  // The New issue modal on /board and /issues posts here with
+  // `Accept: application/json` and gets `{ ok, id, url }` or `{ error }`; the
+  // no-JS form on /issues/new keeps the HTML error page and 303 redirect.
+  app.post("/issues", authMiddleware, async (c) => {
+    const wantsJson = (c.req.header("accept") ?? "").includes("application/json");
+    const fail = (status: 400 | 409, heading: string, message: string) => wantsJson
+      ? jsonOk(c, { error: message }, status)
+      : htmlError(c, status, heading, message, {
+        actions: [{ href: "/issues/new", label: "← New issue" }],
+      });
+    const body = await readTextBody(c);
+    const params = parseFormBody(body);
+    const title = (params["title"] ?? "").trim();
+    if (!title) {
+      return fail(400, "Cannot create issue", "A title is required.");
+    }
+    const known = new Set((await listRepos()).map((r) => r.fullName));
+    const repos = parseFormBodyMulti(body, "repo").filter((r) => known.has(r));
+    const modelPlan = parseModelPlanForm(params);
+    const hasModelPlan = modelPlan.some((cell) => cell.provider || cell.tier);
+    if (hasModelPlan && repos.length === 0) {
+      return fail(409, "Model plan not saved", "The model plan is stored under the issue's primary repository, and this issue has none. Remove the model plan selections or pick a repo, then try again.");
+    }
+    // The form offers no state at all — lifecycle is set by moving
+    // the issue on the board or with its page's Status buttons — so a hand-sent
+    // one is dropped rather than quietly setting the new issue's state.
+    const labels = parseFormBodyMulti(body, "label").filter((l) => l in config.LABEL_SPECS && !isStateLabel(l));
+    // Links are resolved before the issue is written, so a bad reference
+    // fails the whole create instead of leaving a half-linked issue behind.
+    const links: Array<{ kind: issueLinks.LinkKind; target: string }> = [];
+    for (const kind of issueLinks.LINK_KINDS) {
+      const refs = parseFormBodyMulti(body, kind).flatMap((v) => v.split(",")).map((v) => v.trim()).filter(Boolean);
+      for (const ref of refs) {
+        try {
+          links.push({ kind, target: await issueLinks.resolveLinkTarget(ref, clawsIssues.primaryRepo({ repos })) });
+        } catch (err) {
+          if (!(err instanceof issueLinks.LinkError)) throw err;
+          return fail(400, "Cannot create issue", `${issueLinks.LINK_KIND_LABELS[kind]}: ${err.message}`);
+        }
+      }
+    }
+    const id = await clawsIssues.createIssue({
+      title,
+      body: params["body"] ?? "",
+      // Single-tenant dashboard behind OIDC: whoever is signed in is the owner.
+      authorLogin: config.ALLOWED_ACTORS[0] ?? clawsIssues.CLAWS_NATIVE_LOGIN,
+      repos,
+      labels,
+      source: "dashboard",
+      // `wait` and `auto` write a requirements record and carry an explicit
+      // per-issue choice, so a dashboard issue never defers to claws.json;
+      // `skip` turns the stage off, and the issue plans from its text.
+      ...(params["autoPromote"] === "skip"
+        ? { requirementsStage: false }
+        : { requirementsStage: true, autoPromote: params["autoPromote"] === "auto" }),
+    });
+    if (hasModelPlan) await setExplicitPlan(clawsIssues.primaryRepo({ repos }), id, modelPlan);
+    for (const link of links) {
+      await issueLinks.addLink(clawsIssues.primaryRepo({ repos }), id, link.kind, link.target, config.ALLOWED_ACTORS[0] ?? clawsIssues.CLAWS_NATIVE_LOGIN);
+    }
+    // Files uploaded on the form before the issue existed are pending; claim
+    // them and point the body's links at their new home.
+    const claimed = await claimPendingAttachments(parseFormBodyMulti(body, "attachment"), id);
+    if (claimed.length > 0) {
+      const original = params["body"] ?? "";
+      let rewritten = original;
+      for (const row of claimed) {
+        rewritten = rewritten.split(`/issues/${PENDING_URL_SEGMENT}/attachments/${row.id}/`).join(`/issues/${id}/attachments/${row.id}/`);
+      }
+      if (rewritten !== original) await clawsIssues.editIssue(id, rewritten);
+    }
+    if (wantsJson) return jsonOk(c, { ok: true, id, url: `/issues/${id}` });
+    return c.redirect(`/issues/${id}`, 303);
+  });
+
+  /**
+   * The native issue behind `:id`, canonicalised first — a human may have typed
+   * or pasted `clw_01jbq…` in lower case.
+   *
+   * `forWrite` makes a shadow (#3246) read as missing, so the `/issues/:id/*`
+   * POST routes fall into their existing not-found response. A shadow is not an
+   * operator-facing issue: its title, body, labels and state follow the forge
+   * issue it stands for, and `db.ts`' by-id writes refuse it anyway — this is
+   * what turns that refusal into a 404 rather than a silently discarded form
+   * post. The GET handler passes no flag, because it needs the record in order
+   * to redirect to the forge.
+   */
+  async function loadNativeIssue(c: Ctx, opts?: { forWrite?: boolean }): Promise<{ record: Awaited<ReturnType<typeof clawsIssues.getIssue>>; id: string } | null> {
+    const ref = canonicalIssueRef(c.req.param("id"));
+    if (!isNativeIssue(ref)) return null;
+    const record = await clawsIssues.getIssue(ref);
+    if (opts?.forWrite && record?.kind === "shadow") return null;
+    return { record, id: ref };
+  }
+
+  function issueNotFound(c: Ctx) {
+    const raw = c.req.param("id") ?? "";
+    const native = isNativeIssue(canonicalIssueRef(raw));
+    return htmlError(
+      c,
+      404,
+      "Issue not found",
+      native
+        ? "No Claws-native issue with that id."
+        : "That reference belongs to a GitHub or Forgejo issue, which lives on its own forge — open it from the issue list.",
+      { detail: raw ? `#${raw}` : undefined, actions: [{ href: "/issues", label: "← All issues" }] },
+    );
+  }
+
+  /** The repo an event about this issue belongs to — its primary repo, or `""` when it has none. */
+  function eventRepo(issue: { repos: readonly string[]; primary_repo?: string | null }): string {
+    return clawsIssues.primaryRepo(issue);
+  }
+
+  /**
+   * Every PR associated with a native issue, in any stage, for the page's Pull
+   * requests section. Best-effort like `loadIssueFlight`: a failed read is
+   * logged and the section renders empty.
+   */
+  async function loadIssuePullRequests(issueId: string): Promise<IssuePullRequestView[]> {
+    try {
+      const [rows, planned] = await Promise.all([listClawsPrsForIssue(issueId), getIssuePlannedPRs(issueId)]);
+      // Only an open PR can still be merged, so only it carries the warning.
+      const warnings = await loadManualActionWarnings(rows.filter((row) => row.stage !== "merged" && row.stage !== "closed").map(manualWarningRow));
+      return rows.map((row) => ({
+        repo: row.repo,
+        number: row.prNumber,
+        title: row.title
+          ?? planned.find((p) => p.repo === row.repo && p.prNumber === row.prNumber)?.title
+          ?? `PR #${row.prNumber}`,
+        url: config.prUrl(row.repo, row.prNumber),
+        state: row.stage === "merged" ? "merged" : row.stage === "closed" ? "closed" : "open",
+        stage: row.stage,
+        needsHumanReview: row.needsHumanReview,
+        manualWarning: warnings.get(`${row.repo}#${row.prNumber}`),
+      }));
+    } catch (err) {
+      log.warn(`[server] could not load pull requests for issue ${issueId}: ${err}`);
+      return [];
+    }
+  }
+
+  /**
+   * The plan's operator step (its `manual` entry) for the Pull requests
+   * section, pending while the issue is open — a `claws-phase-done:` claim
+   * closes it on the next dispatcher tick. Undefined when the plan has none.
+   */
+  async function loadOperatorStep(record: ClawsIssueRecord): Promise<{ title: string; pending: boolean } | undefined> {
+    try {
+      const manual = (await getIssuePlannedPRs(record.id)).find((e) => e.kind === "manual");
+      return manual ? { title: manual.title, pending: record.state === "open" } : undefined;
+    } catch (err) {
+      log.warn(`[server] could not load the operator step for issue ${record.id}: ${err}`);
+      return undefined;
+    }
+  }
+
+  app.get("/issues/:id", authMiddleware, async (c) => {
+    const loaded = await loadNativeIssue(c);
+    if (!loaded?.record) return issueNotFound(c);
+    const { record } = loaded;
+    // A shadow stands for an issue that is still live on its forge, and the
+    // forge copy is the operator-facing one — it has the comments, and it is
+    // where a reply goes. Redirect rather than render a comment-less mirror
+    // that reads like the real issue (#3246).
+    if (record.kind === "shadow") {
+      const link = await getImportedIssueByNative(record.id);
+      if (!link) return issueNotFound(c);
+      return c.redirect(config.forgeIssueUrl(link.repo, link.forgeNumber), 302);
+    }
+    const comments = await clawsIssues.listCommentDetails(record.id, { renderHtml: false });
+    const planRecords = (await clawsIssues.listPlans(record.id)).map((p) => ({ ...p, sections: planParser.parsePlanSections(p.body) }));
+    const requirementRecords = await clawsIssues.listRequirements(record.id);
+    // Bare issue and PR references in any text on the page link to the items
+    // Claws knows; the stored text is untouched.
+    const refs = await resolveIssueRefLinks([
+      record.body,
+      ...comments.map((cm) => cm.body),
+      ...planRecords.flatMap((p) => p.sections.map((s) => s.markdown)),
+      ...requirementRecords.flatMap((r) => [r.context, r.requirement, ...r.acceptanceCriteria, ...r.outOfScope]),
+    ], record.repos).catch((err): IssueRefLinks => {
+      // Linking is decoration; a lookup failure must not fail the page.
+      log.warn(`Issue ref link lookup failed for ${record.id}: ${err instanceof Error ? err.message : String(err)}`);
+      return { hrefFor: () => undefined };
+    });
+    // The plan comment is shown under Current plan, not in Comments; every
+    // other comment, Claws' replies included, stays in the discussion.
+    const plans = planRecords.map((p): PlanView & { commentId: string | null } => ({
+      version: p.version,
+      createdAt: p.createdAt,
+      attribution: planParser.extractModelsAttribution(p.body),
+      sections: p.sections.map((s) => ({ title: s.title, html: renderMarkdown(s.markdown, { refs }) })),
+      commentId: p.commentId,
+    }));
+    const latestPlan = plans.at(-1) ?? null;
+    // Likewise the requirements record comment, shown under Requirements.
+    const requirements = requirementRecords.map((r): RequirementsView & { commentId: string | null } => ({
+      version: r.version,
+      createdAt: r.createdAt,
+      title: r.title,
+      kind: r.kind,
+      sections: [
+        { title: "Context", html: renderMarkdown(r.context, { refs }) },
+        { title: "Requirement", html: renderMarkdown(r.requirement, { refs }) },
+        { title: "Acceptance criteria", html: renderMarkdown(r.acceptanceCriteria.map((item) => `- ${item}`).join("\n"), { refs }) },
+        { title: "Out of scope", html: r.outOfScope.length > 0 ? renderMarkdown(r.outOfScope.map((item) => `- ${item}`).join("\n"), { refs }) : `<p class="queue-empty">None</p>` },
+      ],
+      commentId: r.commentId,
+    }));
+    const latestRequirements = requirements.at(-1) ?? null;
+    const hiddenCommentIds = new Set([latestPlan?.commentId, latestRequirements?.commentId].filter((id): id is string => id != null));
+    const autoPromotion = clawsIssues.autoPromoteDecision(record, latestRequirements?.kind);
+    const view: IssuePageView = {
+      id: record.id,
+      title: record.title,
+      body: record.body,
+      bodyHtml: renderMarkdown(record.body, { refs, collapseImages: true }),
+      authorLogin: record.author_login,
+      state: record.state,
+      stateReason: record.state_reason,
+      createdAt: clawsIssues.toIso(record.created_at),
+      updatedAt: clawsIssues.toIso(record.updated_at),
+      repos: record.repos,
+      primaryRepo: clawsIssues.primaryRepo(record),
+      ...(record.primary_repo ? { pinnedPrimaryRepo: record.primary_repo } : {}),
+      labels: record.labels,
+      comments: comments
+        .filter((cm) => !hiddenCommentIds.has(String(cm.id)) && !isRequirementsComment(cm.body))
+        .map((cm) => ({ id: String(cm.id), login: cm.login, body: cm.body, bodyHtml: renderMarkdown(cm.body, { refs }), createdAt: cm.createdAt })),
+      plan: latestPlan,
+      previousPlans: plans.slice(0, -1),
+      requirements: latestRequirements,
+      previousRequirements: requirements.slice(0, -1),
+      requirementsApproval: record.requirements_approved_by && record.requirements_approved_at
+        ? {
+            version: record.approved_requirements_version == null ? null : Number(record.approved_requirements_version),
+            by: record.requirements_approved_by,
+            at: clawsIssues.toIso(record.requirements_approved_at),
+          }
+        : null,
+      requirementsApproved: record.requirements_approved_at != null,
+      lifecycle: record.lifecycle,
+      approvedThrough: record.approved_through ?? "none",
+      // Drafting or Requirements review, the same rule as the board's.
+      requirementsReview: latestRequirements !== null
+        && !await clawsIssues.hasRequirementsFeedback(comments, latestRequirements.createdAt),
+      source: record.source,
+      requirementsStage: clawsIssues.requirementsStageApplies(record),
+      autoPromotes: autoPromotion.promotes,
+      autoPromoteReason: autoPromotion.reason === "bug" || autoPromotion.reason === "alert" ? autoPromotion.reason : undefined,
+      filedTitle: record.filed_title,
+      allRepos: (await listRepos()).map((r) => r.fullName),
+      // Resolved against the issue's primary repo; with none there is no row
+      // to read, and the page renders the grid read-only.
+      modelPlan: await describeModelPlan(clawsIssues.primaryRepo(record) || null, record.id, record.labels.map((name) => ({ name }))),
+      attachments: (await listClawsIssueAttachments(record.id)).map((row) => ({
+        id: row.id,
+        name: row.filename,
+        url: attachmentUrl(row),
+        size: row.size,
+        contentType: row.content_type,
+        isImage: isInlineImage(row),
+      })),
+      links: await issueLinks.listLinks("", record.id),
+      history: await clawsIssues.listHistory(record.id),
+      flight: await loadIssueFlight(clawsIssues.primaryRepo(record), record.id),
+      pullRequests: await loadIssuePullRequests(record.id),
+      operatorStep: await loadOperatorStep(record),
+      blockedReason: await getIssueBlockedReasons([record.id])
+        .then((reasons) => reasons.get(record.id) ?? null)
+        .catch((err) => { log.warn(`[server] could not read the blocked reason of issue ${record.id}: ${err}`); return null; }),
+      queuedReason: record.lifecycle === "blocked" ? (await issuesQueued([record.id])).get(record.id) ?? null : null,
+      backlogUntil: record.lifecycle === "backlog" ? record.backlog_until ?? null : null,
+      reapprovalPending: await getIssueReapproval(record.id)
+        .then((row) => (row && row.approvedAt === null ? { version: row.requirementsVersion } : null))
+        .catch((err) => { log.warn(`[server] could not read the re-approval of issue ${record.id}: ${err}`); return null; }),
+    };
+    return htmlOk(c, buildIssuePage(view, getTheme(c), await loadOperatorAttentionCounts()));
+  });
+
+  /**
+   * Feedback on a plan that is Awaiting plan review means the plan is no longer
+   * awaiting review — send it back to the planner (Planning) immediately rather than
+   * waiting for the next issue-dispatcher tick (up to 5 minutes). Shared by
+   * the comment route and the attachment routes' synthesised comment, so an
+   * upload has the same immediate effect as a typed comment.
+   */
+  async function returnToPlannerOnFeedback(
+    loaded: { record: NonNullable<Awaited<ReturnType<typeof clawsIssues.getIssue>>>; id: string },
+    body: string,
+  ): Promise<void> {
+    if (isPhaseClaimOnly(body) || loaded.record.state !== "open" || loaded.record.lifecycle !== "awaiting-plan-review") return;
+    const repo = eventRepo(loaded.record);
+    await clawsIssues.setLifecycle(repo, loaded.id, "planning");
+    if (loaded.record.repos.length === 1 && !isAgentDisabled("planner")) {
+      try {
+        await worker.enqueue(AGENT_KINDS.ISSUE_REFINER_REFINE, repo, loaded.id, {
+          priority: hasPriorityLabel(loaded.record.labels.map((name) => ({ name }))),
+        });
+      } catch (err) {
+        log.warn(`[server] Issue ${loaded.id}: failed to enqueue refinement after operator comment: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    log.info(`[server] Issue ${loaded.id}: returned to the planner (planning) on operator feedback`);
+  }
+
+  // The issue page's combined comment + status box: `body` is the comment and
+  // the optional `status` submit-button value applies a lifecycle move with it.
+  // Only Approve plan (`approved`), its Merge partner (`approved-automerge`)
+  // and Send to backlog may go without a comment; the comment is written first so a re-plan can read it.
+  app.post("/issues/:id/comments", authMiddleware, async (c) => {
+    const loaded = await loadNativeIssue(c, { forWrite: true });
+    if (!loaded?.record) return issueNotFound(c);
+    const params = parseFormBody(await readTextBody(c));
+    const body = (params["body"] ?? "").trim();
+    const status = params["status"] ?? "";
+    const back = { actions: [{ href: `/issues/${loaded.id}`, label: "← Back to issue" }] };
+    if (status && !COMMENT_FREE_STATUSES.has(status) && !body) {
+      return htmlError(c, 400, "Comment needed", "This status change needs a comment saying why.", back);
+    }
+    if (body) {
+      const commentId = await clawsIssues.commentOnIssue(
+        eventRepo(loaded.record),
+        loaded.id,
+        body,
+        config.ALLOWED_ACTORS[0] ?? clawsIssues.CLAWS_NATIVE_LOGIN,
+      );
+      if (commentId && !status) await returnToPlannerOnFeedback({ record: loaded.record, id: loaded.id }, body);
+    }
+    if (status) {
+      const approvedBy = sessionSubject(c);
+      const column = status === "approved-automerge" ? "approved" : status;
+      // The date beside Send to backlog; empty sends it to the backlog undated.
+      const until = column === BACKLOG_DESTINATION && params["backlog_until"] ? params["backlog_until"] : undefined;
+      const result = status === "unblock"
+        ? await unblockNative(loaded.record, loaded.id, approvedBy)
+        : await applyColumnChange(loaded.record, loaded.id, column, status === "approved-automerge", approvedBy, until, column === "blocked" ? body : undefined);
+      if (!result.ok) return htmlError(c, result.status, "Cannot move issue", result.error, back);
+    }
+    return c.redirect(`/issues/${loaded.id}`, 303);
+  });
+
+  // The issue page's per-comment Delete (docs/issue-tracker.md#deleting-comments):
+  // a soft delete recorded in History, never feedback, so nothing re-plans.
+  app.post("/issues/:id/comments/:commentId/delete", authMiddleware, async (c) => {
+    const loaded = await loadNativeIssue(c, { forWrite: true });
+    if (!loaded?.record) return issueNotFound(c);
+    const commentRef = c.req.param("commentId") ?? "";
+    try {
+      await clawsIssues.deleteIssueComments(loaded.id, [commentRef], `operator:${currentIssueActor().name}`);
+    } catch (err) {
+      if (!(err instanceof clawsIssues.IssueCommentDeleteError)) throw err;
+      const refused = err.reason === "refused";
+      return htmlError(c, refused ? 409 : 404, refused ? "Comment not deleted" : "Comment not found", err.message, {
+        actions: [{ href: `/issues/${loaded.id}`, label: "← Issue" }],
+      });
+    }
+    return c.redirect(`/issues/${loaded.id}#comments`, 303);
+  });
+
+  app.post("/issues/:id/labels", authMiddleware, async (c) => {
+    // The issue page's auto-saving forms ask for JSON; a plain form post (no
+    // JS) still gets the redirect back to the page.
+    const wantsJson = (c.req.header("accept") ?? "").includes("application/json");
+    const loaded = await loadNativeIssue(c, { forWrite: true });
+    if (!loaded?.record) return wantsJson ? jsonOk(c, { error: "Issue not found" }, 404) : issueNotFound(c);
+    // Only labels the form itself offered are added or removed, so a label
+    // applied by an agent but absent from LABEL_SPECS survives a "Save labels".
+    // The state labels are not offered: they read off the `lifecycle` field,
+    // and treating them as unticked would reset every issue to Drafting.
+    // Claws Staging is opt-in only via the forge, so it isn't offered either —
+    // must match the checkbox set rendered by offeredLabels() in pages/issue.ts.
+    const offered = offeredLabels(Object.keys(config.LABEL_SPECS));
+    const wanted = new Set(parseFormBodyMulti(await readTextBody(c), "label").filter((l) => offered.includes(l)));
+    const repo = eventRepo(loaded.record);
+    for (const label of wanted) {
+      if (!loaded.record.labels.includes(label)) await addLabel(repo, loaded.id, label);
+    }
+    for (const label of loaded.record.labels) {
+      if (offered.includes(label) && !wanted.has(label)) await removeLabel(repo, loaded.id, label);
+    }
+    if (wantsJson) return jsonOk(c, { ok: true });
+    return c.redirect(`/issues/${loaded.id}`, 303);
+  });
+
+  /**
+   * Set a native issue's lifecycle state the way a board move to `column`
+   * would, with the same refusals. Shared by the issue page's Status buttons
+   * and the session labels and column routes, so a session's Blocked passes
+   * exactly the checks an operator's click does; `approvedBy` is recorded when
+   * the move promotes the issue. A move into Planning for an issue that kept
+   * its plan re-plans it, as a board drop into Planning would.
+   *
+   * `column` is a stored lifecycle or `approved`, the plan-review lifecycle
+   * with the issue approved through Plan (#clw_01M5VW14RKAAGS6VZ5PCKQXB9F).
+   * Into Approved the stored approval rises to Plan — never lowering a Merge
+   * approval — and into Awaiting plan review it drops to Requirements, both
+   * through `applyIssueApproval`, as a board move does.
+   *
+   * `opts.until` parks the issue in the Backlog until that `YYYY-MM-DD` day
+   * (null clears the date, omitted leaves it); only with `column: "backlog"`.
+   *
+   * `opts.reason` is why the issue is Blocked: required with `column:
+   * "blocked"` and written with the move in one transaction. An issue already
+   * Blocked takes it as its re-stated reason.
+   */
+  async function setNativeColumn(record: NativeIssueRecord, id: string, column: string, approvedBy: string, opts?: { unblock?: boolean; until?: string | null; reason?: string; approval?: ApprovedThrough }): Promise<GateWriteResult> {
+    if (isDerivedColumn(column)) return { ok: false, status: 409, error: DERIVED_COLUMN_REJECTION };
+    if (column !== "approved" && !isIssueLifecycle(column)) return { ok: false, status: 400, error: `Unknown column: ${column}` };
+    const reason = opts?.reason?.trim() ?? "";
+    if (column === "blocked" && !reason) return { ok: false, status: 400, error: BLOCKED_REASON_REQUIRED };
+    let until: string | null | undefined;
+    if (opts?.until !== undefined) {
+      if (column !== BACKLOG_DESTINATION) return { ok: false, status: 400, error: "A return date is only accepted with the backlog column." };
+      const parsedUntil = parseBacklogUntil(opts.until);
+      if (!parsedUntil.ok) return { ok: false, status: 400, error: parsedUntil.error };
+      until = parsedUntil.until;
+    }
+    const refusal = await nativeStatusRefusal(record);
+    if (refusal) return refusal;
+    // Planning for a pending design change is its promotion — see promoteNative.
+    if (column === "planning" && await hasPendingReapproval(id)) return await promoteNative(record, id, approvedBy);
+    const hasPlan = (await clawsIssues.listPlans(id)).length > 0;
+    // Before anything writes, so a refused Approved approves nothing either.
+    const planReason = planRefusal(column, hasPlan);
+    if (planReason) return { ok: false, status: 409, error: planReason };
+    const flight = await loadIssueFlight(eventRepo(record), id);
+    if (column === BACKLOG_DESTINATION) {
+      const refusal = backlogRefusal(flight);
+      if (refusal) return { ok: false, status: 409, error: refusal };
+    }
+    // `ideas` is either requirements column; the issue's requirements state
+    // picks which, so a landing in either one is the move landing.
+    const target: BoardDestination = column === "approved" ? column : destinationForLifecycle(column);
+    const move = transitionFor(target)!;
+    const lifecycle: IssueLifecycle = move.lifecycle ?? (column as IssueLifecycle);
+    const approvedThrough: ApprovedThrough = record.approved_through ?? "none";
+    const requirementsReview = column === "ideas" ? await clawsIssues.isAwaitingRequirementsReview(id) : false;
+    const landing = columnAfterMove(move, { labels: record.labels, closed: false, unassigned: false, lifecycle: record.lifecycle, approvedThrough, requirementsReview, ...flight });
+    // Leaving Blocked with a flight (real, or a PR row not yet marked merged)
+    // lands in the derived column the flight implies; that is accepted.
+    const unblockLanding = opts?.unblock === true && record.lifecycle === "blocked" && isDerivedColumn(landing);
+    if (!landsIn(landing, target) && !unblockLanding) {
+      return { ok: false, status: 409, error: isDerivedColumn(landing) ? DERIVED_COLUMN_REJECTION : `That move lands in ${landing}, not ${target}.` };
+    }
+    // The approval first: raising it from Ideas is the promotion, which the
+    // lifecycle write below then moves on from.
+    // A caller's own approval (Refine & Automerge's Merge) replaces the move's, so it is one write.
+    const approval = opts?.approval ?? approvalForMove(move, approvedThrough);
+    let approvalWritten = false;
+    if (approval && approval !== approvedThrough) {
+      const written = await applyIssueApproval(eventRepo(record), id, approval, approvedBy);
+      if (!written.ok) return { ok: false, status: written.status as ContentfulStatusCode, error: written.error };
+      approvalWritten = written.changed;
+    }
+    const moved = record.lifecycle !== lifecycle;
+    if (moved) {
+      try {
+        await moveNativeLifecycle(eventRepo(record), record, lifecycle, approvedBy, false, reason);
+      } catch {
+        // The approval has landed: say the move was partly applied, not refused.
+        return approvalWritten
+          ? { ok: false, status: 500, error: `The approval was saved, but the issue changed before it moved to ${lifecycle} — reload and try the move again.` }
+          : { ok: false, status: 409, error: "The issue changed since this page loaded — reload and try again." };
+      }
+    } else if (column === "blocked") {
+      await setIssueBlockedReason(id, reason);
+    }
+    if (until !== undefined && !(await setClawsIssueBacklogUntil(id, until))) {
+      return {
+        ok: false,
+        status: 409,
+        error: moved
+          ? "The issue was moved to the Backlog, but it changed before its return date was saved — reload and set the date again."
+          : "The issue changed since this page loaded — reload and try again.",
+      };
+    }
+    if (column === "planning" && hasPlan) await replanAfterPlanningMove(eventRepo(record), id, record.labels);
+    return { ok: true };
+  }
+
+  /**
+   * Why a native issue's status (column or Backlog return date) cannot be
+   * changed at all, or null: an unassigned issue, one in an orphaned repo and a
+   * closed one are never selected by the dispatchers or the Backlog sweep.
+   */
+  async function nativeStatusRefusal(record: NativeIssueRecord): Promise<Extract<GateWriteResult, { ok: false }> | null> {
+    if (record.repos.length === 0) return { ok: false, status: 409, error: UNASSIGNED_REJECTION };
+    if (await orphanedRepos(record.repos)) return { ok: false, status: 409, error: orphanedRejection(record.repos) };
+    if (record.state === "closed") return { ok: false, status: 409, error: "Reopen this issue before changing its status." };
+    return null;
+  }
+
+  /** Where a dependency release sends a Blocked issue (clawsIssues.releaseLifecycle). */
+  async function blockedReleaseLifecycle(record: NativeIssueRecord, id: string): Promise<string> {
+    const plans = await clawsIssues.listPlans(id);
+    const latest = plans.length ? plans[plans.length - 1] : undefined;
+    return clawsIssues.releaseLifecycle(record, latest != null, latest != null && planParser.isBlockedVerdictPlan(latest.body)).lifecycle;
+  }
+
+  /** Remove Blocked; with an open PR or running implementer the issue lands in its derived column. */
+  async function unblockNative(record: NativeIssueRecord, id: string, approvedBy: string): Promise<GateWriteResult> {
+    if (record.lifecycle !== "blocked") return { ok: true };
+    return await setNativeColumn(record, id, await blockedReleaseLifecycle(record, id), approvedBy, { unblock: true });
+  }
+
+  // The issue page's Unblock button.
+  app.post("/issues/:id/unblock", authMiddleware, async (c) => {
+    const loaded = await loadNativeIssue(c, { forWrite: true });
+    if (!loaded?.record) return issueNotFound(c);
+    const back = { actions: [{ href: `/issues/${loaded.id}`, label: "← Back to issue" }] };
+    const result = await unblockNative(loaded.record, loaded.id, sessionSubject(c));
+    if (!result.ok) return htmlError(c, result.status, "Cannot move issue", result.error, back);
+    return c.redirect(`/issues/${loaded.id}`, 303);
+  });
+
+  /**
+   * Move a native issue to `column`; with `automerge` alongside Approved, the
+   * issue is approved through Merge rather than Plan.
+   */
+  async function applyColumnChange(record: NativeIssueRecord, id: string, column: string, automerge: boolean, approvedBy: string, until?: string | null, reason?: string): Promise<GateWriteResult> {
+    return await setNativeColumn(record, id, column, approvedBy, {
+      ...(until === undefined ? {} : { until }),
+      ...(reason === undefined ? {} : { reason }),
+      ...(automerge && column === "approved" ? { approval: "merge" as const } : {}),
+    });
+  }
+
+  // Standalone route (the issue page now posts to /comments with `status`): set the issue's lifecycle state the way a
+  // board move to that column would, with the same refusals. `column=approved`
+  // approves the issue through Plan; `automerge=1` alongside it approves it
+  // through Merge.
+  app.post("/issues/:id/column", authMiddleware, async (c) => {
+    const loaded = await loadNativeIssue(c, { forWrite: true });
+    if (!loaded?.record) return issueNotFound(c);
+    const { record } = loaded;
+    const params = parseFormBody(await readTextBody(c));
+    const column = params["column"] ?? "";
+    const automerge = !!params["automerge"];
+    const until = column === BACKLOG_DESTINATION && params["backlog_until"] ? params["backlog_until"] : undefined;
+    const back = { actions: [{ href: `/issues/${loaded.id}`, label: "← Back to issue" }] };
+    const result = await applyColumnChange(record, loaded.id, column, automerge, sessionSubject(c), until, params["reason"]);
+    if (!result.ok) return htmlError(c, result.status, "Cannot move issue", result.error, back);
+    return c.redirect(`/issues/${loaded.id}`, 303);
+  });
+
+  // The issue page's Returns-on controls and the backlog page's per-row date
+  // form (docs/issue-tracker.md#backlog): set or, with an empty `until`, clear
+  // the day a parked issue comes back. Only while the issue is in the Backlog.
+  // `return_to` sends the backlog page's form back to the filtered page.
+  app.post("/issues/:id/backlog-until", authMiddleware, async (c) => {
+    const loaded = await loadNativeIssue(c, { forWrite: true });
+    if (!loaded?.record) return issueNotFound(c);
+    const params = parseFormBody(await readTextBody(c));
+    const returnTo = params["return_to"] ?? "";
+    const back = /^\/backlog(?:\?[^\s]*)?$/.test(returnTo) ? returnTo : `/issues/${loaded.id}`;
+    const backAction = { actions: [{ href: back, label: back.startsWith("/backlog") ? "← Backlog" : "← Back to issue" }] };
+    const refusal = await nativeStatusRefusal(loaded.record);
+    if (refusal) return htmlError(c, refusal.status, "Cannot set the return date", refusal.error, backAction);
+    if (loaded.record.lifecycle !== BACKLOG_DESTINATION) {
+      return htmlError(c, 409, "Not in the backlog", "A return date can only be set while the issue is in the Backlog.", backAction);
+    }
+    const parsed = parseBacklogUntil(params["until"] ?? "");
+    if (!parsed.ok) return htmlError(c, 400, "Invalid return date", parsed.error, backAction);
+    if (!(await setClawsIssueBacklogUntil(loaded.id, parsed.until))) {
+      return htmlError(c, 409, "Not in the backlog", "The issue changed since this page loaded — reload and try again.", backAction);
+    }
+    return c.redirect(back, 303);
+  });
+
+  // The Requirements block's Promote button (docs/refinements/issue-flow.md
+  // "Promotion"): approve the latest requirements version as the signed-in
+  // operator and move the issue from Drafting or Requirements review to Planning — the same write as a
+  // drop into Planning on the board.
+  app.post("/issues/:id/promote", authMiddleware, async (c) => {
+    const loaded = await loadNativeIssue(c, { forWrite: true });
+    if (!loaded?.record) return issueNotFound(c);
+    const back = { actions: [{ href: `/issues/${loaded.id}`, label: "← Back to issue" }] };
+    const result = await promoteNative(loaded.record, loaded.id, sessionSubject(c));
+    if (!result.ok) return htmlError(c, result.status, "Cannot promote issue", result.error, back);
+    return c.redirect(`/issues/${loaded.id}`, 303);
+  });
+
+  /**
+   * Promote a native issue out of Drafting or Requirements review, approving its latest requirements
+   * version as `approvedBy`. Shared by the Requirements block's Promote button
+   * and the session promote route. A demoted issue that kept its plan is
+   * re-planned on the way back into Planning, as a board drop into Planning
+   * would.
+   */
+  async function promoteNative(record: NativeIssueRecord, id: string, approvedBy: string): Promise<GateWriteResult> {
+    if (record.state === "closed") return { ok: false, status: 409, error: "Reopen this issue before promoting it." };
+    if (record.repos.length === 0) return { ok: false, status: 409, error: UNASSIGNED_REJECTION };
+    // A design change pending re-approval is promoted from any column, and
+    // the promotion is its approval — never a re-plan.
+    if (await hasPendingReapproval(id)) {
+      if (!(await promoteReapproval(id, approvedBy))) return { ok: false, status: 409, error: "The issue changed since this page loaded — reload and try again." };
+      return { ok: true };
+    }
+    if (record.lifecycle !== "ideas") return { ok: false, status: 409, error: "Only an issue in Drafting or Requirements review can be promoted." };
+    const promoted = await clawsIssues.promoteIssue(id, approvedBy, "ideas");
+    if (!promoted) return { ok: false, status: 409, error: "The issue changed since this page loaded — reload and try again." };
+    if ((await clawsIssues.listPlans(id)).length > 0) {
+      await replanAfterPlanningMove(eventRepo(record), id, record.labels);
+    }
+    return { ok: true };
+  }
+
+  // The header's inline title editor posts here with just `title` and `Accept:
+  // application/json`; the collapsed Edit section (no-JS path) posts both
+  // `title` and `body`. A missing `body` field means "leave the body alone" —
+  // an absent field must not be read as "set it to empty".
+  app.post("/issues/:id/edit", authMiddleware, async (c) => {
+    const wantsJson = (c.req.header("accept") ?? "").includes("application/json");
+    const loaded = await loadNativeIssue(c, { forWrite: true });
+    if (!loaded?.record) return wantsJson ? jsonOk(c, { error: "Issue not found" }, 404) : issueNotFound(c);
+    const params = parseFormBody(await readTextBody(c));
+    const repo = eventRepo(loaded.record);
+    let title = loaded.record.title;
+    if ("title" in params) {
+      const trimmed = (params["title"] ?? "").trim();
+      if (trimmed && trimmed !== loaded.record.title) await editIssueTitle(repo, loaded.id, trimmed);
+      if (trimmed) title = trimmed;
+    }
+    if ("body" in params) {
+      const newBody = params["body"] ?? "";
+      if (newBody !== loaded.record.body) await editIssue(repo, loaded.id, newBody);
+    }
+    if (wantsJson) return jsonOk(c, { ok: true, title });
+    return c.redirect(`/issues/${loaded.id}`, 303);
+  });
+
+  // The issue page's Create Session button: an interactive session dedicated to
+  // a native issue, set up exactly as a board start (`startIssueSession`: same
+  // repos, agent, model, capabilities, brief and opening message). The only
+  // differences are the audit comment posted here and `spawned_from`. A
+  // dashboard route like `/board/start-session`, not the session-only
+  // `startSpawnedSession` path, so its five-session cap and bearer rules stay
+  // untouched (docs/product/dashboard-and-integrations.md).
+  const issueSessionsInFlight = new Set<string>();
+  app.post("/issues/:id/start-session", authMiddleware, async (c) => {
+    const wantsJson = (c.req.header("accept") ?? "").includes("application/json");
+    const loaded = await loadNativeIssue(c, { forWrite: true });
+    if (!loaded?.record) return wantsJson ? jsonOk(c, { error: "Issue not found" }, 404) : issueNotFound(c);
+    const { record, id } = loaded;
+    const back = { actions: [{ href: `/issues/${id}`, label: "← Back to issue" }] };
+    if (issueSessionsInFlight.has(id)) {
+      const message = "A session is already being created for this issue";
+      return wantsJson ? jsonOk(c, { error: message }, 409) : htmlError(c, 409, "Cannot create session", message, back);
+    }
+    issueSessionsInFlight.add(id);
+    try {
+      const started = await startIssueSession(record, id, "issue-page");
+      if (!started.ok) {
+        const message = `Cannot create session: ${started.error}`;
+        return wantsJson ? jsonOk(c, { error: message }, started.status) : htmlError(c, started.status, "Cannot create session", started.error, back);
+      }
+      const { provider, model, repos, url } = started;
+      await postSessionAudit(eventRepo(record), id, `The operator started session [\`${started.id}\`](${url}) for this issue from the issue page (${provider}${model ? `, ${model}` : ""}; ${repos.length > 0 ? repos.join(", ") : "home directory"}).`);
+      return wantsJson ? jsonOk(c, { ok: true, id: started.id, url }) : c.redirect(url, 303);
+    } finally {
+      issueSessionsInFlight.delete(id);
+    }
+  });
+
+  app.post("/issues/:id/state", authMiddleware, async (c) => {
+    const loaded = await loadNativeIssue(c, { forWrite: true });
+    if (!loaded?.record) return issueNotFound(c);
+    const params = parseFormBody(await readTextBody(c));
+    const state = params["state"] ?? "";
+    const repo = eventRepo(loaded.record);
+    if (state === "open") {
+      // The façade has no reopen — Forgejo never needed one here.
+      await clawsIssues.reopenIssue(loaded.id);
+    } else if (state === "closed") {
+      // Not planned by default — the human closing from the board or this
+      // control almost always means "this was dropped, not shipped". The
+      // issue page's second button opts into completed, for work finished
+      // outside Claws; a merged PR's own close (auto-merger.ts,
+      // issue-auditor.ts, pr-dispatcher.ts) never goes through this route.
+      await closeIssue(repo, loaded.id, params["reason"] === "completed" ? "completed" : "not_planned");
+    }
+    return c.redirect(`/issues/${loaded.id}`, 303);
+  });
+
+  app.post("/issues/:id/repos", authMiddleware, async (c) => {
+    // The issue page's auto-saving forms ask for JSON; a plain form post (no
+    // JS) still gets the redirect back to the page.
+    const wantsJson = (c.req.header("accept") ?? "").includes("application/json");
+    const loaded = await loadNativeIssue(c, { forWrite: true });
+    if (!loaded?.record) return wantsJson ? jsonOk(c, { error: "Issue not found" }, 404) : issueNotFound(c);
+    const known = new Set((await listRepos()).map((r) => r.fullName));
+    await clawsIssues.setRepos(loaded.id, parseFormBodyMulti(await readTextBody(c), "repo").filter((r) => known.has(r)));
+    if (wantsJson) return jsonOk(c, { ok: true });
+    return c.redirect(`/issues/${loaded.id}`, 303);
+  });
+
+  // The phase × (provider, tier) grid (docs/model-selection.md). Every phase in
+  // the form is written: a phase left blank clears its explicit cell back to the
+  // planner's suggestion or the default. Cells are stored under the issue's
+  // primary repo — the one the planner and implementer resolve them from — so a
+  // POST for an issue with no repo, including a stale tab whose repos were
+  // cleared since it loaded, is refused rather than written nowhere.
+  app.post("/issues/:id/model-plan", authMiddleware, async (c) => {
+    const loaded = await loadNativeIssue(c, { forWrite: true });
+    if (!loaded?.record) return issueNotFound(c);
+    const repos = loaded.record.repos;
+    if (repos.length === 0) {
+      return htmlError(c, 409, "Model plan not saved", "The model plan is stored under the issue's primary repository, and this issue has none. Assign a repo, reload the issue and try again.", {
+        actions: [{ href: `/issues/${loaded.id}`, label: "← Issue" }],
+      });
+    }
+    const cells = parseModelPlanForm(parseFormBody(await readTextBody(c)));
+    await setExplicitPlan(clawsIssues.primaryRepo(loaded.record), loaded.id, cells);
+    return c.redirect(`/issues/${loaded.id}`, 303);
+  });
+
+  // ── Native issue attachments (#3289, docs/issue-tracker.md) ──
+  //
+  // `:id` is a native issue id, or the literal `new` for a pending upload made
+  // on the New Issue form before the issue exists. Uploads mirror the session
+  // routes: a multipart route capped at 10 MB per request, and a raw-body
+  // streaming route for anything up to 1 GB.
+
+  /**
+   * The owner an attachment route acts on: a live native issue's id, `null`
+   * for `new` (pending), or undefined when `:id` names neither — including a
+   * shadow, whose files would belong to the forge copy. `loaded` carries the
+   * live issue's record for routes that need to post feedback on upload.
+   */
+  async function attachmentOwner(
+    c: Ctx,
+  ): Promise<{ issueId: string | null; segment: string; loaded?: { record: NonNullable<Awaited<ReturnType<typeof clawsIssues.getIssue>>>; id: string } } | undefined> {
+    if (c.req.param("id") === PENDING_URL_SEGMENT) return { issueId: null, segment: PENDING_URL_SEGMENT };
+    const loaded = await loadNativeIssue(c, { forWrite: true });
+    if (!loaded?.record) return undefined;
+    return { issueId: loaded.id, segment: loaded.id, loaded: { record: loaded.record, id: loaded.id } };
+  }
+
+  function describeAttachment(row: ClawsIssueAttachmentRow) {
+    return { id: row.id, name: row.filename, url: attachmentUrl(row), size: row.size, contentType: row.content_type };
+  }
+
+  /**
+   * Uploading a file from the Attachments-section form counts as plan
+   * feedback, same as a typed comment (issue clw_01M39J5AT1SKCFV6CHMWPVHD6M):
+   * post an "Attached …" comment on the uploader's behalf, one line per
+   * stored file, so `commentOnIssue` stamps `comment_id` on each row and
+   * `returnToPlannerOnFeedback` sends an Awaiting-review issue back to the
+   * planner. Carries no "Automated by Claws" marker, so the refiner treats it
+   * as human feedback.
+   */
+  async function postAttachmentFeedbackComment(
+    loaded: { record: NonNullable<Awaited<ReturnType<typeof clawsIssues.getIssue>>>; id: string },
+    rows: readonly ClawsIssueAttachmentRow[],
+  ): Promise<void> {
+    const body = rows
+      .map((row) => {
+        const name = row.filename.replace(/[[\]]/g, "_");
+        const prefix = isInlineImage(row) ? "!" : "";
+        return `Attached ${prefix}[${name}](${attachmentUrl(row)})`;
+      })
+      .join("\n");
+    const uploader = config.ALLOWED_ACTORS[0] ?? clawsIssues.CLAWS_NATIVE_LOGIN;
+    const commentId = await clawsIssues.commentOnIssue(eventRepo(loaded.record), loaded.id, body, uploader);
+    if (commentId) log.info(`[server] Issue ${loaded.id}: posted attachment feedback comment ${commentId}`);
+    await returnToPlannerOnFeedback(loaded, body);
+  }
+
+  function attachmentUploadFailed(c: Ctx, wantsJson: boolean, segment: string, result: Extract<SaveUploadResult, { ok: false }>, maxLabel: string): Response {
+    if (wantsJson) return uploadErrorResponse(c, result, maxLabel);
+    return htmlError(c, result.reason === "too-large" ? 413 : 500, "Upload failed", describeUploadError(result, maxLabel), {
+      actions: [{ href: `/issues/${segment}`, label: "← Back" }],
+    });
+  }
+
+  app.get("/issues/:id/attachments/:attachmentId/:filename", authMiddleware, async (c) => {
+    const notFound = () => textPlain(c, "Attachment not found", 404);
+    const parsed = parseAttachmentUrl(c.req.path);
+    if (!parsed) return notFound();
+    let owner: string | null = null;
+    if (parsed.issueId !== PENDING_URL_SEGMENT) {
+      const record = await clawsIssues.getIssue(parsed.issueId);
+      if (!record || record.kind === "shadow") return notFound();
+      owner = record.id;
+    }
+    const found = await readIssueAttachment(parsed.attachmentId);
+    // The row, not the URL, decides whose file this is.
+    if (!found || found.row.issue_id !== owner) return notFound();
+    let opened: Awaited<ReturnType<typeof openIssueAttachment>>;
+    try {
+      opened = await openIssueAttachment(found);
+    } catch (err) {
+      log.warn(`[server] Attachment ${found.row.id} could not be read: ${err}`);
+      return textPlain(c, "Attachment store unavailable", 502);
+    }
+    if (!opened) return notFound();
+    c.header("Content-Type", serveContentType(found.row));
+    c.header("Content-Length", String(opened.size));
+    c.header("Content-Disposition", contentDisposition(found.row));
+    c.header("X-Content-Type-Options", "nosniff");
+    c.header("Content-Security-Policy", "default-src 'none'; sandbox");
+    c.header("Cache-Control", "private, max-age=3600");
+    return c.body(opened.body, 200);
+  });
+
+  app.post(
+    "/issues/:id/attachments",
+    authMiddleware,
+    // Per request, not per file: the dashboard client sends one file per
+    // request, and the true per-file cap is still enforced by the store.
+    bodyLimit({
+      maxSize: MAX_UPLOAD_BYTES + 4096,
+      onError: (c) => {
+        c.header("Content-Type", "application/json");
+        return c.body(JSON.stringify({ error: "File too large (max 10 MB)" }), 413);
+      },
+    }),
+    async (c) => {
+      const wantsJson = (c.req.header("accept") ?? "").includes("application/json");
+      const owner = await attachmentOwner(c);
+      if (!owner) return wantsJson ? jsonOk(c, { error: "Issue not found" }, 404) : issueNotFound(c);
+      if (owner.issueId === null) await sweepPendingAttachments();
+      let field: unknown;
+      try {
+        field = (await c.req.parseBody({ all: true }))["file"];
+      } catch (err) {
+        return jsonOk(c, { error: `Malformed upload: ${String(err)}` }, 400);
+      }
+      const files = (Array.isArray(field) ? field : [field]).filter((f): f is File => f instanceof File && f.size > 0);
+      if (files.length === 0) {
+        if (wantsJson) return jsonOk(c, { error: "Missing file field" }, 400);
+        return c.redirect(`/issues/${owner.segment}`, 303);
+      }
+      const uploader = config.ALLOWED_ACTORS[0] ?? clawsIssues.CLAWS_NATIVE_LOGIN;
+      const stored: ClawsIssueAttachmentRow[] = [];
+      for (const file of files) {
+        const result = await storeIssueAttachment(owner.issueId, file.name, Buffer.from(await file.arrayBuffer()), file.type, uploader);
+        if (!result.ok) return attachmentUploadFailed(c, wantsJson, owner.segment, result, "10 MB");
+        log.info(`[server] Issue ${owner.segment}: stored attachment ${result.row.id} (${result.row.size} bytes)`);
+        stored.push(result.row);
+      }
+      if (owner.loaded && c.req.query("feedback") === "1") await postAttachmentFeedbackComment(owner.loaded, stored);
+      if (wantsJson) return jsonOk(c, { attachments: stored.map(describeAttachment) });
+      return c.redirect(`/issues/${owner.segment}`, 303);
+    },
+  );
+
+  app.post("/issues/:id/attachments/stream", authMiddleware, async (c) => {
+    const wantsJson = (c.req.header("accept") ?? "").includes("application/json");
+    // Fast reject before reading a byte when the client declares an over-cap size.
+    const declared = Number(c.req.header("content-length") ?? "");
+    if (Number.isFinite(declared) && declared > MAX_LARGE_UPLOAD_BYTES) {
+      return jsonOk(c, { error: "File too large (max 1 GB)" }, 413);
+    }
+    const owner = await attachmentOwner(c);
+    if (!owner) return wantsJson ? jsonOk(c, { error: "Issue not found" }, 404) : issueNotFound(c);
+    if (owner.issueId === null) await sweepPendingAttachments();
+    const body = c.req.raw.body;
+    if (!body) return jsonOk(c, { error: "Missing request body" }, 400);
+    const result = await storeIssueAttachmentStream(
+      owner.issueId,
+      c.req.query("name") ?? "upload",
+      Readable.fromWeb(body as unknown as import("node:stream/web").ReadableStream<Uint8Array>),
+      c.req.header("content-type"),
+      config.ALLOWED_ACTORS[0] ?? clawsIssues.CLAWS_NATIVE_LOGIN,
+    );
+    if (!result.ok) return attachmentUploadFailed(c, wantsJson, owner.segment, result, "1 GB");
+    log.info(`[server] Issue ${owner.segment}: stored streamed attachment ${result.row.id} (${result.row.size} bytes)`);
+    if (owner.loaded && c.req.query("feedback") === "1") await postAttachmentFeedbackComment(owner.loaded, [result.row]);
+    if (wantsJson) return jsonOk(c, { attachments: [describeAttachment(result.row)] });
+    return c.redirect(`/issues/${owner.segment}`, 303);
+  });
+
+  // A form cannot send DELETE, so this is a POST like every other issue write.
+  app.post("/issues/:id/attachments/:attachmentId/delete", authMiddleware, async (c) => {
+    const wantsJson = (c.req.header("accept") ?? "").includes("application/json");
+    const owner = await attachmentOwner(c);
+    if (!owner) return wantsJson ? jsonOk(c, { error: "Issue not found" }, 404) : issueNotFound(c);
+    const parsed = parseAttachmentUrl(`/issues/${owner.segment}/attachments/${c.req.param("attachmentId")}`);
+    const found = parsed ? await readIssueAttachment(parsed.attachmentId) : undefined;
+    if (!found || found.row.issue_id !== owner.issueId) {
+      return wantsJson ? jsonOk(c, { error: "Attachment not found" }, 404) : textPlain(c, "Attachment not found", 404);
+    }
+    await deleteIssueAttachment(found.row.id);
+    if (wantsJson) return jsonOk(c, { ok: true });
+    return c.redirect(`/issues/${owner.segment}`, 303);
+  });
+
+  // Links to other tracker issues (docs/issue-tracker.md#links). Plain forms,
+  // so both writes are POSTs that redirect back to the page.
+  app.post("/issues/:id/links", authMiddleware, async (c) => {
+    const loaded = await loadNativeIssue(c, { forWrite: true });
+    if (!loaded?.record) return issueNotFound(c);
+    const params = parseFormBody(await readTextBody(c));
+    const back = { actions: [{ href: `/issues/${loaded.id}`, label: "← Back to issue" }] };
+    const kind = issueLinks.parseLinkKind(params["kind"]);
+    if (!kind) return htmlError(c, 400, "Cannot link issue", `Unknown link kind: ${params["kind"] ?? ""}`, back);
+    try {
+      await issueLinks.addLink(eventRepo(loaded.record), loaded.id, kind, params["issue"] ?? "", config.ALLOWED_ACTORS[0] ?? clawsIssues.CLAWS_NATIVE_LOGIN);
+    } catch (err) {
+      if (err instanceof issueLinks.LinkError) return htmlError(c, err.status, "Cannot link issue", err.message, back);
+      throw err;
+    }
+    return c.redirect(`/issues/${loaded.id}#links`, 303);
+  });
+
+  app.post("/issues/:id/links/:linkId/delete", authMiddleware, async (c) => {
+    const loaded = await loadNativeIssue(c, { forWrite: true });
+    if (!loaded?.record) return issueNotFound(c);
+    try {
+      await issueLinks.removeLink(eventRepo(loaded.record), loaded.id, c.req.param("linkId") ?? "");
+    } catch (err) {
+      if (err instanceof issueLinks.LinkError) {
+        return htmlError(c, err.status, "Cannot remove link", err.message, { actions: [{ href: `/issues/${loaded.id}`, label: "← Back to issue" }] });
+      }
+      throw err;
+    }
+    return c.redirect(`/issues/${loaded.id}#links`, 303);
+  });
+
+  app.get("/repo-avatar/:owner/:name", authMiddleware, async (c) => {
+    const fullName = `${c.req.param("owner")}/${c.req.param("name")}`;
+    const avatarPath = getRepoConfig(fullName)?.avatar;
+    if (!avatarPath) return textPlain(c, "No avatar", 404);
+    const bytes = await loadRepoAvatar(fullName, avatarPath);
+    if (!bytes) return textPlain(c, "Avatar not found", 404);
+    const ext = avatarPath.slice(avatarPath.lastIndexOf(".") + 1).toLowerCase();
+    c.header("Content-Type", REPO_AVATAR_CONTENT_TYPES[ext] ?? "application/octet-stream");
+    c.header("X-Content-Type-Options", "nosniff");
+    c.header("Content-Security-Policy", "default-src 'none'; sandbox");
+    c.header("Cache-Control", "private, max-age=1800");
+    return c.body(new Uint8Array(bytes), 200);
+  });
+
+  app.get("/repos/:owner/:name", authMiddleware, async (c) => {
+    const theme = getTheme(c);
+    const owner = c.req.param("owner");
+    const name = c.req.param("name");
+    if (!owner || !name) {
+      return htmlError(c, 404, "Repo not found", "That repository isn't managed by Claws.", {
+        actions: [{ href: "/jobs", label: "← Jobs" }],
+      });
+    }
+
+    const repoWtDir = path.resolve(WORK_DIR, "worktrees", owner, name);
+    if (!repoWtDir.startsWith(path.join(WORK_DIR, "worktrees") + path.sep)) {
+      return c.body(null, 400);
+    }
+
+    const fullName = `${owner}/${name}`;
+
+    const repos = await listRepos();
+    if (!repos.some((r) => r.fullName === fullName)) {
+      return htmlError(c, 404, "Repo not found", "That repository isn't managed by Claws.", {
+        detail: fullName,
+        actions: [{ href: "/jobs", label: "← Jobs" }],
+      });
+    }
+
+    const snapshot = await controller.queueSnapshot();
+    const repoQueueItems = snapshot.items.filter((item) => item.repo === fullName);
+
+    // The PR statuses chain on listPRs so they still load alongside the rest.
+    const prsWithStatuses = listPRs(fullName).catch((): PR[] => [])
+      .then(async (prs) => ({ prs, prStatuses: await loadPRRowStatuses(fullName, prs) }));
+    const [recentTasks, dailyStats, { prs, prStatuses }, prRows, alerts, primaryIssues, namingIssues] = await Promise.all([
+      getRecentTasksForRepo(fullName, 20),
+      getDailyTaskStats(fullName, 30),
+      prsWithStatuses,
+      listClawsPrs(fullName).catch(() => []),
+      listIssuesByLabel(fullName, "claws-error").catch(() => []),
+      listOpenIssues(fullName).catch(() => []),
+      clawsIssues.listOpenIssuesNaming(fullName).catch((): Issue[] => []),
+      enrichQueueItemsWithPRStatus(repoQueueItems),
+    ]);
+    // Any-repo matching: native issues that name this repo as a non-primary
+    // join the primary-repo list, deduped by number.
+    const seenIssues = new Set(primaryIssues.map((i) => String(i.number)));
+    const openIssues = [...primaryIssues, ...namingIssues.filter((i) => !seenIssues.has(String(i.number)))];
+
+    let worktrees: string[] = [];
+    try {
+      const namespaces = await fs.promises.readdir(repoWtDir, { withFileTypes: true });
+      for (const ns of namespaces) {
+        if (!ns.isDirectory()) continue;
+        const branches = await fs.promises.readdir(path.join(repoWtDir, ns.name));
+        for (const branch of branches) {
+          worktrees.push(`${ns.name}/${branch}`);
+        }
+      }
+    } catch {
+      // ENOENT or permission error — no worktrees for this repo
+    }
+
+    const html = buildRepoPage({
+      owner,
+      name,
+      queueItems: repoQueueItems,
+      recentTasks,
+      dailyStats,
+      worktrees,
+      openPRs: prs,
+      clawsPrs: prRows,
+      alertIssues: alerts,
+      openIssues,
+      prStatuses,
+    }, theme, await loadOperatorAttentionCounts());
+    return htmlOk(c, html);
+  });
+
+  app.get("/whatsapp", authMiddleware, async (c) => {
+    const theme = getTheme(c);
+    return htmlOk(c, buildWhatsAppPage(theme, await loadOperatorAttentionCounts()));
+  });
+
+  app.get("/whatsapp/pair", authMiddleware, (c) => {
+    if (isPairing()) {
+      cancelPairing();
+    }
+    return streamSSE(c, async (stream) => {
+      let resolveDone!: () => void;
+      const done = new Promise<void>((r) => { resolveDone = r; });
+      const listener = (event: import("./whatsapp.js").PairingEvent) => {
+        void stream.writeSSE({ data: JSON.stringify(event) });
+        if (event.type === "connected") {
+          resolveDone();
+        } else if (event.type === "error" || event.type === "timeout") {
+          resolveDone();
+        }
+      };
+      stream.onAbort(() => {
+        stopPairing();
+        resolveDone();
+      });
+      startPairing(listener).catch((err) => {
+        void stream.writeSSE({ data: JSON.stringify({ type: "error", message: String(err) }) });
+        resolveDone();
+      });
+      await done;
+    });
+  });
+
+  // ── Session routes (GET) ──
+  // Register specific routes first so they don't collide with /sessions/:id.
+
+  /** Live sessions first, then ended ones, as the /sessions list shows them. */
+  const loadSessionsForList = async () => {
+    // Each live row's Claude account label and Switch account state read the account list.
+    if (claudeAccountsStale()) await refreshClaudeAccounts();
+    const live = await getSessionBackend().listLive();
+    const liveIds = new Set(live.map((s) => s.id));
+    const ended = (await listEndedSessions()).filter((s) => !liveIds.has(s.id));
+    return [...live, ...ended];
+  };
+
+  // The /sessions page polls this to drop an ended session without a reload (#clw_01M52FEC8QSM9P57WWSEBYFB7D).
+  app.get("/api/sessions/table", authMiddleware, async (c) => {
+    const sessions = await loadSessionsForList();
+    const badge = navLinkCount("/sessions", { sessions: sessions.filter((s) => s.alive).length });
+    const nav = [{ href: "/sessions", text: badge?.text ?? "", name: badge?.name ?? "Sessions" }];
+    return c.json({ ...renderSessionsTables(sessions), nav });
+  });
+
+  app.get("/sessions", authMiddleware, async (c) => {
+    // The create form offers claude-auth only while an account has a token.
+    if (claudeAccountsStale()) await refreshClaudeAccounts();
+    const theme = getTheme(c);
+    const repos = await listRepos().catch(() => []);
+    const activityMap = await getLastTaskTimePerRepo();
+    repos.sort((a, b) => {
+      const ta = activityMap.get(a.fullName);
+      const tb = activityMap.get(b.fullName);
+      if (!ta && !tb) return a.fullName.localeCompare(b.fullName);
+      if (!ta) return 1;
+      if (!tb) return -1;
+      return tb.localeCompare(ta);
+    });
+    // buildSessionsListPage orders the choosers alphabetically; this activity sort only picks the default.
+    const defaultRepo = repos[0]?.fullName ?? null;
+    const sessions = await loadSessionsForList();
+    // A DB hiccup must not 500 the sessions page — fall back to no recents.
+    let recentModels = { claude: [] as string[], codex: [] as string[], opencode: [] as string[], pi: [] as string[] };
+    try {
+      recentModels = {
+        claude: await getRecentSessionModels("claude"),
+        codex: await getRecentSessionModels("codex"),
+        opencode: await getRecentSessionModels("opencode"),
+        pi: await getRecentSessionModels("pi"),
+      };
+    } catch { /* ignore */ }
+    // Likewise fall back to the static per-repo map (no remembered defaults).
+    let rememberedCapabilityDefaults = new Map<string, string[]>();
+    try {
+      rememberedCapabilityDefaults = await getAllSessionCapabilityDefaults();
+    } catch { /* ignore */ }
+    const [agentDefaults, providers] = await Promise.all([loadSessionAgentDefaults(), controller.providerStatus()]);
+    const html = buildSessionsListPage(theme, sessions, repos, defaultRepo, recentModels, {
+      defaultProvider: defaultSessionProvider(agentDefaults.lastProvider, providers),
+      defaultMultiProvider: defaultMultiSessionProvider(agentDefaults.lastProvider, providers),
+      rememberedModels: agentDefaults.models,
+      rememberedCapabilityDefaults,
+    }, withSessionCount(await loadOperatorAttentionCounts(), sessions.filter((s) => s.alive).length));
+    return htmlOk(c, html);
+  });
+
+  // WebSocket route for /sessions/:id/ws — register BEFORE /sessions/:id to win match order.
+  // Auth note: the WS upgrade runs through `authMiddleware`. Under OIDC it requires a valid
+  // `claws_session` cookie; with OIDC unconfigured the upgrade is denied (503), consistent with
+  // all other authenticated routes.
+  app.get(
+    "/sessions/:id/ws",
+    authMiddleware,
+    // Validate session before the WebSocket handshake so the client gets HTTP 404 (not a
+    // post-handshake close(1008)) when the session ID is unknown.
+    async (c, next) => {
+      const id = c.req.param("id") ?? "";
+      if (!/^[a-f0-9]+$/.test(id)) return c.body(null, 404);
+      const check = await getSessionBackend().checkAttach(id);
+      if (!check.ok) return c.body(null, check.reason === "unavailable" ? 503 : 404);
+      return next();
+    },
+    upgradeWebSocket((c) => {
+      const id = c.req.param("id") ?? "";
+      return {
+        onOpen(_evt, ws) {
+          if (ws.raw) getSessionBackend().attach(id, ws.raw as WebSocket);
+        },
+      };
+    }),
+  );
+
+  // Files the session published (`claws_publish_file`). Operator routes, like
+  // the session page itself; they work for live and ended sessions alike.
+  app.get("/sessions/:id/files", authMiddleware, async (c) => {
+    const id = c.req.param("id");
+    if (!/^[a-f0-9]+$/.test(id)) return jsonOk(c, { error: "Not found" }, 404);
+    return jsonOk(c, { files: describeSessionFiles(await listSessionFiles(id)) });
+  });
+
+  app.get("/sessions/:id/files/:fileId/:filename", authMiddleware, async (c) => {
+    const notFound = () => textPlain(c, "File not found", 404);
+    const id = c.req.param("id");
+    const fileId = c.req.param("fileId");
+    if (!/^[a-f0-9]+$/.test(id) || !/^csf_[0-9A-Z]{26}$/.test(fileId)) return notFound();
+    const found = await readSessionFile(fileId);
+    // The row, not the URL, decides whose file this is.
+    if (!found || found.row.session_id !== id) return notFound();
+    let size: number;
+    try {
+      size = fs.statSync(found.absolutePath).size;
+    } catch {
+      return notFound();
+    }
+    const disposition = contentDisposition(found.row);
+    c.header("Content-Type", serveContentType(found.row));
+    c.header("Content-Length", String(size));
+    c.header("Content-Disposition", c.req.query("download") === "1" ? disposition.replace(/^inline;/, "attachment;") : disposition);
+    c.header("X-Content-Type-Options", "nosniff");
+    c.header("Content-Security-Policy", "default-src 'none'; sandbox");
+    c.header("Cache-Control", "private, max-age=3600");
+    const stream = Readable.toWeb(fs.createReadStream(found.absolutePath)) as unknown as ReadableStream<Uint8Array>;
+    return c.body(stream, 200);
+  });
+
+  /** A session's published files for its page; a DB hiccup shows none rather than failing the page. */
+  async function sessionFilesForPage(id: string): Promise<SessionFileView[]> {
+    try {
+      return describeSessionFiles(await listSessionFiles(id));
+    } catch (err) {
+      log.warn(`[server] Session ${id}: failed to list published files: ${err}`);
+      return [];
+    }
+  }
+
+  app.get("/sessions/:id", authMiddleware, async (c) => {
+    const theme = getTheme(c);
+    const id = c.req.param("id");
+    if (!/^[a-f0-9]+$/.test(id)) {
+      return htmlError(c, 404, "Session not found", "That session ID isn't valid.", {
+        detail: id,
+        actions: [{ href: "/sessions", label: "← All sessions" }],
+      });
+    }
+    const live = await getSessionBackend().getLive(id);
+    if (!live.ok && live.reason === "unavailable") {
+      return htmlError(c, 503, "Session runtime unavailable",
+        "Claws could not reach the session runtime to look this session up. It has not been changed — try again shortly.",
+        {
+          detail: live.detail ? `${id}: ${live.detail}` : id,
+          actions: [{ href: "/sessions", label: "← All sessions" }],
+        },
+      );
+    }
+    if (!live.ok) {
+      const ended = await getEndedSession(id);
+      if (ended) return htmlOk(c, buildEndedSessionPage(theme, { ...ended, files: await sessionFilesForPage(id) }, await loadOperatorAttentionCounts()));
+      return htmlError(c, 404, "Session not found",
+        "No running session has that ID, and none is in history — it may have been deleted, or pruned (Claws keeps the 50 most recent ended sessions).",
+        {
+          detail: id,
+          actions: [{ href: "/sessions", label: "← All sessions" }, { href: "/", label: "Dashboard" }],
+        },
+      );
+    }
+    const session = live.session;
+    const backend = getSessionBackend();
+    // A DB hiccup only drops the "Started by" line, never the page.
+    let startedBy: { session: string | null; issue: string | null; pr?: { repo: string; number: number } | null; source?: "issue-page" | null } | null = null;
+    try {
+      const row = await getPersistedSession(id);
+      const pr = parsePrSessionRef(row?.spawned_for_pr);
+      if (row?.spawned_by_session) startedBy = { session: row.spawned_by_session, issue: row.spawned_for_issue ?? null };
+      else if (pr) startedBy = { session: null, issue: row?.spawned_for_issue ?? null, pr };
+      else if (row?.spawned_for_issue) startedBy = { session: null, issue: row.spawned_for_issue, ...(row.spawned_from === "issue-page" ? { source: "issue-page" as const } : {}) };
+    } catch { /* ignore */ }
+    const html = buildSessionTerminalPage(theme, {
+      files: await sessionFilesForPage(id),
+      startedBy,
+      id: session.id,
+      repo: session.repo,
+      cwd: session.cwd,
+      alive: session.alive,
+      provider: session.provider,
+      summary: session.summary,
+      extraRepos: session.extraRepos,
+      capabilityOptions: session.alive
+        ? classifyLiveGrants(session.capabilities, backend.kind, session).map(({ cap, state, reason }) => ({ id: cap.id, label: cap.label, group: capabilityGroup(cap), state, reason }))
+        : [],
+    }, await loadOperatorAttentionCounts());
+    return htmlOk(c, html);
+  });
+
+  app.get("/config", authMiddleware, async (c) => {
+    const theme = getTheme(c);
+    const saved = c.req.query("saved") === "1";
+    return htmlOk(c, buildConfigPage(saved, theme, await loadLatestReport(), await loadOperatorAttentionCounts()));
+  });
+
+  app.get("/config/api", authMiddleware, (c) => {
+    return jsonOk(c, getConfigForDisplay());
+  });
+
+  // /logs/issue must come BEFORE /logs/:runId so it isn't captured as a runId.
+  app.get("/logs/issue", authMiddleware, async (c) => {
+    const theme = getTheme(c);
+    const repoParam = c.req.query("repo");
+    const num = canonicalIssueRef(c.req.query("number") ?? "");
+    if (!repoParam || num === null || (typeof num === "number" && num < 1)) {
+      return htmlError(c, 400, "Bad request", "This page needs both a repo and an issue reference, e.g. /logs/issue?repo=owner/name&number=123.", {
+        actions: [{ href: "/jobs", label: "← Jobs" }],
+      });
+    }
+    if (!(await isConfiguredRepo(repoParam))) {
+      return htmlError(c, 404, "Repo not configured", "That repository isn't managed by Claws.", {
+        detail: repoParam,
+        actions: [{ href: "/jobs", label: "← Jobs" }],
+      });
+    }
+    const runs = await getRunsForIssue(repoParam, num);
+    const runIds = runs.map((r) => r.run_id);
+    const logsByRun = await getLogsForRuns(runIds);
+    const workItems = await getWorkItemsForRuns(runIds);
+    const html = buildIssueLogsPage(repoParam, num, runs, logsByRun, workItems, theme, await loadOperatorAttentionCounts());
+    return htmlOk(c, html);
+  });
+
+  app.get("/logs/:runId/tail", authMiddleware, async (c) => {
+    const runId = c.req.param("runId");
+    const afterId = parseInt(c.req.query("after") ?? "0", 10) || 0;
+    const run = await getJobRun(runId);
+    if (!run) {
+      return jsonOk(c, { error: "Run not found" }, 404);
+    }
+    const logs = await getJobRunLogsSince(runId, afterId);
+    const tasks = run.status !== "running" ? await getTasksByRunId(runId) : undefined;
+    const outcomeCards = tasks?.map((t) => {
+      const outcome = parseOutcome(t);
+      const html = outcome ? renderOutcomeCard(outcome, t.status) : "";
+      return { repo: t.repo, item_number: t.item_number, html };
+    }).filter((cd) => cd.html);
+    return jsonOk(c, {
+      status: run.status,
+      completed_at: run.completed_at,
+      logs: logs.map((l) => ({ id: l.id, level: l.level, message: l.message, logged_at: l.logged_at })),
+      taskCount: tasks?.length,
+      outcomeCards,
+    });
+  });
+
+  app.get("/logs/:runId", authMiddleware, async (c) => {
+    const theme = getTheme(c);
+    const runId = c.req.param("runId");
+    const run = await getJobRun(runId);
+    if (!run) {
+      return htmlError(c, 404, "Run not found", "No job run exists with that ID. It may have been pruned from the log retention window.", {
+        detail: runId,
+        actions: [{ href: "/jobs", label: "← Jobs" }],
+      });
+    }
+    const logs = await getJobRunLogs(runId);
+    const tasks = await getTasksByRunId(runId);
+    const html = buildLogDetailPage(run, logs, theme, tasks, await loadOperatorAttentionCounts());
+    return htmlOk(c, html);
+  });
+
+  app.get("/usage", authMiddleware, async (c) => {
+    const theme = getTheme(c);
+    const daysParam = parseInt(c.req.query("days") ?? "7", 10);
+    const days = [1, 7, 30].includes(daysParam) ? daysParam : 7;
+    const pick = (name: string): string | undefined => {
+      const v = c.req.query(name)?.trim();
+      return v ? v : undefined;
+    };
+    const filters = { repo: pick("repo"), job: pick("job"), provider: pick("provider"), model: pick("model"), account: pick("account") };
+    const stats = await getUsageStats(days, filters);
+    const totals = await getTotalUsage(days, filters);
+    const options = await getUsageFilterOptions(days);
+    const recentEvents = await getRecentEffectivenessEvents(days, filters);
+    const opencodeSpendUsd = await getOpencodeAnthropicSpendUsd();
+    const html = buildUsagePage({ stats, totals, days, filters, options, recentEvents, opencodeSpendUsd, opencodeSpendWarnUsd: config.OPENCODE_SPEND_WARN_USD }, theme, await loadOperatorAttentionCounts());
+    return htmlOk(c, html);
+  });
+}

@@ -1,0 +1,1054 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  HOME_ASSISTANT_BASE_URL,
+  HOME_ASSISTANT_TOKEN,
+  PROD_GRAFANA_URL,
+  FLEET_GRAFANA_URL,
+  FORGEJO_BASE_URL,
+  FORGEJO_TOKEN,
+  FORGEJO_READ_TOKEN,
+  FORGEJO_ADMIN_TOKEN,
+  OPENROUTER_API_KEY,
+  ANTHROPIC_API_KEY,
+  MAC_RUNNERS,
+  getMacRunnerRepos,
+  resolveLanHost,
+  PAGES_HOST,
+  PRINT_SERVER,
+  PROD_CLUSTER_TAILNET_HOST,
+  PROD_DATA_TAILNET_HOST,
+  type MacRunner,
+  type PagesHostConfig,
+} from "./config.js";
+import { SENSITIVE_ENV_KEYS } from "./sensitive-env.js";
+import { renameCapabilityIds } from "./capability-renames.js";
+import { mintGrafanaJwt } from "./grafana-jwt.js";
+import { piCredentialSources } from "./pi-auth.js";
+import { accountsWithToken } from "./claude-accounts.js";
+import type { SessionMode, SessionProvider } from "./sessions.js";
+
+/**
+ * A session capability bundles a set of credentials/environment variables that
+ * can be explicitly granted to an interactive Claude session. Sessions are
+ * default-deny: unless a capability is ticked, its env keys are stripped from
+ * the spawned process.
+ */
+export const BROWSER_CAPABILITY_ID = "browser";
+
+/** Mirrors `FORGEJO_GIT_CREDENTIAL_TOKEN_VAR` / `FORGEJO_GIT_CREDENTIAL_HELPER`
+ *  in `github-app.ts`. Duplicated deliberately: this module is
+ *  kept to a small import surface so
+ *  `capabilities.test.ts` can mock only `./config.js`. Keep the two in sync. */
+const FORGEJO_GIT_CREDENTIAL_TOKEN_VAR = "CLAWS_FORGEJO_GIT_TOKEN";
+const FORGEJO_GIT_CREDENTIAL_HELPER =
+  '!f() { echo "username=oauth2"; echo "password=$CLAWS_FORGEJO_GIT_TOKEN"; }; f';
+export const FORGEJO_CAPABILITY_ID = "forgejo";
+export const CROSS_REPO_CAPABILITY_ID = "cross-repo";
+export const PAGES_CAPABILITY_ID = "pages";
+
+/** The publish CLI shipped beside this module (`dist/tools/pages-publish.js`),
+ *  present in every session pod image. */
+const PAGES_PUBLISH_SCRIPT = fileURLToPath(new URL("./tools/pages-publish.js", import.meta.url));
+
+export const PRINT_CAPABILITY_ID = "print";
+
+/** The print wrapper CLI shipped beside this module (`dist/tools/print.js`),
+ *  which bakes in A4 and no scaling and waits for CUPS job completion. */
+const PRINT_SCRIPT = fileURLToPath(new URL("./tools/print.js", import.meta.url));
+
+/** How to call the Forgejo API with the granted token. Shared by the `forgejo`
+ *  capability description and the headless-run guidance (#3067). */
+const FORGEJO_API_USAGE =
+  "Read and write issues, PRs, labels and comments with curl against the Gitea-compatible API at $CLAWS_FORGEJO_BASE_URL/api/v1, sending the header 'Authorization: token '$CLAWS_FORGEJO_TOKEN — e.g. curl -sH \"Authorization: token $CLAWS_FORGEJO_TOKEN\" \"$CLAWS_FORGEJO_BASE_URL/api/v1/repos/OWNER/NAME/issues\".";
+export const FORGEJO_ADMIN_CAPABILITY_ID = "forgejo-admin";
+/** Lets a session's `claws_merge_pr` / `claws_approve_pr_merge` count as the
+ *  human merge of a PR touching infrastructure paths; every other merge gate
+ *  still applies (#clw_01M54GYV05ZCZWKEEMAJTE9Q3X). */
+export const INFRA_MERGE_CAPABILITY_ID = "infra-merge";
+
+/** How to query a cluster's Grafana with a Claws-signed JWT. Shared by the
+ *  two observability capability descriptions. No `=` allowed (registry test). */
+const OBSERVABILITY_API_USAGE = (urlVar: string, tokenVar: string, alertsHint: string): string =>
+  `Read-only metrics, logs and alerts through Grafana's HTTP API at $${urlVar}. Send every request as curl -sG -H "Authorization: Bearer $${tokenVar}" with a path under $${urlVar}; pass PromQL or LogQL as the \`query\` parameter with \`curl -G --data-urlencode\`. ` +
+  `Prometheus: /api/datasources/proxy/uid/prometheus/api/v1/query (also query_range, series, labels). ` +
+  `Loki: /api/datasources/proxy/uid/loki/loki/api/v1/query_range with \`start\`, \`end\` and \`limit\` parameters; Claws services log JSON, so query {app…} | json | level…error (use | logfmt for shell or CronJob logs). ` +
+  `The datasource uids are pinned to \`prometheus\` and \`loki\`. Alerts: ${alertsHint}. Dashboards: /api/search and /api/dashboards/uid/<uid>. POST /api/ds/query is a fallback when the proxy path is awkward. ` +
+  `Strictly read-only: never write to dashboards, alert rules, annotations or datasources, and never print the token.`;
+
+/** Lifetime of the Grafana JWT an observability grant carries. */
+const OBSERVABILITY_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+export const CROSS_REPO_ACCESS_GUIDANCE =
+  "Agents may read any Claws-managed repo and file issues there when work depends on deployment manifests, provisioning config, CI workflows or conventions; read the real file instead of guessing. " +
+  "Work that spans repositories is one issue: file it with the `claws_create_issue` MCP tool, naming every repo it touches — it always files natively regardless of which forge hosts them, and returns the `clw_…` id and dashboard URL to cite in your PR body. The alphabetically first repo owns planning and labels, though the issue is listed under every repo it names, and the plan lists the PRs it needs in each. File a separate issue in another repo only when the issue you are working does not name that repo and you cannot add it yourself — an interactive session adds it with `claws_set_issue_repos`; a headless planner adds it by listing a PR in that repo with `claws_save_plan`; other headless agents cannot, and otherwise only the dashboard's Repositories form can — citing its `#clw_…` id in your PR body. " +
+  "When the plan names a `dedupeKey` for that issue, pass it. A reply with `deduplicated: true` is success — an open issue already covers the work, so cite that `#clw_…` id in your PR body and do not retry with a reworded title. " +
+  "Every managed repo is hosted on Forgejo, so read through the Forgejo API with the read-only token already in your environment, from your first command and with no login step: list a directory with `curl -sH \"Authorization: token $CLAWS_FORGEJO_READ_TOKEN\" \"$CLAWS_FORGEJO_BASE_URL/api/v1/repos/OWNER/NAME/contents/DIR\"`, read a file by replacing `contents` with `raw`, and read issues at `.../repos/OWNER/NAME/issues` and `.../issues/N/comments`. " +
+  "The same token reads pull requests at `.../repos/OWNER/NAME/pulls`, `.../pulls/N` and `.../pulls/N/reviews`, and PR comments at `.../issues/N/comments`. " +
+  "Forgejo Actions run state: `GET $CLAWS_FORGEJO_BASE_URL/api/v1/repos/OWNER/NAME/actions/runs` with `$CLAWS_FORGEJO_READ_TOKEN`, filtered by the `status` query parameter (e.g. `waiting`) and capped by `limit` (e.g. 50); each run carries `index_in_repo`, `status`, `created` and `started` (`0001-01-01…` until it starts). Runner-registry routes are admin-only; read job logs with `claws_forgejo_job_logs`. " +
+  "Only when `claws_create_issue` is unavailable or fails, file an issue by POSTing JSON to `.../repos/OWNER/NAME/issues` with the same token. " +
+  "Reading and filing issues need no approval; changing code in another repo does, so open a PR there or file an issue. Never print or commit tokens.";
+
+/** UI grouping only (#3138) — never affects what is granted, validated or
+ *  pre-ticked. Fixed display order: see `CAPABILITY_GROUPS`. */
+export type CapabilityGroup = "agent" | "forge" | "infra" | "ssh" | "tools";
+
+/** Grouping sections for the create-form checkboxes and the live-grant
+ *  dropdown, in fixed display order (#3138). */
+export const CAPABILITY_GROUPS: ReadonlyArray<{ id: CapabilityGroup; label: string }> = [
+  { id: "agent", label: "Agent logins" },
+  { id: "forge", label: "Forge access" },
+  { id: "infra", label: "Infrastructure" },
+  { id: "ssh", label: "SSH hosts" },
+  { id: "tools", label: "Tools" },
+];
+
+export interface SessionCapability {
+  id: string;
+  label: string;
+  description: string;
+  /** Env keys this capability owns; stripped when not granted. */
+  envKeys: string[];
+  /** Resolve the env vars to inject, or null when unavailable (unconfigured). */
+  resolve: () => Record<string, string> | null;
+  /** Granted automatically by `withImplicitCapabilities` server-side whenever
+   *  it applies to a session's repos. The create form still renders it: when
+   *  `autoGrantedRepos` forces the grant for the selected repo(s) it is a
+   *  checked, disabled checkbox with the reason; otherwise (e.g. `forgejo` for
+   *  a home session with no repo) it is an ordinary opt-in checkbox. */
+  implicit?: boolean;
+  /** Set on the provider-auth capabilities (#3026): the agent CLI whose login
+   *  it carries. The create form keys its pre-ticking on it. */
+  provider?: SessionProvider;
+  /** Safe to grant to unattended issue planners for read-only diagnostics. */
+  headlessPlannerDiagnostic?: boolean;
+  /** UI section (#3138); see `capabilityGroup` for the fallback when unset. */
+  group?: CapabilityGroup;
+}
+
+/** `cap.group` when set, else `"ssh"` for an `ssh:*` id, else `"tools"`. */
+export function capabilityGroup(cap: SessionCapability): CapabilityGroup {
+  if (cap.group) return cap.group;
+  return cap.id.startsWith("ssh:") ? "ssh" : "tools";
+}
+
+export const CAPABILITIES: SessionCapability[] = [
+  {
+    id: "home-assistant",
+    label: "Home Assistant",
+    group: "infra",
+    description: "Read/control the Home Assistant instance via its REST API.",
+    envKeys: ["HOME_ASSISTANT_BASE_URL", "HOME_ASSISTANT_TOKEN", "CLAWS_HOME_ASSISTANT_TOKEN"],
+    resolve: () =>
+      !HOME_ASSISTANT_TOKEN
+        ? null
+        : {
+            HOME_ASSISTANT_BASE_URL,
+            HOME_ASSISTANT_TOKEN,
+            CLAWS_HOME_ASSISTANT_TOKEN: HOME_ASSISTANT_TOKEN,
+          },
+  },
+  {
+    id: "prod-observability",
+    label: "Prod observability (Grafana)",
+    group: "infra",
+    description: OBSERVABILITY_API_USAGE(
+      "CLAWS_PROD_GRAFANA_URL",
+      "CLAWS_PROD_GRAFANA_TOKEN",
+      "/api/alertmanager/grafana/api/v2/alerts or /api/datasources/proxy/uid/alertmanager/api/v2/alerts",
+    ),
+    envKeys: ["CLAWS_PROD_GRAFANA_URL", "CLAWS_PROD_GRAFANA_TOKEN"],
+    headlessPlannerDiagnostic: true,
+    // A fresh Claws-signed JWT per grant; nothing to configure (#clw_01M5AW39TVQ6KX2WRDZGHSN2TZ).
+    resolve: () => ({
+      CLAWS_PROD_GRAFANA_URL: PROD_GRAFANA_URL,
+      CLAWS_PROD_GRAFANA_TOKEN: mintGrafanaJwt("prod", OBSERVABILITY_TOKEN_TTL_MS),
+    }),
+  },
+  {
+    id: "fleet-observability",
+    label: "Fleet observability (Grafana)",
+    group: "infra",
+    description:
+      OBSERVABILITY_API_USAGE(
+        "CLAWS_FLEET_GRAFANA_URL",
+        "CLAWS_FLEET_GRAFANA_TOKEN",
+        "/api/prometheus/grafana/api/v1/alerts (Grafana-managed rules)",
+      ) +
+      " A redirect or an HTML Authentik page instead of JSON means the request missed the Bearer-only route (the token is a Claws-signed JWT starting with eyJ); report that rather than retrying.",
+    envKeys: ["CLAWS_FLEET_GRAFANA_URL", "CLAWS_FLEET_GRAFANA_TOKEN"],
+    headlessPlannerDiagnostic: true,
+    resolve: () => ({
+      CLAWS_FLEET_GRAFANA_URL: FLEET_GRAFANA_URL,
+      CLAWS_FLEET_GRAFANA_TOKEN: mintGrafanaJwt("fleet", OBSERVABILITY_TOKEN_TTL_MS),
+    }),
+  },
+  {
+    id: CROSS_REPO_CAPABILITY_ID,
+    label: "Cross-repo (read + issues)",
+    implicit: true,
+    group: "forge",
+    description: CROSS_REPO_ACCESS_GUIDANCE,
+    envKeys: ["CLAWS_FORGEJO_READ_TOKEN", "CLAWS_FORGEJO_BASE_URL"],
+    resolve: (): Record<string, string> => {
+      if (!FORGEJO_READ_TOKEN || !FORGEJO_READ_TOKEN.trim()) return {};
+      return {
+        CLAWS_FORGEJO_READ_TOKEN: FORGEJO_READ_TOKEN,
+        CLAWS_FORGEJO_BASE_URL: FORGEJO_BASE_URL.replace(/\/+$/, ""),
+      };
+    },
+  },
+  {
+    id: FORGEJO_CAPABILITY_ID,
+    label: "Forgejo (git + API)",
+    implicit: true,
+    group: "forge",
+    description:
+      "This repository is hosted on Forgejo, like every repo Claws manages; Claws manages no work on GitHub, so never use `gh` for its issues, PRs, checks, runs or comments. " +
+      FORGEJO_API_USAGE +
+      " git fetch and git push against the Forgejo host are already authenticated in this shell via a credential helper, and `origin` already points at Forgejo — do not add a GitHub remote. CI runs on Forgejo Actions from workflows in .forgejo/workflows/, not .github/workflows/. Never print or commit the token.",
+    envKeys: [
+      "CLAWS_FORGEJO_TOKEN",
+      "CLAWS_FORGEJO_BASE_URL",
+      "CLAWS_FORGEJO_GIT_TOKEN",
+      "GIT_CONFIG_COUNT",
+      "GIT_CONFIG_KEY_0",
+      "GIT_CONFIG_VALUE_0",
+    ],
+    resolve: () => {
+      if (!FORGEJO_TOKEN || !FORGEJO_TOKEN.trim()) return null;
+      const base = FORGEJO_BASE_URL.replace(/\/+$/, "");
+      return {
+        CLAWS_FORGEJO_TOKEN: FORGEJO_TOKEN,
+        CLAWS_FORGEJO_BASE_URL: base,
+        [FORGEJO_GIT_CREDENTIAL_TOKEN_VAR]: FORGEJO_TOKEN,
+        GIT_CONFIG_COUNT: "1",
+        GIT_CONFIG_KEY_0: `credential.${base}.helper`,
+        GIT_CONFIG_VALUE_0: FORGEJO_GIT_CREDENTIAL_HELPER,
+      };
+    },
+  },
+  {
+    id: FORGEJO_ADMIN_CAPABILITY_ID,
+    label: "Forgejo admin (Actions secrets)",
+    group: "forge",
+    description:
+      "An org-owner Forgejo token in $CLAWS_FORGEJO_ADMIN_TOKEN. Use it ONLY for Forgejo Actions secrets and variables — the API paths $CLAWS_FORGEJO_BASE_URL/api/v1/repos/OWNER/NAME/actions/secrets, .../actions/variables, $CLAWS_FORGEJO_BASE_URL/api/v1/orgs/OWNER/actions/secrets and .../actions/variables — which the ordinary token cannot write (Forgejo answers 403 'user should be the owner of the repo'). For everything else, including issues, pull requests, comments, labels, reviews and all git operations, keep using $CLAWS_FORGEJO_TOKEN: the admin token belongs to a separate owner account whose name must never appear on anything this session writes. Never print or commit either token. The Claws service itself also reads the Actions runner registry and runner-jobs endpoints with this token, in-process and read-only, for mac-runner-waker; that does not widen what this session may use it for.",
+    envKeys: ["CLAWS_FORGEJO_ADMIN_TOKEN", "CLAWS_FORGEJO_BASE_URL"],
+    resolve: () => {
+      if (!FORGEJO_ADMIN_TOKEN || !FORGEJO_ADMIN_TOKEN.trim()) return null;
+      return {
+        CLAWS_FORGEJO_ADMIN_TOKEN: FORGEJO_ADMIN_TOKEN,
+        CLAWS_FORGEJO_BASE_URL: FORGEJO_BASE_URL.replace(/\/+$/, ""),
+      };
+    },
+  },
+  {
+    id: INFRA_MERGE_CAPABILITY_ID,
+    label: "Infra merge (human merge for OpenTofu PRs)",
+    group: "infra",
+    description:
+      "claws_merge_pr and claws_approve_pr_merge count this session's merge as the human merge for a PR touching OpenTofu/Terraform paths, which they otherwise refuse with 'always need a human merge'. Use it only for a PR the operator has explicitly told you to merge. Every other check still applies and still refuses with its usual reason: a stored merge approval, green CI on the head, a clean Claws review of the head, no merge conflicts, and no manual-action, merge, stacked or re-approval hold. claws_approve_pr_merge with queue true leaves the merge to the auto-merger, which never carries this capability, so call claws_merge_pr again once the PR is ready. Never merge any other way.",
+    envKeys: [],
+    resolve: () => ({}),
+  },
+  {
+    id: BROWSER_CAPABILITY_ID,
+    label: "Browser (Playwright)",
+    group: "tools",
+    description:
+      "Drive a real headless Chromium (which may be a shared browser service) through the Playwright MCP tools (mcp__playwright__*). " +
+      "Use these for sites that block plain HTTP fetches — eBay, Facebook Marketplace, Gumtree — " +
+      "instead of WebFetch or curl, which such sites answer with a bot-challenge page. " +
+      "Close tabs you have finished reading; an unbounded tab count exhausts the host's memory budget. " +
+      "The browser may be shared with other work: the first browser tool call can take a while because the run is waiting in a queue — that is not a failure. " +
+      "If a browser tool call reports that the connection was refused or the queue is full, wait about 30 seconds and retry once before abandoning the task. " +
+      "Browser sessions are ephemeral; do not rely on logins persisting between sessions.",
+    envKeys: [],
+    resolve: () => ({}),
+  },
+  {
+    // #clw_01M3J52H0H9WSH3GTSY87ZY351. No `=` in the description: see the
+    // #2138 note on `macRunnerSshCommand`.
+    id: PAGES_CAPABILITY_ID,
+    label: "Pages host (publish previews)",
+    group: "tools",
+    description:
+      "Publish a directory to the private fleet pages host with: node \"$CLAWS_PAGES_PUBLISH\" --repo NAME --kind pr|issue|docs --ref REF DIR. " +
+      "It uploads DIR to $CLAWS_PAGES_BASE_URL/<repo>/<kind>/<ref>/<sha8>/, where repo is the lowercase repository name without the owner, " +
+      "ref is pr-<N> for a PR, the issue id for an issue, or the branch name with / turned into - for docs, and sha8 is the first 8 characters of the commit in DIR (pass --sha SHA when DIR is not in a git checkout). " +
+      "DIR must have an index.html at its root, because the pages host cannot list directories. " +
+      "Earlier SHAs under the same <repo>/<kind>/<ref>/ are removed automatically after a successful publish. " +
+      "The last line printed is the URL to put in a PR comment or issue. The host is reachable on the LAN and tailnet only. Never print the S3 credentials. " +
+      "To view a published page from a shell: curl -H \"Authorization: Bearer $CLAWS_PAGES_READ_TOKEN\" URL (without the header the host redirects to the SSO login). " +
+      "In the Playwright browser, first navigate once to the value of CLAWS_PAGES_LOGIN_URL (print it with: printenv CLAWS_PAGES_LOGIN_URL); " +
+      "it sets a cookie for the pages host and redirects to the root index, after which every pages URL renders until the browser restarts. " +
+      "The read token works only on the pages host and only while this session runs; never paste it into a PR or issue.",
+    envKeys: [
+      "CLAWS_PAGES_S3_ENDPOINT",
+      "CLAWS_PAGES_S3_REGION",
+      "CLAWS_PAGES_S3_BUCKET",
+      "CLAWS_PAGES_BASE_URL",
+      "CLAWS_PAGES_S3_ACCESS_KEY_ID",
+      "CLAWS_PAGES_S3_SECRET_ACCESS_KEY",
+      "CLAWS_PAGES_PUBLISH",
+      // Per-session, so added by the pod launch and granted-env builders (src/pages-read-token.ts), not resolve().
+      "CLAWS_PAGES_READ_TOKEN",
+      "CLAWS_PAGES_LOGIN_URL",
+    ],
+    resolve: () => {
+      const host = safeRead((): PagesHostConfig | null => PAGES_HOST, null);
+      if (!host) return null;
+      return {
+        CLAWS_PAGES_S3_ENDPOINT: host.endpoint,
+        CLAWS_PAGES_S3_REGION: host.region,
+        CLAWS_PAGES_S3_BUCKET: host.bucket,
+        CLAWS_PAGES_BASE_URL: host.baseUrl,
+        CLAWS_PAGES_S3_ACCESS_KEY_ID: host.accessKeyId,
+        CLAWS_PAGES_S3_SECRET_ACCESS_KEY: host.secretAccessKey,
+        CLAWS_PAGES_PUBLISH: PAGES_PUBLISH_SCRIPT,
+      };
+    },
+  },
+  {
+    // #clw_01M498X85G9KCWHAX28RHG0F7Y. No `=` in the description (#2138), which
+    // is why the A4 and no-scaling `lp` options live in the wrapper.
+    id: PRINT_CAPABILITY_ID,
+    label: "Print (LAN printers)",
+    group: "tools",
+    description:
+      "Print a PDF, plain text, PNG or JPEG file with: node \"$CLAWS_PRINT\" --printer laserjet|envy FILE. " +
+      "laserjet is the HP LaserJet 4050 (mono laser, 600 dpi, best for dimensional accuracy, CUPS queue LaserJet4050); " +
+      "envy is the HP Envy 6100e (colour inkjet, CUPS queue HP_Envy_6100e). " +
+      "Every job is sent as A4 at 1:1 (no scaling) unless you pass --fit to scale to the page. " +
+      "The wrapper waits until CUPS reports the job completed and exits non-zero otherwise, so its last line is the result to report. " +
+      "node \"$CLAWS_PRINT\" --status shows both printers' state and queued jobs. " +
+      "For the LaserJet 4050, CUPS reports completion as soon as the bytes are delivered, so a wrong paper size or an empty tray shows only on the printer's own panel " +
+      "(TRAY 1 LOAD PLAIN LETTER means the job did not print); ask the operator to check the panel. " +
+      "lp, lpstat and cancel are also available against the same two queues. " +
+      "Printing is physical and irreversible: print once, and never retry a job that CUPS says completed.",
+    envKeys: ["CUPS_SERVER", "CLAWS_PRINT", "CLAWS_PRINT_SERVER"],
+    resolve: () => {
+      const server = safeRead(() => PRINT_SERVER, "");
+      if (!server) return null;
+      return { CUPS_SERVER: server, CLAWS_PRINT: PRINT_SCRIPT };
+    },
+  },
+];
+
+/**
+ * SSH hosts from the operator's ~/.ssh/config (hardcoded — the box running
+ * Claws already has the keys + config on disk, so an interactive session can
+ * already SSH to these; this just surfaces them as grantable capabilities and
+ * tells the model what each host is for). No env var is needed (auth is via
+ * on-disk keys), so envKeys is empty and resolve() returns an empty (non-null)
+ * object — the capability is always "available" and injects/strips nothing.
+ * Source of truth is this list: adding/removing a host requires a code edit.
+ * A renamed host keeps its old id as an alias in `capability-renames.ts`
+ * (`ssh:k3s` -> `ssh:thinkcentre`).
+ * thinkcentre is the k3s server (kubectl via `sudo -n k3s kubectl`); nas and ryzen are k3s
+ * agents with no API server, so their guidance points at thinkcentre. Keep those lines.
+ * The two macOS Actions runners are NOT in this list (#3138): they come from
+ * `MAC_RUNNERS` (config.ts) below, the same config `mac-runner-waker` uses.
+ */
+const SSH_HOST_KEY_GUIDANCE =
+  "Its host key is pinned in /etc/ssh/ssh_known_hosts from Claws' deploy/ssh-known-hosts, so a first ssh with -o BatchMode yes works without accepting a key. " +
+  "If ssh prints Host key verification failed, run ssh-keygen -F ADDRESS -f /etc/ssh/ssh_known_hosts with the HostName from ~/.ssh/config: " +
+  "no output means the pinned entry is missing, which is a Claws bug to report, not a changed key; " +
+  "output together with a REMOTE HOST IDENTIFICATION HAS CHANGED warning means the host serves a key that differs from the pinned one. " +
+  "Never bypass host key checking for this host; tell the operator both fingerprints instead.";
+
+const K3S_SERVER_KUBECTL_GUIDANCE =
+  "Run kubectl on the node as sudo -n k3s kubectl (plain kubectl fails with connection to localhost:8080 refused: the login user brendan has no kubeconfig and the k3s admin kubeconfig is root-only; sudo needs no password); read-only only, no kubectl mutations or flux commands";
+
+const K3S_AGENT_KUBECTL_GUIDANCE =
+  "It is a k3s agent, not the server: there is no API server or kubeconfig on it, so kubectl there fails with connection to localhost:8080 refused. Run kubectl on the server instead: request ssh:thinkcentre and use sudo -n k3s kubectl there";
+
+const SSH_HOST_CAPABILITIES: SessionCapability[] = (
+  [
+    ["nas", "NixOS NAS: ZFS pool, NFS/SMB exports, and the k3s storage node (Kubernetes node name `k3s-nas`). " + K3S_AGENT_KUBECTL_GUIDANCE,"NixOS NAS"],
+    ["thinkcentre", "The thinkcentre host at its LAN alias `thinkcentre` (192.168.0.251), logged in as `brendan`, running the home k3s server (Kubernetes node `k3s`). Home Assistant Core, Mosquitto, ESPHome and Music Assistant run on it as systemd services. Built from `St-John-Software/nixos-config` (`hosts/thinkcentre/`) — configuration changes go in that flake, not in ad-hoc edits on the box. A session whose ~/.ssh/config lacks the thinkcentre alias can use `brendan@192.168.0.251` instead: the host key is pinned by address. " + K3S_SERVER_KUBECTL_GUIDANCE,"thinkcentre, home k3s server"],
+    ["ryzen", "NixOS workstation / build machine: k3s GPU node, GNOME desktop, and a self-hosted Actions runner. Built from `St-John-Software/nixos-config` (`hosts/ryzen/`) — configuration changes go in that flake, not in ad-hoc edits on the box. " + K3S_AGENT_KUBECTL_GUIDANCE, "NixOS workstation"],
+  ] as [string, string, string][]
+).map(([alias, desc, role]) => ({
+  id: `ssh:${alias}`,
+  label: `SSH: ${alias} (${role})`,
+  description: `SSH into ${alias}. ${desc}. ${SSH_HOST_KEY_GUIDANCE}`,
+  envKeys: [],
+  resolve: () => ({}),
+}));
+
+CAPABILITIES.push(...SSH_HOST_CAPABILITIES);
+
+/**
+ * SSH to the two production cluster nodes (Hetzner Cloud, `production-infra`).
+ * Port 22 is closed publicly and session pods are not on the tailnet, so the
+ * only route is a tailnet jump through `nas` (or `ryzen`), whose host-mode
+ * runners already run `tailscale ssh` to these nodes. Tailscale suffixes the
+ * node name on every rebuild (`prod-cluster-11`), so the tailnet host comes
+ * from config (`CLAWS_PROD_*_TAILNET_HOST`) while the capability id stays on
+ * the stable alias. Descriptions contain no `=` (#2138 prompt-file check).
+ * Grant/revoke reuse the shared `ssh:*` key machinery unchanged.
+ */
+const PROD_CLUSTER_SSH_CAPABILITIES: SessionCapability[] = (
+  [
+    ["prod-cluster", safeRead(() => PROD_CLUSTER_TAILNET_HOST, "prod-cluster-11"), "CLAWS_PROD_CLUSTER_TAILNET_HOST", "production k3s control plane (Traefik, cert-manager, Flux, bonkus, namey, hello)", "production k3s control plane, Hetzner"],
+    ["prod-data", safeRead(() => PROD_DATA_TAILNET_HOST, "prod-data-14"), "CLAWS_PROD_DATA_TAILNET_HOST", "production k3s agent node holding the Supabase Postgres volume at /var/lib/rancher/k3s/storage", "production k3s data node, Hetzner"],
+  ] as [string, string, string, string, string][]
+).map(([alias, host, envVar, desc, role]) => ({
+  id: `ssh:${alias}`,
+  label: `SSH: ${alias} (${role})`,
+  group: "ssh" as const,
+  description:
+    `SSH into ${alias}, the ${desc}. Port 22 is closed publicly and the host is tailnet-only, so jump through nas: ` +
+    `open a shell with: ssh -t nas tailscale ssh root@${host} ; run one command with: ssh nas tailscale ssh root@${host} -- COMMAND . ` +
+    "That one-command form passes COMMAND through the shell on nas, so anything after a ; or && or | or a redirect runs on nas, not on the node. " +
+    `To run a multi-command script on the node, base64-encode the script and pipe it through: echo <base64 of the script> | ssh nas 'base64 -d | tailscale ssh root@${host} -- bash -s' . ` +
+    "If nas is in its nightly off window, use ryzen as the jump instead. " +
+    `If that name does not resolve (the node was rebuilt), list the current name with: ssh nas tailscale status | grep ${alias} , use the online entry, and tell the operator to update ${envVar}. ` +
+    "Run kubectl on the node as k3s kubectl (plain kubectl fails with connection to localhost:8080 refused); read-only only, no kubectl mutations or flux commands. " +
+    `The jump host nas is pinned. ${SSH_HOST_KEY_GUIDANCE}`,
+  envKeys: [],
+  resolve: () => ({}),
+}));
+
+CAPABILITIES.push(...PROD_CLUSTER_SSH_CAPABILITIES);
+
+/** `(runner.name ?? runner.host)` lowercased, trailing `.local` stripped,
+ *  every character outside `[a-z0-9-]` replaced with `-` (#3138). */
+function macRunnerSlug(runner: MacRunner): string {
+  return (runner.name ?? runner.host)
+    .toLowerCase()
+    .replace(/\.local$/, "")
+    .replace(/[^a-z0-9-]/g, "-");
+}
+
+/** The exact `ssh` invocation for a Mac runner, for the capability description.
+ *  Uses the config-file (space, not `=`) form of `-o` so the text never
+ *  contains a literal `=` (#2138: descriptions are concatenated into the text
+ *  written to the `--append-system-prompt-file` prompt file, and a `=` there
+ *  would look like a leaked KEY=value assignment to the #2138 argv checks). */
+function macRunnerSshCommand(runner: MacRunner): string {
+  const parts = ["ssh", "-o", '"StrictHostKeyChecking accept-new"'];
+  if (runner.identityFile) parts.push("-i", runner.identityFile);
+  if (runner.port && runner.port !== 22) parts.push("-p", String(runner.port));
+  parts.push(runner.user ? `${runner.user}@${runner.host}` : runner.host);
+  return parts.join(" ");
+}
+
+/**
+ * SSH capabilities for the macOS Actions runners in `MAC_RUNNERS` (#3138),
+ * built from that config (the advertised host resolved through the shared
+ * `resolveLanHost` LAN alias table, since pods have no mDNS) rather than hardcoded like `SSH_HOST_CAPABILITIES`
+ * above, so Claws and `mac-runner-waker` share one source of truth for Mac
+ * hosts. Read via `safeRead` (defined below, but a hoisted function
+ * declaration so it is callable here) because `capabilities.test.ts` mocks
+ * `./config.js` with a partial object and accessing a missing export throws.
+ * `resolve()` re-reads `MAC_RUNNERS` at call time, so disabling or removing a
+ * Mac from the config hides its capability without a restart; a Mac *added*
+ * after boot only appears once the capability list is rebuilt at the next
+ * restart, since this list itself is only built once, at module load.
+ * Deliberately excluded from `REPO_CAPABILITY_DEFAULTS` (#3138 decision 5):
+ * on `k8s-pod`, granting any `ssh:*` copies the service's private keys into
+ * the session pod's Secret, so these are opt-in via "Show all capabilities"
+ * or the live-grant dropdown, like `forgejo-admin`.
+ */
+function macRunnerCapabilities(): SessionCapability[] {
+  const runners = safeRead(() => MAC_RUNNERS, [] as readonly MacRunner[]);
+  const seenIds = new Set(CAPABILITIES.map((c) => c.id));
+  const out: SessionCapability[] = [];
+  for (const runner of runners) {
+    const id = `ssh:${macRunnerSlug(runner)}`;
+    if (seenIds.has(id)) continue;
+    seenIds.add(id);
+    const name = runner.name ?? runner.host;
+    const host = runner.host;
+    const target = safeRead(() => resolveLanHost(runner), runner);
+    out.push({
+      id,
+      label: `SSH: ${name} (macOS Actions runner)`,
+      group: "ssh",
+      description:
+        `SSH into ${name}, a macOS self-hosted Actions runner (labels: ${runner.labels.join(", ")}). ` +
+        `Connect with: ${macRunnerSshCommand(target)}. ` +
+        "Use this LAN address: the .local name does not resolve inside a session pod. " +
+        "The Mac sleeps when idle; the first connection may time out — Claws' mac-runner-waker wakes it, so retry once after ~30 s before concluding it is unreachable. Do not change its runner registration.",
+      envKeys: [],
+      resolve: () => {
+        const current = safeRead(() => MAC_RUNNERS, [] as readonly MacRunner[]).find((r) => r.host === host);
+        return current && current.enabled !== false ? {} : null;
+      },
+    });
+  }
+  return out;
+}
+
+CAPABILITIES.push(...macRunnerCapabilities());
+
+export const CLAUDE_AUTH_CAPABILITY_ID = "claude-auth";
+export const CODEX_AUTH_CAPABILITY_ID = "codex-auth";
+export const OPENROUTER_AUTH_CAPABILITY_ID = "openrouter-auth";
+export const ANTHROPIC_API_AUTH_CAPABILITY_ID = "anthropic-api-auth";
+export const PI_AUTH_CAPABILITY_ID = "pi-auth";
+
+/** Read a config binding, tolerating a test's partial `config.js` mock. */
+function safeRead<T>(read: () => T, fallback: T): T {
+  try {
+    return read() ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+/** The service's Codex `auth.json`: `$CODEX_HOME/auth.json`, else `~/.codex/auth.json` (same lookup as `claude.ts`). */
+export function serviceCodexAuthPath(): string {
+  return path.join(process.env["CODEX_HOME"] ?? path.join(os.homedir(), ".codex"), "auth.json");
+}
+
+/**
+ * Provider auth for session pods (#3026): each grant copies one of the
+ * service's own credentials into the session pod's Secret, and each resolves
+ * to null — so it is never offered — when the service lacks that credential.
+ * `envKeys` is deliberately empty and `resolve()` injects nothing: the
+ * pod launcher (`session-pod-launch.ts`) gathers the material itself. `pi-auth`
+ * bundles every pi credential source the service has (the Claude token as
+ * `ANTHROPIC_OAUTH_TOKEN`, the Codex login translated into pi's `auth.json`,
+ * and the OpenAI and OpenRouter keys). OpenCode has two: `anthropic-api-auth`
+ * for `anthropic/` models and `openrouter-auth` for `openrouter/` ones.
+ */
+const PROVIDER_AUTH_CAPABILITIES: SessionCapability[] = [
+  {
+    id: CLAUDE_AUTH_CAPABILITY_ID,
+    label: "Claude login",
+    provider: "claude",
+    group: "agent",
+    description: "The Claude CLI is logged in with the token of one of the Claude accounts managed on the Claws Reauth page. Never print it.",
+    envKeys: [],
+    resolve: () => (accountsWithToken().length > 0 ? {} : null),
+  },
+  {
+    id: CODEX_AUTH_CAPABILITY_ID,
+    label: "Codex login",
+    provider: "codex",
+    group: "agent",
+    description: "The Codex CLI is logged in with a copy of the Claws service's Codex auth.json in CODEX_HOME. Never print it.",
+    envKeys: [],
+    resolve: () => (fs.existsSync(serviceCodexAuthPath()) ? {} : null),
+  },
+  {
+    id: OPENROUTER_AUTH_CAPABILITY_ID,
+    label: "OpenRouter key",
+    provider: "opencode",
+    group: "agent",
+    description: "OPENROUTER_API_KEY holds the Claws service's OpenRouter key, so OpenCode can use OpenRouter models. Never print it.",
+    envKeys: [],
+    resolve: () => (!!safeRead(() => OPENROUTER_API_KEY, "") ? {} : null),
+  },
+  {
+    id: ANTHROPIC_API_AUTH_CAPABILITY_ID,
+    label: "Anthropic API key",
+    provider: "opencode",
+    group: "agent",
+    description: "ANTHROPIC_API_KEY holds the Claws service's Anthropic API key, so OpenCode can use anthropic/ models. It spends API credit. Never print it.",
+    envKeys: [],
+    resolve: () => (!!safeRead(() => ANTHROPIC_API_KEY, "") ? {} : null),
+  },
+  {
+    id: PI_AUTH_CAPABILITY_ID,
+    label: "Pi login",
+    provider: "pi",
+    group: "agent",
+    description: "pi is logged in with the Claws service's credentials: the Claude token (ANTHROPIC_OAUTH_TOKEN), the Codex login in ~/.pi/agent/auth.json, and OPENAI_API_KEY / OPENROUTER_API_KEY when configured. Never print them.",
+    envKeys: [],
+    resolve: () => (safeRead(() => piCredentialSources(), []).length > 0 ? {} : null),
+  },
+];
+
+CAPABILITIES.push(...PROVIDER_AUTH_CAPABILITIES);
+
+/**
+ * Provider-auth capabilities pre-ticked on the create form for `provider` in
+ * `mode`: the agent's own logins only (OpenCode has two), and nothing for `repo-zsh`. The
+ * `repo-zsh` exclusion covers agent logins only — they are useless with no
+ * agent CLI running to use them. Not filtered by availability — the form only
+ * renders available capabilities.
+ */
+export function defaultProviderAuthCapabilities(provider: SessionProvider, mode: SessionMode): string[] {
+  if (mode === "repo-zsh") return [];
+  return PROVIDER_AUTH_CAPABILITIES.filter((c) => c.provider === provider).map((c) => c.id);
+}
+
+/** True for an agent-login capability (`claude-auth`, `codex-auth`,
+ *  `openrouter-auth`, `anthropic-api-auth`, `pi-auth`): one with a `provider`. These follow the
+ *  Agent select, not the repo, so they are never remembered as a repo
+ *  combination's default. */
+export function isAgentLoginCapability(id: string): boolean {
+  return !!CAPABILITIES.find((c) => c.id === id)?.provider;
+}
+
+/** True for a capability that may be stored as a repo combination's
+ *  remembered default: not an agent login (those follow the Agent select)
+ *  and not `cross-repo` (always forced, never submitted, so remembering it
+ *  would be meaningless), and not `infra-merge` (a per-session operator
+ *  grant, never a remembered default). An explicit `forgejo` tick for a repo selection it
+ *  is not forced on IS remembered like any other capability; a forced tick
+ *  is never submitted by the browser (disabled checkboxes don't post) so it
+ *  is never recorded either way. */
+export function isRememberableCapability(id: string): boolean {
+  if (isAgentLoginCapability(id)) return false;
+  return id !== CROSS_REPO_CAPABILITY_ID && id !== INFRA_MERGE_CAPABILITY_ID;
+}
+
+/** Display label for a capability id, for the id alone (e.g. a session's stored
+ *  capability list) without the full `SessionCapability` record. Falls back to
+ *  the raw id for one no longer in the registry — deliberately not filtered by
+ *  availability, since a label must still render for a capability whose
+ *  `resolve()` now returns null. */
+export function capabilityLabel(id: string): string {
+  return CAPABILITIES.find((c) => c.id === id)?.label ?? id;
+}
+
+/** True if the capability exists in the registry and is currently configured. */
+export function isCapabilityAvailable(id: string): boolean {
+  const cap = CAPABILITIES.find((c) => c.id === id);
+  return !!cap && cap.resolve() !== null;
+}
+
+/** Capabilities that are configured (resolve() != null) right now. */
+export function availableCapabilities(): SessionCapability[] {
+  return CAPABILITIES.filter((c) => c.resolve() !== null);
+}
+
+/**
+ * Default capability associations per repo (full "owner/name"). The
+ * session-create UI uses this to pre-filter the capability checkboxes to those
+ * relevant to the selected repo, and to pre-tick those boxes at session-create
+ * time (#2755). UI convenience ONLY, not a security boundary: the "Show all
+ * capabilities" toggle reveals every available capability, pre-ticking is
+ * still only a form default the user can untick before submitting, and the
+ * server still accepts any available capability the user explicitly ticks
+ * (default-deny + availability check in validCapabilityIds remain the gate).
+ * Repos absent from this map have no default capabilities.
+ * Defaults pre-tick and show; `REPO_CAPABILITY_SUGGESTIONS` only show (unticked).
+ */
+export const REPO_CAPABILITY_DEFAULTS: Record<string, string[]> = {
+  "St-John-Software/production-infra": ["prod-observability", "ssh:ryzen"],
+  "St-John-Software/fleet-infra": ["fleet-observability", "ssh:thinkcentre", "ssh:ryzen", "ssh:nas"],
+  "St-John-Software/bin-scraper": ["fleet-observability"],
+  "St-John-Software/namey": ["prod-observability"],
+  "St-John-Software/bonkus": ["prod-observability"],
+  "St-John-Software/home-assistant-config": ["home-assistant", "ssh:thinkcentre"],
+  "St-John-Software/ha-carlink": ["home-assistant"],
+  "St-John-Software/nixos-config": ["ssh:nas", "ssh:ryzen"],
+};
+
+/**
+ * Capabilities shown (unticked) on the create form for a repo without being
+ * pre-ticked: production SSH for the prod repos. Mac SSH suggestions are
+ * derived from the Mac runner repos in `suggestedCapabilitiesForRepo`.
+ */
+export const REPO_CAPABILITY_SUGGESTIONS: Record<string, string[]> = {
+  "St-John-Software/production-infra": ["ssh:prod-cluster", "ssh:prod-data"],
+  "St-John-Software/namey": ["ssh:prod-cluster", "ssh:prod-data"],
+  "St-John-Software/bonkus": ["ssh:prod-cluster", "ssh:prod-data"],
+};
+
+function macRunnerCapabilityIds(): string[] {
+  return safeRead(() => MAC_RUNNERS, [] as readonly MacRunner[]).map((r) => `ssh:${macRunnerSlug(r)}`);
+}
+
+function isMacRunnerRepo(fullName: string): boolean {
+  const lower = fullName.toLowerCase();
+  return safeRead(() => getMacRunnerRepos(), [] as readonly string[]).some((r) => r.toLowerCase() === lower);
+}
+
+/** Capability ids offered unticked for `fullName` (available ones only). */
+export function suggestedCapabilitiesForRepo(fullName: string): string[] {
+  const ids = [...(REPO_CAPABILITY_SUGGESTIONS[fullName] ?? [])];
+  if (isMacRunnerRepo(fullName)) ids.push(...macRunnerCapabilityIds());
+  return validCapabilityIds(ids);
+}
+
+/** Full repo names for which `capId` is suggested (unticked) on the form. */
+export function suggestedReposForCapability(capId: string, allRepos: string[] = []): string[] {
+  const out = new Set<string>();
+  for (const [repo, ids] of Object.entries(REPO_CAPABILITY_SUGGESTIONS)) {
+    if (ids.includes(capId)) out.add(repo);
+  }
+  if (macRunnerCapabilityIds().includes(capId)) {
+    for (const repo of allRepos) if (isMacRunnerRepo(repo)) out.add(repo);
+  }
+  return [...out];
+}
+
+/**
+ * Claws-owned grants for unattended planners, separate from interactive defaults.
+ * Read-only Grafana observability is granted for the fleet cluster (Claws itself
+ * runs in fleet-infra) and for prod. The kubectl capabilities were removed
+ * (#clw_01M3EW1TJ5FPD17N8JQSHDJXAJ): sessions and agents hold no Kubernetes
+ * credentials. Each grant must be marked `headlessPlannerDiagnostic`. SSH, HA
+ * control, browser, admin and provider-auth capabilities are not unattended
+ * diagnostic access. Keep keys lowercase; unlisted repos get
+ * {@link DEFAULT_PLANNER_CAPABILITIES}, so any planner can run a fleet Loki or
+ * Prometheus check itself rather than make it an operator step.
+ */
+const PLANNER_CAPABILITIES_BY_REPO: ReadonlyMap<string, readonly string[]> = new Map([
+  ["st-john-software/fleet-infra", ["fleet-observability"]],
+  ["st-john-software/bin-scraper", ["fleet-observability"]],
+  ["st-john-software/claws", ["fleet-observability"]],
+  ["st-john-software/production-infra", ["prod-observability"]],
+  ["st-john-software/namey", ["prod-observability"]],
+  ["st-john-software/bonkus", ["prod-observability"]],
+]);
+
+/** The planner grant for a repo not in {@link PLANNER_CAPABILITIES_BY_REPO}. */
+const DEFAULT_PLANNER_CAPABILITIES: readonly string[] = ["fleet-observability"];
+
+/** Planner grants only; availability and diagnostic eligibility are checked at launch. */
+export function plannerCapabilitiesForRepo(fullName: string): string[] {
+  return [...(PLANNER_CAPABILITIES_BY_REPO.get(fullName.toLowerCase()) ?? DEFAULT_PLANNER_CAPABILITIES)];
+}
+
+/** Full repo names for which `capId` is a default-relevant capability. */
+export function reposForCapability(capId: string): string[] {
+  const out: string[] = [];
+  for (const [repo, ids] of Object.entries(REPO_CAPABILITY_DEFAULTS)) {
+    if (ids.includes(capId)) out.push(repo);
+  }
+  return out;
+}
+
+/** Capability IDs pre-ticked on the session-create form for `fullName`
+ *  (#2755). Unavailable ones are dropped, since they are never rendered. */
+export function defaultCapabilitiesForRepo(fullName: string | null): string[] {
+  if (!fullName) return [];
+  return validCapabilityIds([...(REPO_CAPABILITY_DEFAULTS[fullName] ?? [])]);
+}
+
+/** Intersect requested ids with the registry, dedupe, and drop unavailable ones. */
+export function validCapabilityIds(ids: string[]): string[] {
+  const out: string[] = [];
+  for (const id of renameCapabilityIds(ids)) {
+    if (out.includes(id)) continue;
+    if (isCapabilityAvailable(id)) out.push(id);
+  }
+  return out;
+}
+
+/** Which of `allRepos` force `capId`'s grant server-side, for the create
+ *  form's disabled/checked rendering: `"all"` for `cross-repo` (unconditional
+ *  for every session), every repo of `allRepos` for `forgejo` (forced whenever
+ *  a repo is selected), `null` for any other id (never forced, an ordinary
+ *  checkbox). */
+export function autoGrantedRepos(capId: string, allRepos: string[]): "all" | string[] | null {
+  if (capId === CROSS_REPO_CAPABILITY_ID) return "all";
+  if (capId === FORGEJO_CAPABILITY_ID) return [...allRepos];
+  return null;
+}
+
+/** Union of the operator's explicit selection with the capabilities a
+ *  session's repos require unconditionally. Every managed repo is on Forgejo
+ *  and has no forge credential of any kind without `forgejo`, so any session
+ *  with a repo is granted it automatically (#2871) — the create form renders the grant as a forced, disabled
+ *  checkbox (`autoGrantedRepos`) rather than relying on this union alone to
+ *  make it visible. Ids that are unavailable (no token configured) still
+ *  drop out via `validCapabilityIds`. */
+export function withImplicitCapabilities(
+  selected: string[],
+  repos: Array<string | null | undefined>,
+): string[] {
+  const ids = [...selected];
+  ids.push(CROSS_REPO_CAPABILITY_ID);
+  if (repos.some((r) => !!r)) ids.push(FORGEJO_CAPABILITY_ID);
+  return validCapabilityIds(ids);
+}
+
+/**
+ * Forgejo access for a headless, repo-scoped agent run (#3067): the `forgejo`
+ * capability's env plus its description as system-prompt guidance. Returns
+ * null when no Forgejo token is configured. The prompt names env vars only,
+ * never their values.
+ */
+export function resolveHeadlessForgejoAccess(): { env: Record<string, string>; prompt: string } | null {
+  const cap = CAPABILITIES.find((c) => c.id === FORGEJO_CAPABILITY_ID);
+  const env = cap?.resolve();
+  if (!cap || !env) return null;
+  return { env, prompt: `## Forgejo access\n\n${cap.description}` };
+}
+
+export function resolveHeadlessCrossRepoAccess(): { env: Record<string, string>; prompt: string } | null {
+  const cap = CAPABILITIES.find((c) => c.id === CROSS_REPO_CAPABILITY_ID);
+  const env = cap?.resolve();
+  if (!cap || !env || !env.CLAWS_FORGEJO_READ_TOKEN) return null;
+  return { env, prompt: `## Cross-repo access\n\n${CROSS_REPO_ACCESS_GUIDANCE}` };
+}
+
+function isHeadlessPlannerCapabilityAllowed(cap: SessionCapability): boolean {
+  return cap.headlessPlannerDiagnostic === true && cap.envKeys.length > 0;
+}
+
+/** Every environment variable owned by a registered capability. */
+export function capabilityEnvKeys(): string[] {
+  const keys: string[] = [];
+  for (const cap of CAPABILITIES) {
+    for (const key of cap.envKeys) {
+      if (!keys.includes(key)) keys.push(key);
+    }
+  }
+  return keys;
+}
+
+/**
+ * Resolve explicit Claws-owned diagnostic grants for headless issue planners.
+ * This is intentionally narrower than interactive session capabilities:
+ * planners get only configured, env-backed capabilities positively marked safe
+ * for unattended read-only diagnostics, and the prompt names usage guidance but
+ * never secret values.
+ */
+export function resolveHeadlessPlannerCapabilityAccess(
+  ids: string[],
+): { env: Record<string, string>; prompt: string; grantedIds: string[] } | null {
+  const grantedIds = validCapabilityIds(ids).filter((id) => {
+    const cap = CAPABILITIES.find((c) => c.id === id);
+    return !!cap && isHeadlessPlannerCapabilityAllowed(cap);
+  });
+  if (grantedIds.length === 0) return null;
+
+  const env: Record<string, string> = {};
+  const grantedCaps: SessionCapability[] = [];
+  for (const id of grantedIds) {
+    const cap = CAPABILITIES.find((c) => c.id === id);
+    if (!cap) continue;
+    const resolved = cap.resolve();
+    if (!resolved) continue;
+    grantedCaps.push(cap);
+    Object.assign(env, resolved);
+  }
+  if (grantedCaps.length === 0 || Object.keys(env).length === 0) return null;
+
+  const lines = [
+    "## Planner diagnostic capabilities",
+    "",
+    "Claws grants this repo’s planner these capabilities for read-only diagnosis before writing the implementation plan. Use them only to inspect current state and logs; do not mutate infrastructure, secrets, repositories, or external services.",
+    "",
+    ...grantedCaps.map((c) => `- ${c.label}: ${c.description}`),
+    "",
+    "A Loki, Prometheus or alert check these capabilities can run is not an operator step: run it while planning and plan, or report the outcome, from the result.",
+  ];
+  if (grantedCaps.some((c) => c.envKeys.some((k) => k.endsWith("_GRAFANA_TOKEN")))) {
+    lines.push(
+      "",
+      "For observability diagnostics, use only read-only query endpoints on Grafana (datasource proxy queries, alerts, dashboards, search; POST /api/ds/query is the one permitted POST). Do not POST, PUT, PATCH or DELETE to dashboards, alert rules, annotations or datasource config, and never echo the token.",
+    );
+  }
+  return { env, prompt: lines.join("\n"), grantedIds };
+}
+
+/**
+ * `/bin/sh -c` script that delivers granted capability values without putting
+ * them on argv. Invariant: `$0` is `claws-session`, `$1` is the env file, and
+ * `$2…` is the real command. The file is sourced, deleted immediately, then
+ * `shift` drops the path so `exec "$@"` runs the command.
+ */
+export const ENV_FILE_PRELUDE = '. "$1"; rm -f "$1"; shift; exec "$@"';
+
+/**
+ * Resolve a capability selection into the env vars to grant and the env keys to
+ * strip. `vars` merges every granted capability's `resolve()` output. `stripKeys` is
+ * every gated key across the registry plus the baseline `SENSITIVE_ENV_KEYS`
+ * (the same set stripped from automated `runClaude` child processes) — granted
+ * keys included, so a session can never silently inherit an ambient value; the
+ * granted ones are re-set out-of-band by the sourced env file.
+ */
+export function resolveCapabilityEnv(
+  selected: string[],
+): { vars: Record<string, string>; stripKeys: string[] } {
+  const granted = validCapabilityIds(selected);
+
+  const allKeys = capabilityEnvKeys();
+
+  const merged: Record<string, string> = {};
+  for (const id of granted) {
+    const cap = CAPABILITIES.find((c) => c.id === id);
+    if (!cap) continue;
+    const resolved = cap.resolve();
+    if (!resolved) continue;
+    Object.assign(merged, resolved);
+  }
+
+  const stripKeys: string[] = [];
+  for (const key of [...allKeys, ...SENSITIVE_ENV_KEYS]) {
+    if (!stripKeys.includes(key)) stripKeys.push(key);
+  }
+
+  return { vars: merged, stripKeys };
+}
+
+/** The env vars a capability selection grants: `resolveCapabilityEnv`'s
+ *  merged `vars`. Empty for e.g. `ssh:*` alone. */
+export function grantedEnvVars(caps: string[]): Record<string, string> {
+  return resolveCapabilityEnv(caps).vars;
+}
+
+/** How a capability relates to a session that is already running (#3322). */
+export type LiveGrantState = "held" | "grantable" | "fixed";
+
+export interface LiveGrantEntry {
+  cap: SessionCapability;
+  state: LiveGrantState;
+  /** Why a `fixed` capability cannot be granted now, or (for `held`) why it
+   *  is always held — set on the `cross-repo` baseline as "always granted";
+   *  unset for an ordinary already-granted `held` entry. */
+  reason?: string;
+}
+
+/** Reason shown for capabilities only a fresh launch can deliver (#3322). */
+export const FIXED_AT_LAUNCH_REASON = "fixed at launch — start a new session";
+
+/** The running session a live grant is classified for: its agent provider
+ *  and mode decide whether `browser` can be delivered. */
+export interface LiveGrantTarget {
+  provider: SessionProvider;
+  mode: SessionMode;
+}
+
+/** Why `target` cannot hold `browser`, or null when it can (a Claude agent
+ *  session — the only provider that attaches the Playwright MCP server). */
+export function browserUnsupportedReason(target: LiveGrantTarget): string | null {
+  if (target.mode === "repo-zsh") return "a shell session has no agent to use the browser";
+  if (target.provider !== "claude") return `${target.provider} cannot use the ${BROWSER_CAPABILITY_ID} capability`;
+  return null;
+}
+
+/**
+ * Every configured capability with its state for a running session (#3072,
+ * #3322). `held`: already granted, or the unconditional `cross-repo` baseline
+ * (carrying `reason: "always granted"`). `fixed` (with a reason): provider
+ * auth, with
+ * `FIXED_AT_LAUNCH_REASON`, and `browser` for a `target` that cannot use it
+ * (codex, opencode, pi, `repo-zsh`), with `browserUnsupportedReason`. A Claude
+ * agent session can be granted `browser` live: the backend relaunches the
+ * agent with its conversation kept so the Playwright MCP server loads
+ * (#clw_01M4RASNVDKH2YBHZMGR0SM0RA). `grantable`: everything else —
+ * `implicit` only means server-side auto-grant when `autoGrantedRepos` forces
+ * it, so Forgejo can still be requested or granted live when it wasn't, and
+ * `ssh:*` is grantable (live via the SSH key slots every pod mounts from
+ * launch; only a pod launched before those slots existed waits for a resume), and a held `ssh:*` is revocable (see
+ * `isLiveRevocable`). Unconfigured
+ * capabilities are omitted. `backend` is a plain string so this module never
+ * imports `session-backend.ts`; no rule depends on it today.
+ */
+export function classifyLiveGrants(
+  granted: string[],
+  _backend: "k8s-pod",
+  target: LiveGrantTarget,
+): LiveGrantEntry[] {
+  const browserReason = browserUnsupportedReason(target);
+  return availableCapabilities().map((cap): LiveGrantEntry => {
+    if (cap.id === CROSS_REPO_CAPABILITY_ID) return { cap, state: "held", reason: "always granted" };
+    if (granted.includes(cap.id)) return { cap, state: "held" };
+    if (cap.provider) {
+      return { cap, state: "fixed", reason: FIXED_AT_LAUNCH_REASON };
+    }
+    if (cap.id === BROWSER_CAPABILITY_ID && browserReason) return { cap, state: "fixed", reason: browserReason };
+    return { cap, state: "grantable" };
+  });
+}
+
+/** Whether a held capability can be revoked from a running session: only `ssh:*` today. */
+export function isLiveRevocable(capId: string): boolean {
+  return capId.startsWith("ssh:");
+}
+
+/**
+ * Capabilities that can be granted to a session that is already running
+ * (#3072): the `grantable` entries of `classifyLiveGrants`.
+ */
+export function liveGrantableCapabilities(
+  granted: string[],
+  backend: "k8s-pod",
+  target: LiveGrantTarget,
+): SessionCapability[] {
+  return classifyLiveGrants(granted, backend, target).filter((e) => e.state === "grantable").map((e) => e.cap);
+}
+
+/**
+ * Build `env`-prefix argv that enforces the capability grant: every gated env
+ * key and every baseline sensitive key is stripped with `-u`, so an empty
+ * selection is default-deny and a granted session never inherits ambient
+ * values. Granted values are NOT placed on argv — argv is world-readable via
+ * `/proc/<pid>/cmdline` (#2138). Instead the caller writes them to a 0600 file
+ * and passes its path as `envFilePath`; this appends a `/bin/sh` prelude that
+ * sources and deletes the file before `exec`ing the real command, so argv
+ * carries key names and a path only. Pass `envFilePath: null` when there is
+ * nothing to grant.
+ */
+export function buildCapabilityEnvArgs(selected: string[], envFilePath: string | null): string[] {
+  const { stripKeys } = resolveCapabilityEnv(selected);
+  const args = [
+    "env",
+    ...stripKeys.flatMap((k) => ["-u", k]),
+    // claws_wait_for_change blocks up to 3600 s; the MCP SDK's default per-request
+    // timeout is 60 s and would abort it. 65 minutes covers the longest wait with
+    // margin — the trade-off is that a genuinely wedged MCP server now blocks a
+    // session tool call for 65 minutes instead of 1.
+    "MCP_TOOL_TIMEOUT=3900000",
+  ];
+  if (envFilePath) {
+    args.push("/bin/sh", "-c", ENV_FILE_PRELUDE, "claws-session", envFilePath);
+  }
+  return args;
+}
+
+/**
+ * Build the text — written to the prompt file passed via
+ * `--append-system-prompt-file` — that makes a Claude session aware of the
+ * capabilities it has been granted. Lists ONLY granted capabilities (the ones
+ * whose credentials are present). Returns "" when nothing is granted, in
+ * which case callers must skip the `--append-system-prompt-file` flag entirely.
+ */
+export function buildCapabilityPrompt(selected: string[]): string {
+  const granted = validCapabilityIds(selected);
+  const grantedCaps = CAPABILITIES.filter((c) => granted.includes(c.id));
+  if (grantedCaps.length === 0) return "";
+  const lines = [
+    "## Session capabilities",
+    "",
+    "You have been explicitly granted these capabilities (their credentials are present in your environment):",
+  ];
+  for (const c of grantedCaps) lines.push(`- ${c.label}: ${c.description}`);
+  return lines.join("\n");
+}
+
+/**
+ * The compact block naming the capabilities a session may request mid-session
+ * with the `claws_request_capability` MCP tool (#3072): ids and labels only,
+ * never descriptions — the tool returns a capability's usage guidance once the
+ * operator approves it. Returns "" when nothing is requestable. Only for
+ * sessions that have the `claws-state` MCP server; the caller decides that.
+ */
+export function buildRequestableCapabilityPrompt(
+  granted: string[],
+  backend: "k8s-pod",
+  target: LiveGrantTarget,
+): string {
+  const requestable = liveGrantableCapabilities(granted, backend, target);
+  if (requestable.length === 0) return "";
+  const lines = [
+    "## Requestable capabilities",
+    "",
+    "If a task needs one of these capabilities, call `claws_request_capability` with its id and a short reason; the user must approve the request before you get access.",
+  ];
+  for (const group of CAPABILITY_GROUPS) {
+    const caps = requestable.filter((c) => capabilityGroup(c) === group.id);
+    if (caps.length === 0) continue;
+    lines.push(`${group.label}: ${caps.map((c) => `\`${c.id}\` (${c.label})`).join(", ")}`);
+  }
+  lines.push("A granted capability is usable within seconds; its credentials are loaded into every new shell automatically, including each Bash tool call — nothing to source.");
+  if (requestable.some((c) => c.id === BROWSER_CAPABILITY_ID)) {
+    lines.push(`Granting \`${BROWSER_CAPABILITY_ID}\` restarts your agent with the conversation kept so its tools load; expect a brief restart, then continue where you left off.`);
+  }
+  return lines.join("\n");
+}

@@ -1,0 +1,1034 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+
+const autoPromotePolicy = vi.hoisted(() => ({ current: {} as { bugsAndAlerts?: boolean } }));
+
+vi.mock("./config.js", async () => ({
+  WORK_DIR: (await import("node:path")).join((await import("node:os")).tmpdir(), "claws-issues-attachments-test"),
+  DB_PATH: ":memory:",
+  DATABASE_URL: "",
+  DATABASE_PASSWORD: "",
+  DASHBOARD_URL: "https://claws.example.invalid",
+  ATTACHMENTS_S3: null,
+  LABELS: { duplicate: "Duplicate" },
+  getAutoPromotePolicy: () => autoPromotePolicy.current,
+}));
+
+vi.mock("./log.js", () => ({
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+}));
+
+import { initDb, closeDb, upsertClawsPr, getClawsPr, getIssueModelPlanRows, listExplicitIssueModelPlanRows, upsertIssueModelPlanCell, addClawsIssueRequirementsVersion, setRequirementsVersionListener, enqueueWork, getWorkRow, createShadowIssue, setClawsIssueLifecycle, blockClawsIssue, promoteShadowIssue } from "./db.js";
+import type { RequirementsRecord } from "./requirements-record.js";
+import { getEventsSince, resetGitHubEventsForTest } from "./github-events.js";
+import * as claws from "./claws-issues.js";
+import { storeIssueAttachment } from "./issue-attachments.js";
+import { getClawsIssueAttachment } from "./db.js";
+
+beforeEach(async () => {
+  await initDb();
+  await resetGitHubEventsForTest();
+});
+
+afterEach(async () => {
+  await closeDb();
+});
+
+describe("claws-issues mapping", () => {
+  it("maps a stored issue onto the façade's Issue shape with an ISO updatedAt", async () => {
+    const id = await claws.createIssue({
+      title: "Native",
+      body: "Body",
+      authorLogin: "stjohnb",
+      repos: ["org/a"],
+      labels: ["Priority"],
+    });
+
+    const [issue] = await claws.listOpenIssues("org/a");
+    expect(issue).toMatchObject({
+      number: id,
+      title: "Native",
+      body: "Body",
+      labels: [{ name: "Priority" }],
+      approvedThrough: "none",
+      author: { login: "stjohnb" },
+    });
+    expect(issue!.updatedAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+  });
+
+  it("reports when the issue entered its column, falling back to updated_at for an older row", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"] });
+    const { _rawDb } = await import("./db.js");
+    await _rawDb().run(`UPDATE claws_issues SET stage_changed_at = ?, updated_at = ? WHERE id = ?`, ["2026-01-02 03:04:05", "2026-02-03 04:05:06", id]);
+    expect((await claws.listOpenIssues("org/a"))[0]!.stageSince).toBe("2026-01-02T03:04:05.000Z");
+
+    await _rawDb().run(`UPDATE claws_issues SET stage_changed_at = NULL WHERE id = ?`, [id]);
+    expect((await claws.listOpenIssues("org/a"))[0]!.stageSince).toBe("2026-02-03T04:05:06.000Z");
+  });
+
+  it("mints a prefixed ULID id", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb" });
+    expect(id).toMatch(/^clw_[0-9A-HJKMNP-TV-Z]{26}$/);
+  });
+
+  it("renders comment bodies to body_html", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"] });
+    await claws.commentOnIssue("org/a", id, "some **bold** feedback", "stjohnb");
+
+    const [comment] = await claws.getIssueComments(id);
+    expect(comment).toMatchObject({ login: "stjohnb", body: "some **bold** feedback" });
+    expect(comment!.body_html).toContain("<strong>bold</strong>");
+  });
+
+  it("drops a blank comment without inserting it or emitting an event", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"] });
+
+    expect(await claws.commentOnIssue("org/a", id, "   ", "stjohnb")).toBeNull();
+    expect(await claws.getIssueComments(id)).toEqual([]);
+    expect(await claws.listCommentDetails(id)).toEqual([]);
+    expect(await getEventsSince(0, { kinds: ["issue-comment"] })).toEqual([]);
+  });
+
+  it("renders the body to HTML so the images pipeline still finds <img>", async () => {
+    const id = await claws.createIssue({
+      title: "T",
+      authorLogin: "stjohnb",
+      body: "![shot](https://example.invalid/a.png)",
+    });
+
+    expect(await claws.getIssueBodyHtml(id)).toContain('<img src="https://example.invalid/a.png"');
+  });
+
+  it("reports state in the façade's upper-case form with its reason", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"] });
+    expect(await claws.getIssueState(id)).toEqual({ state: "OPEN", stateReason: null, labels: [] });
+
+    await claws.closeIssue("org/a", id, "not_planned");
+    expect(await claws.getIssueState(id)).toEqual({ state: "CLOSED", stateReason: "not_planned", labels: [] });
+  });
+
+  // The labels come off the record this already reads, and the board's
+  // `POST /board/move` needs them with the state to decide the column a move
+  // lands in — so they are part of the same answer rather than a second read.
+  it("carries the issue's labels alongside its state", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"] });
+    await claws.addLabel("org/a", id, "In Review");
+
+    expect(await claws.getIssueState(id)).toEqual({ state: "OPEN", stateReason: null, labels: ["In Review"] });
+  });
+
+  it("accepts a lower-cased id at every entry point", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"] });
+    const lower = id.toLowerCase();
+
+    await claws.editIssueTitle(lower, "Renamed");
+    await claws.addLabel("org/a", lower, "Priority");
+
+    expect(await claws.getIssueTitleBody(lower)).toMatchObject({ title: "Renamed" });
+    expect((await claws.getIssue(lower))!.labels).toEqual(["Priority"]);
+  });
+
+  it("throws for an unknown or non-native reference", async () => {
+    await expect(claws.getIssueBody("clw_01JBQ7X4M2K8NV3TYRW9GZ5PDC")).rejects.toThrow(/no native issue/);
+    await expect(claws.getIssueBody(123)).rejects.toThrow(/no native issue 123/);
+    await expect(claws.getIssueComments(123)).rejects.toThrow(/not a native issue id/);
+  });
+
+  it("returns issues whose primary repo is the requested one", async () => {
+    const single = await claws.createIssue({ title: "Single", authorLogin: "stjohnb", repos: ["org/a"] });
+    const multi = await claws.createIssue({ title: "Multi", authorLogin: "stjohnb", repos: ["org/b", "org/a"] });
+    await claws.createIssue({ title: "None", authorLogin: "stjohnb" });
+
+    expect((await claws.listOpenIssues("org/a")).map((i) => i.number).sort()).toEqual([single, multi].sort());
+    expect(await claws.listOpenIssues("org/b")).toEqual([]);
+    // Discovery lists the two-repo issue under its non-primary repo too, with sorted repos.
+    const naming = await claws.listOpenIssuesNaming("org/b");
+    expect(naming.map((i) => i.number)).toEqual([multi]);
+    expect(naming[0]!.repos).toEqual(["org/a", "org/b"]);
+    expect((await claws.listUnassignedOpenIssues()).map((i) => i.title)).toEqual(["None"]);
+  });
+
+  it("skips an alert inbox holding the key and returns the later plain issue", async () => {
+    const inbox = await claws.createIssue({ title: "Grafana alerts", authorLogin: "claws", repos: ["org/a"], dedupeKey: "alert-pvc", labels: ["grafana-alert"] });
+    const dedicated = await claws.createIssue({ title: "PVC usage", authorLogin: "claws", repos: ["org/a"], dedupeKey: "alert-pvc" });
+    expect(inbox).toBeTruthy();
+    expect((await claws.findOpenIssueByDedupeKey("org/a", "alert-pvc"))?.id).toBe(dedicated);
+  });
+
+  it("round-trips a dedupe key and finds the open issue by key in its primary repo only", async () => {
+    const keyed = await claws.createIssue({ title: "Keyed", authorLogin: "claws", repos: ["org/b", "org/a"], dedupeKey: "renovate-github-com-secret" });
+    const plain = await claws.createIssue({ title: "Plain", authorLogin: "claws", repos: ["org/a"] });
+    expect((await claws.getIssue(keyed))?.dedupe_key).toBe("renovate-github-com-secret");
+    expect((await claws.getIssue(plain))?.dedupe_key).toBeNull();
+    expect((await claws.listOpenIssues("org/a")).find((i) => i.number === keyed)?.dedupeKey).toBe("renovate-github-com-secret");
+
+    expect((await claws.findOpenIssueByDedupeKey("org/a", "renovate-github-com-secret"))?.id).toBe(keyed);
+    expect(await claws.findOpenIssueByDedupeKey("org/b", "renovate-github-com-secret")).toBeUndefined();
+    expect(await claws.findOpenIssueByDedupeKey("org/a", "other-key")).toBeUndefined();
+
+    await claws.closeIssue("org/a", keyed, "completed");
+    expect(await claws.findOpenIssueByDedupeKey("org/a", "renovate-github-com-secret")).toBeUndefined();
+  });
+
+  it("finds a recently closed issue by key in its primary repo, newest closed first", async () => {
+    const older = await claws.createIssue({ title: "Older", authorLogin: "claws", repos: ["org/a"], dedupeKey: "alert-disk" });
+    const newer = await claws.createIssue({ title: "Newer", authorLogin: "claws", repos: ["org/a"], dedupeKey: "alert-disk" });
+    const elsewhere = await claws.createIssue({ title: "Elsewhere", authorLogin: "claws", repos: ["org/b"], dedupeKey: "alert-disk" });
+    const since = new Date(Date.now() - 60_000);
+    expect(await claws.findRecentlyClosedIssueByDedupeKey("org/a", "alert-disk", since)).toBeUndefined();
+    await claws.closeIssue("org/a", older, "completed");
+    await claws.closeIssue("org/a", newer, "completed");
+    await claws.closeIssue("org/b", elsewhere, "completed");
+    expect((await claws.findRecentlyClosedIssueByDedupeKey("org/a", "alert-disk", since))?.id).toBe(newer);
+    expect((await claws.findRecentlyClosedIssueByDedupeKey("org/b", "alert-disk", since))?.id).toBe(elsewhere);
+    expect(await claws.findRecentlyClosedIssueByDedupeKey("org/a", "alert-disk", new Date(Date.now() + 60_000))).toBeUndefined();
+    expect(await claws.findRecentlyClosedIssueByDedupeKey("org/a", "alert-other", since)).toBeUndefined();
+  });
+
+  it("sets a dedupe key unless another open issue in the primary repo holds it", async () => {
+    const holder = await claws.createIssue({ title: "Holder", authorLogin: "claws", repos: ["org/a"], dedupeKey: "alert-disk" });
+    const target = await claws.createIssue({ title: "Target", authorLogin: "claws", repos: ["org/a"] });
+    const other = await claws.createIssue({ title: "Other repo", authorLogin: "claws", repos: ["org/b"] });
+    expect(await claws.setClawsIssueDedupeKey(target, "alert-disk")).toBe(false);
+    expect((await claws.getIssue(target))?.dedupe_key).toBeNull();
+    expect(await claws.setClawsIssueDedupeKey(other, "alert-disk")).toBe(true);
+    expect((await claws.getIssue(other))?.dedupe_key).toBe("alert-disk");
+    expect(await claws.setClawsIssueDedupeKey(holder, "alert-disk")).toBe(true);
+    await claws.closeIssue("org/a", holder, "completed");
+    expect(await claws.setClawsIssueDedupeKey(target, "alert-disk")).toBe(true);
+    expect(await claws.setClawsIssueDedupeKey("clw_01JBQ7X4M2K8NV3TYRW9GZ5PDC", "alert-disk")).toBe(false);
+  });
+
+  it("listOpenIssuesTouching includes issues naming a repo as a non-primary repo", async () => {
+    const primary = await claws.createIssue({ title: "Primary", authorLogin: "claws", repos: ["org/b"] });
+    const secondary = await claws.createIssue({ title: "Secondary", authorLogin: "claws", repos: ["org/a", "org/b"] });
+    await claws.createIssue({ title: "Elsewhere", authorLogin: "claws", repos: ["org/c"] });
+    await claws.createIssue({ title: "None", authorLogin: "claws" });
+    expect((await claws.listOpenIssuesTouching(["org/b"])).map((r) => r.id).sort()).toEqual([primary, secondary].sort());
+  });
+
+  it("primaryRepo is the alphabetically first repo, or empty with none", () => {
+    expect(claws.primaryRepo({ repos: ["org/b", "org/a"] })).toBe("org/a");
+    expect(claws.primaryRepo({ repos: ["org/a"] })).toBe("org/a");
+    expect(claws.primaryRepo({ repos: [] })).toBe("");
+  });
+
+  it("primaryRepo honours a pin only while it is one of the repos", () => {
+    expect(claws.primaryRepo({ repos: ["org/b", "org/a"], primary_repo: "org/b" })).toBe("org/b");
+    expect(claws.primaryRepo({ repos: ["org/c", "org/a"], primary_repo: "org/b" })).toBe("org/a");
+    expect(claws.primaryRepo({ repos: ["org/b", "org/a"], primary_repo: null })).toBe("org/a");
+    expect(claws.primaryRepo({ repos: [], primary_repo: "org/b" })).toBe("");
+  });
+
+  it("lists a pinned issue under its pinned primary, primary first in its repos", async () => {
+    const id = await claws.createIssue({ title: "Retro", authorLogin: "claws", repos: ["org/c", "org/a", "org/b"], primaryRepo: "org/b" });
+    expect(claws.primaryRepo((await claws.getIssue(id))!)).toBe("org/b");
+    expect((await claws.listOpenIssues("org/a")).map((i) => i.number)).not.toContain(id);
+    const listed = (await claws.listOpenIssues("org/b")).find((i) => i.number === id);
+    expect(listed?.primaryRepo).toBe("org/b");
+    expect(listed?.repos).toEqual(["org/b", "org/a", "org/c"]);
+    expect((await claws.listOpenIssuesNaming("org/a")).map((i) => i.number)).toContain(id);
+  });
+
+  it("finds a pinned issue by dedupe key under its pinned primary only", async () => {
+    const id = await claws.createIssue({ title: "Retro", authorLogin: "claws", repos: ["org/b", "org/a"], primaryRepo: "org/b", dedupeKey: "retro-1" });
+    expect((await claws.findOpenIssueByDedupeKey("org/b", "retro-1"))?.id).toBe(id);
+    expect(await claws.findOpenIssueByDedupeKey("org/a", "retro-1")).toBeUndefined();
+  });
+
+  it("falls back to the alphabetical primary when the pinned repo is removed", async () => {
+    const id = await claws.createIssue({ title: "Retro", authorLogin: "claws", repos: ["org/b", "org/a"], primaryRepo: "org/b" });
+    await claws.setRepos(id, ["org/a", "org/c"]);
+    expect(claws.primaryRepo((await claws.getIssue(id))!)).toBe("org/a");
+    await claws.setRepos(id, ["org/a", "org/b"]);
+    expect(claws.primaryRepo((await claws.getIssue(id))!)).toBe("org/b");
+  });
+});
+
+describe("claws-issues events", () => {
+  it("emits label events once per associated repo and never with a blank repo", async () => {
+    const both = await claws.createIssue({ title: "Both", authorLogin: "stjohnb", repos: ["org/a", "org/b"] });
+    const none = await claws.createIssue({ title: "None", authorLogin: "stjohnb" });
+
+    await claws.addLabel("", both, "Priority");
+    await claws.addLabel("", none, "Priority");
+
+    const events = await getEventsSince(0, { kinds: ["label-added"] });
+    expect(events.map((e) => e.repo).sort()).toEqual(["org/a", "org/b"]);
+    expect(events.every((e) => e.repo !== "")).toBe(true);
+  });
+
+  it("does not emit a label event when the label was already present", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"], labels: ["Priority"] });
+
+    await claws.addLabel("org/a", id, "Priority");
+
+    expect(await getEventsSince(0, { kinds: ["label-added"] })).toEqual([]);
+  });
+
+  it("emits the state label's event on a lifecycle change, and nothing on a repeat", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"] });
+
+    await claws.setLifecycle("org/a", id, "backlog");
+    await claws.setLifecycle("org/a", id, "backlog");
+    await claws.setLifecycle("org/a", id, "ideas");
+
+    expect((await getEventsSince(0, { kinds: ["label-added"] })).map((e) => e.detail)).toEqual(["Backlog"]);
+    expect((await getEventsSince(0, { kinds: ["label-removed"] })).map((e) => e.detail)).toEqual(["Backlog"]);
+    expect((await claws.getIssue(id))!.labels).toEqual([]);
+  });
+
+  it("files an issue with a pre-approval, refuses a gate label and records an approval change (#clw_01M5VW14RKAAGS6VZ5PCKQXB9F)", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"], labels: ["Refined", "Automerge"], approvedThrough: "plan", approvedBy: "session:s1" });
+    const filed = (await claws.getIssue(id))!;
+    expect(filed.labels).toEqual([]);
+    expect(filed).toMatchObject({ approved_through: "plan", approved_through_by: "session:s1" });
+    await expect(claws.addLabel("org/a", id, "Refined")).rejects.toThrow(/not a label any more/);
+
+    expect(await claws.setApprovedThrough(id, "merge", "stjohnb")).toBe(true);
+    expect(await claws.setApprovedThrough(id, "merge", "stjohnb")).toBe(false);
+    expect((await claws.getIssue(id))).toMatchObject({ approved_through: "merge", approved_through_by: "stjohnb" });
+    expect((await getEventsSince(0, { kinds: ["stage-changed"] })).map((e) => e.detail)).toContain("approved-through:plan->merge");
+    expect((await claws.listHistory(id)).map((h) => [h.field, h.oldValue, h.newValue])).toEqual(expect.arrayContaining([
+      ["approved_through", "none", "plan"],
+      ["approved_through", "plan", "merge"],
+    ]));
+  });
+
+  it("emits issue-closed exactly once even when two jobs close the same issue", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"] });
+
+    await claws.closeIssue("org/a", id, "completed");
+    await claws.closeIssue("org/a", id, "completed");
+
+    expect(await getEventsSince(0, { kinds: ["issue-closed"] })).toHaveLength(1);
+  });
+
+  it("emits issue-reopened on a reopen, and nothing on a repeat", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"] });
+    await claws.closeIssue("org/a", id, "completed");
+
+    await claws.reopenIssue(id);
+    await claws.reopenIssue(id);
+
+    expect(await getEventsSince(0, { kinds: ["issue-reopened"] })).toHaveLength(1);
+    expect(await claws.getIssueState(id)).toEqual({ state: "OPEN", stateReason: null, labels: [] });
+  });
+
+  it("tags a plan comment so claws_wait_for_change can filter on it", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"] });
+
+    await claws.commentOnIssue("org/a", id, "*— Automated by Claws —*\n\n## Implementation Plan\n\nDo it.", "claws");
+
+    expect((await getEventsSince(0, { kinds: ["issue-comment"] }))[0]).toMatchObject({ repo: "org/a", detail: "plan" });
+  });
+});
+
+describe("claws-issues imports (#clw_01M55F0ACDZP8ND1BNRZ8TNGPD)", () => {
+  const promoted = async (): Promise<string> => {
+    const { id } = (await createShadowIssue("org/a", 7, { title: "Forge", authorLogin: "stjohnb", labels: ["Backlog"] }))!;
+    expect(await promoteShadowIssue(id, { title: "Forge", body: "Imported", labels: ["Backlog"] }, { importPending: true })).toBe(true);
+    return id;
+  };
+
+  it("shows an import in progress on the issue, and finishing it emits one stage-changed event", async () => {
+    const id = await promoted();
+    expect((await claws.listOpenIssues("org/a"))[0]).toMatchObject({ number: id, importPending: true });
+
+    await claws.finishImport("org/a", id);
+    await claws.finishImport("org/a", id);
+
+    expect((await claws.listOpenIssues("org/a"))[0]!.importPending).toBeUndefined();
+    expect((await getEventsSince(0, { kinds: ["stage-changed"] })).map((e) => e.detail)).toEqual(["importing->backlog"]);
+  });
+
+  it("parks an abandoned import in the Backlog with one operator comment", async () => {
+    const id = await promoted();
+
+    await claws.abandonImport("org/a", id, "https://github.com/org/a/issues/7");
+    await claws.abandonImport("org/a", id, "https://github.com/org/a/issues/7");
+
+    const issue = (await claws.getIssue(id))!;
+    expect(issue.importPending).toBe(false);
+    expect(issue.lifecycle).toBe("backlog");
+    const comments = await claws.getIssueComments(id);
+    expect(comments).toHaveLength(1);
+    expect(comments[0]!.body).toContain("https://github.com/org/a/issues/7");
+  });
+});
+
+describe("claws-issues requirements and stage events (#clw_01M4E54RY2PFWT9SRT81V16GVG)", () => {
+  const record = (title: string): RequirementsRecord => ({
+    title, kind: "feature", context: "Why.", requirement: "What.", acceptanceCriteria: ["It works"], outOfScope: [],
+  });
+
+  beforeEach(() => {
+    autoPromotePolicy.current = {};
+    setRequirementsVersionListener(claws.onRequirementsVersionStored);
+  });
+
+  afterEach(() => {
+    setRequirementsVersionListener(undefined);
+  });
+
+  it("emits requirements-stored for each version of a native issue, per repo", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a", "org/b"], source: "dashboard" });
+    await addClawsIssueRequirementsVersion(id, record("T"), null);
+    await addClawsIssueRequirementsVersion(id, record("T"), null);
+
+    const events = await getEventsSince(0, { kinds: ["requirements-stored"], items: [id] });
+    expect(events.map((e) => [e.repo, e.detail])).toEqual([["org/a", "v1"], ["org/b", "v1"], ["org/a", "v2"], ["org/b", "v2"]]);
+    expect(await getEventsSince(0, { kinds: ["stage-changed"] })).toEqual([]);
+    expect((await claws.getIssue(id))!.lifecycle).toBe("ideas");
+  });
+
+  it("emits requirements-stored before the auto-promotion's stage-changed", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "claws", repos: ["org/a"], source: "automation" });
+    await addClawsIssueRequirementsVersion(id, record("T"), null);
+
+    expect((await getEventsSince(0, { items: [id], kinds: ["requirements-stored", "stage-changed"] })).map((e) => [e.kind, e.detail]))
+      .toEqual([["requirements-stored", "v1"], ["stage-changed", "ideas->planning"]]);
+    expect((await claws.getIssue(id))!.lifecycle).toBe("planning");
+  });
+
+  it("emits nothing for a forge issue's shadow, and still auto-promotes it", async () => {
+    const shadow = (await createShadowIssue("org/a", 3, { title: "Forge", authorLogin: "someone" }))!.id;
+    await addClawsIssueRequirementsVersion(shadow, record("Forge"), null);
+
+    expect(await getEventsSince(0, { kinds: ["requirements-stored", "stage-changed"] })).toEqual([]);
+    expect((await claws.getIssue(shadow))!.lifecycle).toBe("planning");
+  });
+
+  it("emits stage-changed on a hand promotion out of Ideas and on a demotion", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"] });
+    await claws.promoteIssue(id, "someone", "ideas");
+    await claws.demoteIssue(id);
+
+    expect((await getEventsSince(0, { kinds: ["stage-changed"], items: [id] })).map((e) => e.detail)).toEqual(["ideas->planning", "planning->ideas"]);
+  });
+
+  // Back in Ideas nothing is approved, so neither is an open PR's merge
+  // (#clw_01M5VW14RKAAGS6VZ5PCKQXB9F review #9).
+  it("a demotion withdraws the merge approval on the issue's open PR rows, and leaves a merged one alone", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"] });
+    await claws.promoteIssue(id, "someone", "ideas");
+    await claws.setApprovedThrough(id, "merge", "someone");
+    const approved = { issueId: id, mergeApprovedBy: "someone", mergeApprovedAt: "2026-10-27T09:00:00Z" };
+    await upsertClawsPr("org/a", 7, { ...approved, stage: "awaiting-merge", infraMergeApprovedBy: "someone", infraMergeApprovedAt: "2026-10-27T09:00:00Z", infraMergeApprovedSha: "abc" });
+    await upsertClawsPr("org/a", 8, { ...approved, stage: "merged" });
+
+    await claws.demoteIssue(id);
+
+    expect((await claws.getIssue(id))!.approved_through).toBe("none");
+    expect(await getClawsPr("org/a", 7)).toMatchObject({ mergeApprovedBy: null, mergeApprovedAt: null, infraMergeApprovedBy: null, infraMergeApprovedAt: null, infraMergeApprovedSha: null });
+    expect((await getClawsPr("org/a", 8))!.mergeApprovedAt).not.toBeNull();
+  });
+
+  it("emits stage-changed on setLifecycle and nothing on a no-op move", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"] });
+    await claws.setLifecycle("org/a", id, "planning");
+    await claws.setLifecycle("org/a", id, "planning");
+    await claws.setLifecycle("org/a", id, "backlog");
+
+    expect((await getEventsSince(0, { kinds: ["stage-changed"] })).map((e) => e.detail)).toEqual(["ideas->planning", "planning->backlog"]);
+  });
+
+  it("emits stage-changed when a state label moves the lifecycle, and not for a plain label", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"] });
+    await claws.setLifecycle("org/a", id, "planning");
+    await resetGitHubEventsForTest();
+
+    await claws.addLabel("org/a", id, "Backlog");
+    await claws.addLabel("org/a", id, "Backlog");
+    await claws.addLabel("org/a", id, "Priority");
+    await claws.removeLabel("org/a", id, "Backlog");
+
+    expect((await getEventsSince(0, { kinds: ["stage-changed"] })).map((e) => e.detail)).toEqual(["planning->backlog", "backlog->ideas"]);
+    expect((await getEventsSince(0, { kinds: ["label-added"] })).map((e) => e.detail)).toEqual(["Backlog", "Priority"]);
+  });
+});
+
+// A board or Status move into Planning on an issue with a plan queues
+// ISSUE_REFINER_REPLAN; `processRefinement` then edits the plan comment in
+// place and moves the issue back to Awaiting plan review. This drives those same tracker writes and
+// checks the cycle's two promises: the issue returns to Awaiting plan review on
+// its own, and the plan it replaced is still there as a previous version.
+describe("claws-issues re-plan after a move to Planning", () => {
+  it("returns the issue to Awaiting plan review and keeps the old plan as version 1", async () => {
+    const PLAN = "*— Automated by Claws —*\n\n## Implementation Plan\n\n";
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"] });
+    const commentId = await claws.commentOnIssue("org/a", id, `${PLAN}Do it the first way.`, "claws");
+    await claws.setLifecycle("org/a", id, "awaiting-plan-review");
+    expect((await claws.getIssue(id))!.lifecycle).toBe("awaiting-plan-review");
+
+    // "Send back to Planning".
+    await claws.setLifecycle("org/a", id, "planning");
+    expect((await claws.getIssue(id))!.lifecycle).toBe("planning");
+
+    // The re-plan posts: the plan comment is revised, then the issue goes back to plan review.
+    await claws.editIssueComment(commentId!, `${PLAN}Do it the second way.`);
+    expect((await claws.getIssue(id))!.lifecycle).toBe("planning");
+    await claws.setLifecycle("org/a", id, "awaiting-plan-review");
+
+    expect((await claws.getIssue(id))!.lifecycle).toBe("awaiting-plan-review");
+    const plans = await claws.listPlans(id);
+    expect(plans.map((p) => p.version)).toEqual([1, 2]);
+    expect(plans[0]!.body).toContain("first way");
+    expect(plans[1]!.body).toContain("second way");
+  });
+});
+
+describe("claws-issues duplicates", () => {
+  it("matches the structured marker case-insensitively and not a bare mention", async () => {
+    const canonical = await claws.createIssue({ title: "Canonical", authorLogin: "stjohnb", repos: ["org/a"] });
+    const dup = await claws.createIssue({
+      title: "Dup",
+      authorLogin: "stjohnb",
+      repos: ["org/a"],
+      labels: ["Duplicate"],
+      body: `claws-duplicate-of:${canonical.toLowerCase()}`,
+    });
+    await claws.createIssue({
+      title: "Mentions only",
+      authorLogin: "stjohnb",
+      repos: ["org/a"],
+      labels: ["Duplicate"],
+      body: `Related to #${canonical}, but not a duplicate.`,
+    });
+
+    expect((await claws.listDuplicateIssuesOf("org/a", canonical)).map((i) => i.number)).toEqual([dup]);
+  });
+
+  it("finds the marker in a comment too", async () => {
+    const canonical = await claws.createIssue({ title: "Canonical", authorLogin: "stjohnb", repos: ["org/a"] });
+    const dup = await claws.createIssue({ title: "Dup", authorLogin: "stjohnb", repos: ["org/a"], labels: ["Duplicate"] });
+    await claws.commentOnIssue("org/a", dup, `claws-duplicate-of:${canonical}`, "claws");
+
+    expect((await claws.listDuplicateIssuesOf("org/a", canonical)).map((i) => i.number)).toEqual([dup]);
+  });
+
+  it("does not match an id that merely starts with the canonical one", async () => {
+    const canonical = await claws.createIssue({ title: "Canonical", authorLogin: "stjohnb", repos: ["org/a"] });
+    await claws.createIssue({
+      title: "Dup",
+      authorLogin: "stjohnb",
+      repos: ["org/a"],
+      labels: ["Duplicate"],
+      body: `claws-duplicate-of:${canonical}X`,
+    });
+
+    expect(await claws.listDuplicateIssuesOf("org/a", canonical)).toEqual([]);
+  });
+});
+
+describe("claws-issues writes", () => {
+  it("keeps the model plan while setRepos leaves the same single repo", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"] });
+    await upsertIssueModelPlanCell("org/a", id, "implement", { provider: "codex", tier: "haiku", source: "explicit" });
+
+    await claws.setRepos(id, ["org/a"]);
+
+    expect((await getIssueModelPlanRows("org/a", id)).map((r) => r.phase)).toEqual(["implement"]);
+  });
+
+  it("keeps the model plan while setRepos adds a repo that sorts after the primary", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"] });
+    await upsertIssueModelPlanCell("org/a", id, "implement", { provider: "codex", tier: "haiku", source: "explicit" });
+
+    await claws.setRepos(id, ["org/b", "org/a"]);
+
+    expect((await getIssueModelPlanRows("org/a", id)).map((r) => r.phase)).toEqual(["implement"]);
+  });
+
+  it.each([[["org/0", "org/a"]], [["org/b"]], [[]]])("clears the model plan when setRepos leaves %j", async (repos) => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"] });
+    await upsertIssueModelPlanCell("org/a", id, "implement", { provider: "codex", tier: "haiku", source: "explicit" });
+    await upsertIssueModelPlanCell("org/a", id, "review", { provider: null, tier: "opus", source: "suggested" });
+
+    await claws.setRepos(id, repos);
+
+    expect(await getIssueModelPlanRows("org/a", id)).toEqual([]);
+    expect(await listExplicitIssueModelPlanRows()).toEqual([]);
+  });
+
+  it("addRepos pins the current primary, keeps its model plan, and skips repos already on the issue", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/b"] });
+    await upsertIssueModelPlanCell("org/b", id, "implement", { provider: "codex", tier: "haiku", source: "explicit" });
+
+    expect(await claws.addRepos(id, ["org/a", "org/b"])).toEqual(["org/a"]);
+
+    const record = (await claws.getIssue(id))!;
+    expect([...record.repos].sort()).toEqual(["org/a", "org/b"]);
+    expect(record.primary_repo).toBe("org/b");
+    expect(claws.primaryRepo(record)).toBe("org/b");
+    expect((await getIssueModelPlanRows("org/b", id)).map((r) => r.phase)).toEqual(["implement"]);
+    expect(await claws.addRepos(id, ["org/a"])).toEqual([]);
+  });
+
+  it("stores reactions per (comment, login, content)", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"] });
+    const commentId = (await claws.commentOnIssue("org/a", id, "please fix", "stjohnb"))!;
+
+    await claws.addReaction(commentId, claws.CLAWS_NATIVE_LOGIN, "+1");
+    await claws.addReaction(commentId, claws.CLAWS_NATIVE_LOGIN, "+1");
+
+    expect(await claws.getCommentReactions(commentId)).toEqual([
+      { id: 0, user: { login: "claws" }, content: "+1" },
+    ]);
+  });
+
+  it("removeLabel reports the label absent afterwards either way", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"] });
+    expect(await claws.removeLabel("org/a", id, "Priority")).toBe(true);
+  });
+
+  it("dashboardIssueUrl canonicalises the id it is handed", async () => {
+    expect(claws.dashboardIssueUrl("clw_01jbq7x4m2k8nv3tyrw9gz5pdc"))
+      .toBe("https://claws.example.invalid/issues/clw_01JBQ7X4M2K8NV3TYRW9GZ5PDC");
+  });
+});
+
+describe("claws-issues requirements feedback", () => {
+  const record = (title: string): RequirementsRecord => ({
+    title, kind: "feature", context: "Why.", requirement: "What.", acceptanceCriteria: ["It works"], outOfScope: [],
+  });
+  const VERSION_AT = "2026-10-05T12:00:00.000Z";
+  const human = (createdAt: string, body = "please tighten AC2") => ({ login: "stjohnb", body, createdAt });
+
+  it("counts a human comment at or after the latest version as feedback", () => {
+    expect(claws.isRequirementsFeedback(human(VERSION_AT), VERSION_AT)).toBe(true);
+    expect(claws.isRequirementsFeedback(human("2026-10-05T13:00:00.000Z"), VERSION_AT)).toBe(true);
+  });
+
+  it("ignores a comment before the version, and one Claws or a bot wrote", () => {
+    expect(claws.isRequirementsFeedback(human("2026-10-05T11:59:59.000Z"), VERSION_AT)).toBe(false);
+    expect(claws.isRequirementsFeedback({ ...human(VERSION_AT), login: "claws" }, VERSION_AT)).toBe(false);
+    expect(claws.isRequirementsFeedback({ ...human(VERSION_AT), login: "claws-app[bot]" }, VERSION_AT)).toBe(false);
+    expect(claws.isRequirementsFeedback(human(VERSION_AT, "*— Automated by Claws —*\n\nQueued."), VERSION_AT)).toBe(false);
+    expect(claws.isRequirementsFeedback(human(VERSION_AT, "*— Automated by Claws · Requirements writer —*\n\n## Requirements\n\nv2"), VERSION_AT)).toBe(false);
+  });
+
+  async function backdate(table: "claws_issue_comments" | "claws_issue_requirements", issueId: string, at: string): Promise<void> {
+    const { _rawDb } = await import("./db.js");
+    await _rawDb().run(`UPDATE ${table} SET created_at = ? WHERE issue_id = ?`, [at, issueId]);
+  }
+
+  it("moves a card to Drafting on feedback and back to Requirements review on the next version", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"] });
+    expect(await claws.isAwaitingRequirementsReview(id)).toBe(false);
+
+    await addClawsIssueRequirementsVersion(id, record("v1"), null);
+    expect(await claws.isAwaitingRequirementsReview(id)).toBe(true);
+    expect(await claws.getRequirementsFeedbackPending(await claws.getLatestRequirementsForOpenIssues())).toEqual(new Set());
+
+    // Claws' own comment does not move the card.
+    await claws.commentOnIssue("org/a", id, "*— Automated by Claws —*\n\nNoted.", "claws");
+    expect(await claws.isAwaitingRequirementsReview(id)).toBe(true);
+
+    await claws.commentOnIssue("org/a", id, "please tighten AC2", "stjohnb");
+    expect(await claws.isAwaitingRequirementsReview(id)).toBe(false);
+    expect(await claws.getRequirementsFeedbackPending(await claws.getLatestRequirementsForOpenIssues())).toEqual(new Set([id]));
+
+    // The refine run stores v2 after the comment.
+    await backdate("claws_issue_comments", id, "2026-01-01 00:00:00");
+    await backdate("claws_issue_requirements", id, "2026-01-01 00:00:00");
+    await addClawsIssueRequirementsVersion(id, record("v2"), null);
+    expect(await claws.isAwaitingRequirementsReview(id)).toBe(true);
+    expect(await claws.getRequirementsFeedbackPending(await claws.getLatestRequirementsForOpenIssues())).toEqual(new Set());
+  });
+
+  it("ignores a comment posted before the latest version", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"] });
+    await claws.commentOnIssue("org/a", id, "an early thought", "stjohnb");
+    await backdate("claws_issue_comments", id, "2026-01-01 00:00:00");
+    await addClawsIssueRequirementsVersion(id, record("v1"), null);
+
+    expect(await claws.isAwaitingRequirementsReview(id)).toBe(true);
+    expect(await claws.getRequirementsFeedbackPending(await claws.getLatestRequirementsForOpenIssues())).toEqual(new Set());
+  });
+
+  it("ignores a comment Claws has already 👍'd, as the dispatcher does", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"] });
+    await addClawsIssueRequirementsVersion(id, record("v1"), null);
+    await claws.commentOnIssue("org/a", id, "please tighten AC2", "stjohnb");
+    const [comment] = await claws.listCommentDetails(id);
+    await claws.addReaction(comment!.id, "claws", "+1");
+
+    expect(await claws.isAwaitingRequirementsReview(id)).toBe(true);
+    expect(await claws.hasRequirementsFeedback(await claws.listCommentDetails(id), VERSION_AT)).toBe(false);
+    expect(await claws.getRequirementsFeedbackPending(await claws.getLatestRequirementsForOpenIssues())).toEqual(new Set());
+
+    // Someone else's reaction does not address it.
+    const other = await claws.createIssue({ title: "U", authorLogin: "stjohnb", repos: ["org/a"] });
+    await addClawsIssueRequirementsVersion(other, record("v1"), null);
+    await claws.commentOnIssue("org/a", other, "and AC3", "stjohnb");
+    const [otherComment] = await claws.listCommentDetails(other);
+    await claws.addReaction(otherComment!.id, "stjohnb", "+1");
+    expect(await claws.isAwaitingRequirementsReview(other)).toBe(false);
+  });
+
+  it("answers false for no tracker id", async () => {
+    expect(await claws.isAwaitingRequirementsReview(undefined)).toBe(false);
+  });
+});
+
+describe("claws-issues promotion", () => {
+  const record = (title: string): RequirementsRecord => ({
+    title, kind: "feature", context: "Why.", requirement: "What.", acceptanceCriteria: ["It works"], outOfScope: [],
+  });
+
+  beforeEach(() => {
+    autoPromotePolicy.current = {};
+    setRequirementsVersionListener(claws.autoPromoteOnFirstVersion);
+  });
+
+  afterEach(() => {
+    setRequirementsVersionListener(undefined);
+  });
+
+  it("waits for a human on dashboard, session, whatsapp and agent sources, and promotes automation and forge as claws", async () => {
+    // The stage is on by default only for hand-filed sources; turned on, an
+    // agent or session issue's record waits for a human too.
+    for (const source of ["dashboard", "session", "whatsapp", "agent"] as const) {
+      const id = await claws.createIssue({ title: `From ${source}`, authorLogin: "stjohnb", repos: ["org/a"], source, requirementsStage: true });
+      await addClawsIssueRequirementsVersion(id, record(`From ${source}`), null);
+      expect((await claws.getIssue(id))!, source).toMatchObject({ lifecycle: "ideas", requirements_approved_by: null });
+      await claws.autoPromoteIfDue(id, true);
+      expect((await claws.getIssue(id))!.lifecycle, source).toBe("ideas");
+    }
+
+    for (const source of ["automation", "forge"] as const) {
+      const id = await claws.createIssue({ title: `From ${source}`, authorLogin: "claws", repos: ["org/a"], source });
+      await addClawsIssueRequirementsVersion(id, record(`From ${source}`), null);
+      expect((await claws.getIssue(id))!, source).toMatchObject({
+        lifecycle: "planning", approved_requirements_version: 1, requirements_approved_by: "claws",
+      });
+    }
+  });
+
+  it("follows a per-issue choice over the source default", async () => {
+    const held = await claws.createIssue({ title: "T", authorLogin: "claws", repos: ["org/a"], source: "forge", autoPromote: false });
+    await addClawsIssueRequirementsVersion(held, record("T"), null);
+    expect((await claws.getIssue(held))!.lifecycle).toBe("ideas");
+
+    for (const source of ["dashboard", "whatsapp"] as const) {
+      const forced = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"], source, autoPromote: true });
+      await addClawsIssueRequirementsVersion(forced, record("T"), null);
+      expect((await claws.getIssue(forced))!, source).toMatchObject({ lifecycle: "planning", requirements_approved_by: "claws" });
+    }
+  });
+
+  it("promotes an issue that skips the requirements stage with no record, unless it is held", async () => {
+    for (const source of ["session", "agent", "automation"] as const) {
+      const id = await claws.createIssue({ title: `From ${source}`, authorLogin: "claws", repos: ["org/a"], source });
+      expect(claws.requirementsStageApplies((await claws.getIssue(id))!), source).toBe(false);
+      await claws.autoPromoteIfDue(id, true);
+      expect((await claws.getIssue(id))!, source).toMatchObject({
+        lifecycle: "planning", approved_requirements_version: null, requirements_approved_by: "claws", title: `From ${source}`,
+      });
+    }
+
+    // A hand-filed issue whose author skipped the stage promotes the same way.
+    const skipped = await claws.createIssue({ title: "Skip", authorLogin: "stjohnb", repos: ["org/a"], source: "dashboard", requirementsStage: false });
+    await claws.autoPromoteIfDue(skipped, true);
+    expect((await claws.getIssue(skipped))!.lifecycle).toBe("planning");
+
+    // `auto_promote = 0` — an explicit hold, or a human's demotion — waits in Drafting.
+    const held = await claws.createIssue({ title: "Held", authorLogin: "claws", repos: ["org/a"], source: "agent", autoPromote: false });
+    await claws.autoPromoteIfDue(held, true);
+    expect((await claws.getIssue(held))!).toMatchObject({ lifecycle: "ideas", requirements_approved_by: null });
+  });
+
+  it("requirementsStageApplies treats a row from before the column as on", () => {
+    expect(claws.requirementsStageApplies({ requirements_stage: null })).toBe(true);
+    expect(claws.requirementsStageApplies({})).toBe(true);
+    expect(claws.requirementsStageApplies({ requirements_stage: 1 })).toBe(true);
+    expect(claws.requirementsStageApplies({ requirements_stage: 0 })).toBe(false);
+  });
+
+  it("autoPromoteIfDue leaves an issue already in Planning alone", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"], source: "dashboard" });
+    await claws.promoteIssue(id, "session:abc", "ideas");
+    await claws.autoPromoteIfDue(id, true);
+    expect((await claws.getIssue(id))!).toMatchObject({ lifecycle: "planning", requirements_approved_by: "session:abc" });
+  });
+
+  it("auto-promotes only on the first version", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"], source: "dashboard" });
+    await addClawsIssueRequirementsVersion(id, record("T"), null);
+    await claws.createIssue({ title: "unrelated", authorLogin: "x" });
+    await addClawsIssueRequirementsVersion(id, record("T"), null);
+    expect((await claws.getIssue(id))!.lifecycle).toBe("ideas");
+  });
+
+  it("promotes a forge issue's shadow on its first version", async () => {
+    const shadow = (await createShadowIssue("org/a", 3, { title: "Forge", authorLogin: "someone" }))!.id;
+    await addClawsIssueRequirementsVersion(shadow, record("Renamed"), null);
+    expect((await claws.getIssue(shadow))!).toMatchObject({ lifecycle: "planning", title: "Forge", requirements_approved_by: "claws" });
+  });
+
+  it("promotes by hand, renaming to the approved version's title", async () => {
+    const id = await claws.createIssue({ title: "make it quick", authorLogin: "stjohnb", repos: ["org/a"] });
+    await claws.promoteIssue(id, "someone", "ideas");
+    expect((await claws.getIssue(id))!).toMatchObject({ lifecycle: "planning", approved_requirements_version: null, requirements_approved_by: "someone", title: "make it quick" });
+
+    const titled = await claws.createIssue({ title: "make it quick", authorLogin: "stjohnb", repos: ["org/a"] });
+    await addClawsIssueRequirementsVersion(titled, record("Speed up the board"), null);
+    await claws.promoteIssue(titled, "someone", "ideas");
+    expect((await claws.getIssue(titled))!).toMatchObject({ title: "Speed up the board", filed_title: "make it quick", approved_requirements_version: 1 });
+    expect((await claws.listOpenIssues("org/a")).find((i) => i.number === titled)).toMatchObject({ title: "Speed up the board", filedTitle: "make it quick" });
+  });
+
+  it("promotes out of Blocked, not only Ideas, when the caller reads that lifecycle", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"] });
+    await blockClawsIssue(id, "Waiting on a vendor fix");
+    // A human drag from Blocked straight into Planning: the caller passes the
+    // lifecycle it read, `blocked`, not `ideas`.
+    expect(await claws.promoteIssue(id, "someone", "blocked")).toBe(true);
+    expect((await claws.getIssue(id))!).toMatchObject({ lifecycle: "planning", requirements_approved_by: "someone" });
+
+    // A stale read loses the race rather than promoting.
+    await blockClawsIssue(id, "Waiting on a vendor fix");
+    expect(await claws.promoteIssue(id, "someone", "ideas")).toBe(false);
+    expect((await claws.getIssue(id))!.lifecycle).toBe("blocked");
+  });
+
+  it("demotes: clears the approval, returns to Ideas and skips a queued planner run", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"] });
+    await claws.promoteIssue(id, "someone", "ideas");
+    const planner = (await enqueueWork("issue-refiner:plan", "org/a", id))!;
+    await claws.demoteIssue(id);
+    expect((await claws.getIssue(id))!).toMatchObject({ lifecycle: "ideas", requirements_approved_by: null, requirements_approved_at: null });
+    expect((await getWorkRow(planner.id))!.status).toBe("completed");
+  });
+
+  it("re-enters the board in Planning once past Ideas, and in Ideas otherwise", () => {
+    expect(claws.entryLifecycle({ requirements_approved_at: null }, false)).toBe("ideas");
+    expect(claws.entryLifecycle({ requirements_approved_at: null }, true)).toBe("planning");
+    expect(claws.entryLifecycle({ requirements_approved_at: "2026-09-01 00:00:00" }, false)).toBe("planning");
+  });
+
+  describe("bug and alert issues (clw_01M3DZ46C7A0K6M98EESRP2W9X)", () => {
+    it("promotes a bug from an attended source, whatever the source", async () => {
+      const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"], source: "dashboard" });
+      await addClawsIssueRequirementsVersion(id, { ...record("T"), kind: "bug" }, null);
+      expect((await claws.getIssue(id))!.lifecycle).toBe("planning");
+    });
+
+    it("promotes an alert-labelled issue even with kind feature", async () => {
+      for (const label of ["alert", "grafana-alert"]) {
+        const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"], source: "dashboard", labels: [label] });
+        await addClawsIssueRequirementsVersion(id, record("T"), null);
+        expect((await claws.getIssue(id))!, label).toMatchObject({ lifecycle: "planning" });
+      }
+    });
+
+    it("promotes a forge shadow with a consolidated alert-bridge body", async () => {
+      const shadow = (await createShadowIssue("org/a", 5, {
+        title: "Alert", authorLogin: "bot", body: "## Currently firing\n\nX\n\n## Alerts\n\nY",
+      }))!.id;
+      await addClawsIssueRequirementsVersion(shadow, record("Alert"), null);
+      expect((await claws.getIssue(shadow))!.lifecycle).toBe("planning");
+    });
+
+    it("a demoted (auto_promote = 0) bug or alert issue still waits", async () => {
+      const bug = await claws.createIssue({ title: "T", authorLogin: "claws", repos: ["org/a"], source: "dashboard", autoPromote: false });
+      await addClawsIssueRequirementsVersion(bug, { ...record("T"), kind: "bug" }, null);
+      expect((await claws.getIssue(bug))!.lifecycle).toBe("ideas");
+
+      const alert = await claws.createIssue({ title: "T", authorLogin: "claws", repos: ["org/a"], source: "dashboard", labels: ["alert"], autoPromote: false });
+      await addClawsIssueRequirementsVersion(alert, record("T"), null);
+      expect((await claws.getIssue(alert))!.lifecycle).toBe("ideas");
+    });
+
+    it("bugsAndAlerts: false makes a bug follow the source default", async () => {
+      autoPromotePolicy.current = { bugsAndAlerts: false };
+      const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"], source: "dashboard" });
+      await addClawsIssueRequirementsVersion(id, { ...record("T"), kind: "bug" }, null);
+      expect((await claws.getIssue(id))!.lifecycle).toBe("ideas");
+    });
+
+    it("bugsAndAlerts: true promotes a bug", async () => {
+      autoPromotePolicy.current = { bugsAndAlerts: true };
+      const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"], source: "dashboard" });
+      await addClawsIssueRequirementsVersion(id, { ...record("T"), kind: "bug" }, null);
+      expect((await claws.getIssue(id))!.lifecycle).toBe("planning");
+    });
+
+    it("promotes an agent's bug through the bugsAndAlerts default, and waits when it is false", async () => {
+      const id = await claws.createIssue({ title: "T", authorLogin: "claws", repos: ["org/a"], source: "agent" });
+      await addClawsIssueRequirementsVersion(id, { ...record("T"), kind: "bug" }, null);
+      expect((await claws.getIssue(id))!.lifecycle).toBe("planning");
+
+      autoPromotePolicy.current = { bugsAndAlerts: false };
+      const waiting = await claws.createIssue({ title: "T", authorLogin: "claws", repos: ["org/a"], source: "agent" });
+      await addClawsIssueRequirementsVersion(waiting, { ...record("T"), kind: "bug" }, null);
+      expect((await claws.getIssue(waiting))!.lifecycle).toBe("ideas");
+    });
+
+    it("autoPromoteIfDue promotes a bug already sitting in Ideas with a written record", async () => {
+      setRequirementsVersionListener(undefined);
+      const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"], source: "dashboard" });
+      await addClawsIssueRequirementsVersion(id, { ...record("T"), kind: "bug" }, null);
+      expect((await claws.getIssue(id))!.lifecycle).toBe("ideas");
+
+      await claws.autoPromoteIfDue(id, true);
+      expect((await claws.getIssue(id))!.lifecycle).toBe("planning");
+    });
+
+    it("autoPromoteIfDue does not re-promote a bug already approved", async () => {
+      setRequirementsVersionListener(undefined);
+      const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"], source: "dashboard" });
+      await addClawsIssueRequirementsVersion(id, { ...record("T"), kind: "bug" }, null);
+      await claws.promoteIssue(id, "someone", "ideas");
+      await setClawsIssueLifecycle(id, "ideas"); // back in Ideas, approval left intact
+      await claws.autoPromoteIfDue(id, true);
+      expect((await claws.getIssue(id))!.lifecycle).toBe("ideas");
+    });
+
+    it("autoPromoteIfDue does not promote a bug the human has demoted", async () => {
+      setRequirementsVersionListener(undefined);
+      const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"], source: "dashboard" });
+      await addClawsIssueRequirementsVersion(id, { ...record("T"), kind: "bug" }, null);
+      await claws.demoteIssue(id); // sets auto_promote to "wait"
+      await claws.autoPromoteIfDue(id, true);
+      expect((await claws.getIssue(id))!.lifecycle).toBe("ideas");
+    });
+  });
+});
+
+describe("claws-issues attachments", () => {
+  afterEach(async () => {
+    const [fs, os, path] = await Promise.all([import("node:fs"), import("node:os"), import("node:path")]);
+    fs.rmSync(path.join(os.tmpdir(), "claws-issues-attachments-test"), { recursive: true, force: true });
+  });
+
+  async function store(issueId: string | null, name: string, type: string) {
+    const result = await storeIssueAttachment(issueId, name, Buffer.from("data"), type, "stjohnb");
+    if (!result.ok) throw new Error(result.reason);
+    return result.row;
+  }
+
+  it("lists a native issue's files as { name, url } with the site-relative URL", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb" });
+    const png = await store(id, "shot.png", "image/png");
+    const zip = await store(id, "logs.zip", "application/zip");
+    await store(null, "pending.png", "image/png");
+
+    expect(await claws.listAttachments(id)).toEqual([
+      { name: "shot.png", url: `/issues/${id}/attachments/${png.id}/shot.png` },
+      { name: "logs.zip", url: `/issues/${id}/attachments/${zip.id}/logs.zip` },
+    ]);
+    expect(await claws.listAttachments(id.toLowerCase())).toHaveLength(2);
+    expect(await claws.listAttachments(42)).toEqual([]);
+  });
+
+  it("stamps comment_id on the attachments a comment links, and only those", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb" });
+    const linked = await store(id, "shot.png", "image/png");
+    const unlinked = await store(id, "other.png", "image/png");
+
+    const commentId = await claws.commentOnIssue("", id, `see ![shot](/issues/${id}/attachments/${linked.id}/shot.png)`, "stjohnb");
+    expect((await getClawsIssueAttachment(linked.id))?.comment_id).toBe(commentId);
+    expect((await getClawsIssueAttachment(unlinked.id))?.comment_id).toBeNull();
+
+    // A later comment re-linking the same file does not move it.
+    await claws.commentOnIssue("", id, `again /issues/${id}/attachments/${linked.id}/shot.png`, "stjohnb");
+    expect((await getClawsIssueAttachment(linked.id))?.comment_id).toBe(commentId);
+  });
+
+  it("stamps only the attachments an allowlist names", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb" });
+    const bodyFile = await store(id, "body.png", "image/png");
+    const ownFile = await store(id, "own.png", "image/png");
+
+    const commentId = await claws.commentOnIssue(
+      "",
+      id,
+      `/issues/${id}/attachments/${bodyFile.id}/body.png /issues/${id}/attachments/${ownFile.id}/own.png`,
+      "stjohnb",
+      { attachmentIds: [ownFile.id] },
+    );
+    expect((await getClawsIssueAttachment(ownFile.id))?.comment_id).toBe(commentId);
+    expect((await getClawsIssueAttachment(bodyFile.id))?.comment_id).toBeNull();
+  });
+});
+
+describe("claws-issues comment deletion", () => {
+  const PLAN = "*— Automated by Claws —*\n\n## Implementation Plan\n\n";
+  const record: RequirementsRecord = {
+    title: "T", kind: "feature", context: "C", requirement: "R", acceptanceCriteria: ["A"], outOfScope: [],
+  };
+
+  it("refuses the current plan comment but deletes an older one, leaving plan history intact", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"] });
+    const older = await claws.commentOnIssue("org/a", id, `${PLAN}First way.`, "claws");
+    const current = await claws.commentOnIssue("org/a", id, `${PLAN}Second way.`, "claws");
+    const plansBefore = await claws.listPlans(id);
+
+    await expect(claws.deleteIssueComments(id, [current!], "operator:stjohnb")).rejects.toMatchObject({ reason: "refused" });
+    expect(await claws.deleteIssueComments(id, [older!], "operator:stjohnb")).toBe(1);
+    expect((await claws.getIssueComments(id)).map((c) => c.id)).toEqual([current]);
+    expect(await claws.listPlans(id)).toEqual(plansBefore);
+  });
+
+  it("refuses the latest requirements comment", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"] });
+    const reqComment = await claws.commentOnIssue("org/a", id, "## Requirements\n\nstuff", "claws");
+    await addClawsIssueRequirementsVersion(id, record, reqComment, { notify: false });
+    await expect(claws.deleteIssueComments(id, [reqComment!], "operator:stjohnb")).rejects.toMatchObject({ reason: "refused" });
+  });
+
+  it("deletes nothing when any id is foreign, unknown or already deleted", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"] });
+    const other = await claws.createIssue({ title: "U", authorLogin: "stjohnb", repos: ["org/a"] });
+    const mine = await claws.commentOnIssue("org/a", id, "noise", "stjohnb");
+    const gone = await claws.commentOnIssue("org/a", id, "gone", "stjohnb");
+    const foreign = await claws.commentOnIssue("org/a", other, "elsewhere", "stjohnb");
+    await claws.deleteIssueComments(id, [gone!], "operator:stjohnb");
+
+    for (const bad of [foreign!, gone!, "clwc_01JBQ7X4M2K8NV3TYRW9GZ5PDC", "17"]) {
+      await expect(claws.deleteIssueComments(id, [mine!, bad], "session:abc")).rejects.toMatchObject({ reason: "not-found" });
+    }
+    expect((await claws.getIssueComments(id)).map((c) => c.id)).toEqual([mine]);
+  });
+
+  it("emits issue-comment and never re-plans or touches the stage", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"] });
+    const c = await claws.commentOnIssue("org/a", id, "noise", "stjohnb");
+    const before = await claws.getIssue(id);
+    await resetGitHubEventsForTest();
+    await claws.deleteIssueComments(id, [c!.toLowerCase()], "operator:stjohnb");
+    expect((await getEventsSince(0, {})).map((e) => [e.kind, e.number])).toEqual([["issue-comment", id]]);
+    const after = await claws.getIssue(id);
+    expect(after!.lifecycle).toBe(before!.lifecycle);
+    expect(after!.updated_at).toBe(before!.updated_at);
+  });
+
+  it("stops a deleted claws-duplicate-of marker and claws-phase-done claim from counting", async () => {
+    const canonical = await claws.createIssue({ title: "Canonical", authorLogin: "stjohnb", repos: ["org/a"] });
+    const dup = await claws.createIssue({ title: "Dup", authorLogin: "stjohnb", repos: ["org/a"], labels: ["Duplicate"] });
+    const marker = await claws.commentOnIssue("org/a", dup, `claws-duplicate-of:${canonical}`, "claws");
+    const claim = await claws.commentOnIssue("org/a", dup, "claws-phase-done: 1", "stjohnb");
+    expect((await claws.listDuplicateIssuesOf("org/a", canonical)).map((i) => i.number)).toEqual([dup]);
+
+    await claws.deleteIssueComments(dup, [marker!, claim!], "operator:stjohnb");
+    expect(await claws.listDuplicateIssuesOf("org/a", canonical)).toEqual([]);
+    // Phase claims are parsed from the façade's comments, which no longer carry it.
+    expect((await claws.getIssueComments(dup)).some((c) => c.body.includes("claws-phase-done"))).toBe(false);
+  });
+
+  it("stores a session's requirements version unapproved", async () => {
+    const id = await claws.createIssue({ title: "T", authorLogin: "stjohnb", repos: ["org/a"] });
+    await addClawsIssueRequirementsVersion(id, record, null, { notify: false });
+    await claws.promoteIssue(id, "stjohnb", "ideas");
+    await resetGitHubEventsForTest();
+
+    expect(await claws.storeSessionRequirements(id, { ...record, requirement: "R2" })).toBe(2);
+    const issue = await claws.getIssue(id);
+    expect(Number(issue!.approved_requirements_version)).toBe(1);
+    expect(issue!.lifecycle).toBe("planning");
+    expect((await getEventsSince(0, {})).map((e) => [e.kind, e.detail])).toEqual([["requirements-stored", "v2"]]);
+  });
+});
