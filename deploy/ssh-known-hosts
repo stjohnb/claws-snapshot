@@ -1,0 +1,8 @@
+# SSH host verification for every pod built from this image (St-John-Software/claws).
+# Shipped by the Dockerfile to /etc/ssh/ssh_known_hosts, OpenSSH's global
+# known-hosts file. One line, no raw host-key pins: trust any host certificate
+# signed by the fleet host CA (#clw_01M4TVENKC78XCG6CX2VDCEEEE). Not a secret.
+# Copied verbatim from St-John-Software/nixos-config ssh-ca/known_hosts (the
+# flake's packages.x86_64-linux.ssh-ca-known-hosts); a host CA rotation adds the
+# new line there and here first (fleet-infra docs/ssh-ca.md#rotating-the-cas).
+@cert-authority * ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBCaT5RDo1eEZNgZp4Xm52/JtfRZeChHebC8/Eq6AbGeBEZw1jFtev8d3ulF43tGmHn9tJpD3QVh6VxZt6srhqoo=
