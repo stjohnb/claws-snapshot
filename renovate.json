@@ -1,0 +1,81 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "packageRules": [
+    {
+      "description": "One PR for the DSPy tooling's Python dependencies, as Dependabot's pip group did",
+      "matchFileNames": [
+        "tools/dspy/**"
+      ],
+      "groupName": "tools/dspy"
+    },
+    {
+      "description": "One PR for Dockerfile base-image bumps, as Dependabot's docker group did; base images are pinned by digest",
+      "matchManagers": [
+        "dockerfile"
+      ],
+      "groupName": "docker",
+      "pinDigests": true
+    },
+    {
+      "description": "Self-built LAN registry images are bumped by their own release pipelines, not Renovate",
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchPackageNames": [
+        "registry.home.bstjohn.net/st-john-software/**"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "One PR for the Dockerfile's step-cli-build stage, so a step-cli release, its commit and the Go module pins it bumps move together (the x/net pin is shared with gh-build)",
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchPackageNames": [
+        "smallstep/cli",
+        "github.com/go-jose/go-jose/v4",
+        "github.com/klauspost/compress",
+        "golang.org/x/net"
+      ],
+      "groupName": "step-cli"
+    }
+  ],
+  "customManagers": [
+    {
+      "description": "Dockerfile ARG pins annotated with a `# renovate:` comment (step-cli's Go module bumps and the shared x/net pin)",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^Dockerfile$/"
+      ],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)( extractVersion=(?<extractVersion>\\S+))?\\nARG \\w+=(?<currentValue>\\S+)"
+      ]
+    },
+    {
+      "description": "The step-cli-build stage's release tag and the commit it must resolve to",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^Dockerfile$/"
+      ],
+      "matchStrings": [
+        "# renovate: smallstep/cli release tag and its commit[^\\n]*\\nARG STEP_CLI_VERSION=(?<currentValue>\\S+)\\nARG STEP_CLI_COMMIT=(?<currentDigest>[0-9a-f]{40})"
+      ],
+      "datasourceTemplate": "github-tags",
+      "depNameTemplate": "smallstep/cli",
+      "extractVersionTemplate": "^v(?<version>.*)$"
+    },
+    {
+      "description": "The gh-build stage's release tag and the commit it must resolve to",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^Dockerfile$/"
+      ],
+      "matchStrings": [
+        "# renovate: cli/cli release tag and its commit[^\\n]*\\nARG GH_VERSION=(?<currentValue>\\S+)\\nARG GH_COMMIT=(?<currentDigest>[0-9a-f]{40})"
+      ],
+      "datasourceTemplate": "github-tags",
+      "depNameTemplate": "cli/cli",
+      "extractVersionTemplate": "^v(?<version>.*)$"
+    }
+  ]
+}

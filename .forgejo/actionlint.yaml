@@ -1,0 +1,9 @@
+# Read by the devShell `actionlint` wrapper (flake.nix); actionlint only auto-discovers .github/workflows.
+self-hosted-runner:
+  labels: [container, linux, host, nixos, macos, xcode26, gpu, "ram-*", "disk-*"]
+paths:
+  .forgejo/workflows/**/*.{yml,yaml}:
+    ignore:
+      - 'specifying action "https://.+" in invalid format'
+      - 'unexpected key "enable-openid-connect" for "workflow" section'
+      - 'shellcheck reported issue in this script: SC\d+:info:'

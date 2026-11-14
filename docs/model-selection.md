@@ -1,0 +1,317 @@
+# Model Selection
+
+**Reference.** Read this when you need to know which model an agent run will
+use, or where to change it. For provider *selection* (which of Claude, Codex,
+OpenCode and pi runs an item) see the Model Selection section of
+[patterns.md](patterns.md); this doc is about tiers and the models they resolve to.
+
+## The tier vocabulary
+
+Every agent asks for a **tier**, never a concrete model id. There are four,
+best first:
+
+| Tier | Use for |
+|---|---|
+| `fable` | The best model each provider offers. Fresh planning by default, and any later phase an operator escalates by hand. |
+| `opus` | Deep analysis: architectural work, novel logic, multi-file investigation. |
+| `sonnet` | Well-defined changes following an established pattern. The default when nothing says otherwise. |
+| `haiku` | Trivial changes with no logic to get wrong — typos, comments, docs, one-line fixes. |
+
+`haiku` was called `cheap` until the vocabulary was unified, and `cheap` is still
+**read** everywhere it can appear: plan comments that were posted before the
+rename, `recommended-model:` markers in reviewer output, and
+persisted `reviewModelTier` config. Nothing writes it any more. The single
+sanctioned way to turn a string into a tier is `normalizeTier(raw)` in
+`model-selector.ts` — it maps `cheap` to `haiku` and returns `null` for anything
+that is not a tier, so a caller falls back rather than trusting model output.
+
+`fable` is deliberately not a tier `classifyComplexity()` may answer: escalating
+to the best model available is an operator decision, not a classification.
+
+## The tier table
+
+`getModel(tier, provider)` resolves a tier to a concrete model id, and
+`MODEL_TIER_TABLE` (also in `model-selector.ts`) describes the whole grid — the
+config key, environment variable, default and operator-facing label of every
+cell. The `/config` page renders that table directly, so a new tier or key shows
+up in the UI without touching the page. Saving the page does not store a model
+field left at its shipped default (or blank); only a deliberate override is kept.
+
+| Tier | Claude | Codex | OpenCode | pi |
+|---|---|---|---|---|
+| `fable` | `claudeFableModel` (default `fable`) | `codexFableModel` (defaults to `codexDefaultModel`) | `opencodeFableModel` (default `anthropic/claude-fable-5-1`) | `piFableModel` (defaults to `piBestModel`) |
+| `opus` | CLI alias `opus` | `codexDefaultModel` | `opencodeBestModel` | `piBestModel` |
+| `sonnet` | CLI alias `sonnet` | `codexLightModel` | `opencodeAdequateModel` | `piAdequateModel` |
+| `haiku` | `claudeCheapModel` (empty falls back to the `haiku` alias) | `codexCheapModel` | `opencodeCheapModel` | `piCheapModel` |
+
+Claude's `opus` and `sonnet` cells have no config key at all, and the `fable`
+cell defaults to the literal string `fable`: `claude --model <alias>` resolves an
+alias to the newest model in that tier, so these stay correct across model
+releases with no code change. Codex ids are run through `resolveCodexModel()`
+(stale-alias repair) and validated against `codex debug models` where available;
+an empty Codex key means "let the CLI pick the account's default". OpenCode ids
+carry a provider prefix: `anthropic/` runs on Anthropic directly with a
+short-lived workload identity federation token, or the Anthropic API key
+(`anthropicApiKey` / `CLAWS_ANTHROPIC_API_KEY`) as fallback when federation is
+not configured (see [OpenCode credentials](configuration.md#opencode-credentials)),
+spending API credit, and `openrouter/` runs on OpenRouter with the OpenRouter key. The
+OpenCode defaults are `anthropic/claude-fable-5-1`, `anthropic/claude-opus-5-5`,
+`anthropic/claude-sonnet-5-5` and `anthropic/claude-haiku-5-5`; an
+operator-set `openrouter/` id keeps working while an OpenRouter key is
+configured. A run whose prefix has no credential fails before spawning with `No API
+key found for anthropic` (or `openrouter`), which latches the OpenCode auth
+alert. pi ids are `provider/id`: Claws splits at
+the first `/` and runs `pi --provider <prefix> --model <rest>`. The prefix is
+`anthropic` (the Claude account), `openai-codex` (the ChatGPT account),
+`openai` (`OPENAI_API_KEY`) or `openrouter` (`OPENROUTER_API_KEY`), so an
+OpenRouter model is `openrouter/anthropic/claude-opus-4`. The defaults are
+`anthropic/claude-opus-5-5` (fable and best), `anthropic/claude-sonnet-5-5`
+and `anthropic/claude-haiku-4-5`, set with `CLAWS_PI_FABLE_MODEL`,
+`CLAWS_PI_BEST_MODEL`, `CLAWS_PI_ADEQUATE_MODEL` and `CLAWS_PI_CHEAP_MODEL`.
+See [pi credentials](configuration.md#pi-credentials) for where each
+provider's credential comes from.
+
+See [configuration.md](configuration.md) for every key's default and environment
+variable.
+
+## The per-issue model plan
+
+Every issue has a **model plan**: an optional `{provider, tier}` cell for each
+pipeline phase, stored in the `issue_model_plan` table (see
+[database-schema.md](database-schema.md#issue_model_plan-table)) and resolved by
+`resolveModelPlanCell()` in `src/model-plan.ts`. It is keyed by repository and
+issue ref, so forge issues have one too; only native issues can be edited from
+the dashboard.
+
+| Phase | Agent | Default when no cell and no older input names one (shipped tier) |
+|---|---|---|
+| `requirements` | requirements-writer, writing and refining the requirements record | claude / configured default (`opus`) |
+| `plan` | issue-refiner, fresh plan | claude / configured default (`fable`, at maximum reasoning effort) |
+| `plan-refine` | issue-refiner, re-plan on feedback and follow-up replies | claude / configured default (`opus`) for a re-plan; `sonnet` for a follow-up reply |
+| `implement` | issue-worker | weighted draw / the plan's recommendation, else the configured default (`sonnet`) |
+| `review` | pr-reviewer | weighted draw / `reviewModelTier` (`sonnet`) — the plan's review recommendation arrives as a suggested `review` cell |
+| `ci-fix` | ci-fixer (CI fix, conflicts, unrelated-fix revert) | weighted draw / `classifyComplexity()`, else the configured default (`sonnet`) |
+| `review-address` | review-addresser | weighted draw / the review round's recorded `recommended_model`, else `sonnet` |
+
+Every "configured default" is a row of the Config page's default-tier table
+(see [Default tiers](#default-tiers) below).
+
+A cell is either **explicit** — set by an operator in the Model plan grid on the
+issue page or the New Issue form — or **suggested**, written by the planner. The
+planner may end a plan with an optional line after the two recommendation lines:
+
+```
+**Model plan:** `implement=claude/sonnet` `review=opus` `ci-fix=haiku`
+```
+
+Each cell is `phase=provider/tier` or `phase=tier`. `plan-parser.ts`'s
+`parseModelPlanLine()` drops unknown phases, providers and tiers, and reads only
+the last line that *starts* with `**Model plan:**` outside a code fence, so a plan
+that quotes the format in its prose is not mistaken for one that sets it (the two
+recommendation lines are read the same way). A suggested `plan` or `requirements` cell
+is dropped: only an operator moves fresh planning or the requirements writer,
+so the planner cannot steer the runs that feed it. When a plan
+has no such line, its `Recommended implementation model` and `Recommended review
+model` lines become the suggested `implement` and `review` cells. Every new plan
+replaces the previous suggestions; a suggested write never overwrites an
+explicit cell.
+
+The grid's selects show only explicit cells. A planner suggestion is named in the
+blank option (`default (suggested: opus)`, after the fable clamp), so saving the
+form unchanged never turns a suggestion into an explicit cell; a blank phase
+clears only its explicit cell. The form is offered, and the save route accepts it,
+for any issue linked to a repository; the cells are stored under the issue's
+primary repo. An interactive session reads the grid with the
+`claws_get_issue_model_plan` MCP tool and sets or clears explicit cells with
+`claws_set_issue_model_plan`. That tool writes only the phases it names,
+through the same `setExplicitPlan`, and posts a Claws comment recording the
+change. Every phase resolves them from there, whichever repo it runs in:
+a review, review-address or CI-fix round on a multi-repo issue's PR in another
+of its repos reads the same cells.
+
+The issue page shows each phase's resolved concrete model id (`sonnet` on Codex
+reads `gpt-5.6-terra`) and which input won; a board card whose issue has any
+explicit cell carries a one-line summary of them.
+
+## Which tier a run gets
+
+Provider and tier resolve independently, in this order, highest first:
+
+1. **An explicit cell** in the issue's model plan. A cell that names a provider
+   pins it for the whole run (`strictProvider`), exactly like a `Use *` label —
+   unless that provider is disabled, in which case the cell's provider is ignored
+   and the reason lands in the "Models used" attribution.
+2. **A suggested cell.**
+3. **The agent's own legacy input**, passed as the fallback: the plan's
+   `**Recommended implementation model:**` for the implementer;
+   `classifyComplexity()` for ci-fixer; the review round's
+   `pr_reviews.recommended_model` (parsed from the reviewer model's
+   `recommended-model:` line when the round is recorded, never from the posted
+   comment) for the review-addresser. The reviewer has no legacy input: see
+   [The `review` cell](#the-review-cell). `Plan: Deep` is this layer's tier for both
+   planning phases and for a requirements write. A requirements refine run
+   passes no tier, so it takes the configured phase default, and ignores
+   `Plan: Deep`, like a follow-up reply. A follow-up reply to a question comment resolves the
+   `plan-refine` cell too, but its fallback tier is `sonnet` and it ignores
+   `Plan: Deep` — answering a question is not re-planning.
+4. **A `Use Claude` / `Use Codex` / `Use OpenCode` / `Use Pi` label** for the provider.
+5. **The phase default**: the tier from the Config page's default-tier table
+   (`getDefaultTier(phase)`, attributed as `default`; for `review` this is
+   `reviewModelTier`), and the provider from the table above.
+6. **The weighted provider draw** over the enabled `aiProviders`.
+
+**Weight 0 is pin-only.** An enabled provider with weight 0 never enters the
+weighted draw, but a cell or a `Use *` label can still pin it
+(`getPinnableProviders()`; the draw pool is `getEnabledProviderWeights()`).
+Only a disabled provider, or one with a negative or non-finite weight, has its
+pin ignored. pi and OpenCode ship this way — enabled at weight 0 — so pi runs
+only on an issue an operator pins with `Use Pi` or a `pi/…` cell such as
+`implement=pi/sonnet`, and OpenCode, which spends Anthropic API credit, only
+for a `Use OpenCode` label, an `opencode/…` cell, the jobs that pin it
+(improvement-identifier's analysis, idea-suggester), OpenCode sessions and the
+completion API's `opencode` option. Unpinned implement, review, CI-fix and
+planning runs never draw it. A draw over a pool of nothing but weight-0 providers
+still throws `NoEligibleProviderError`.
+
+A phase default provider is a preference, not a pin: planning prefers Claude but
+`runClaude` can still fall back to another provider, re-deriving the model from
+the tier (`getModel("fable", …)` for a fable plan). A PR with no linked issue —
+Dependabot, a hand-rolled branch — has no model plan and resolves from step 3
+down, exactly as before model plans existed.
+
+### Default tiers
+
+`DEFAULT_TIER_TABLE` (`src/default-tiers.ts`, re-exported from
+`model-selector.ts`) lists every default tier Claws uses when nothing more
+specific names one: one row per pipeline phase above, and one per scheduled or
+background job that runs on a fixed tier — `doc-maintainer`, `idea-suggester`,
+`friction-retrospective`, `email-monitor`, `whatsapp-handler`,
+`public-snapshot-sync` (all `sonnet`), `escalation-reviewer` (`opus`) and
+`prompt-guard-judge` (`haiku`). The Config page renders it as the "Default
+tiers" table; `getDefaultTier(key)` reads the resolved value at call time, so a
+save reaches the next run with no restart. Each row resolves from its env var
+(`CLAWS_DEFAULT_TIER_<KEY>`, e.g. `CLAWS_DEFAULT_TIER_REQUIREMENTS`; the review
+row is `CLAWS_REVIEW_MODEL_TIER`), then the config file's `defaultModelTiers`
+record (`reviewModelTier` for review), then the shipped default. The form
+stores a row only when it differs from the shipped default.
+
+A configured default is operator input, so the fable guardrail below does not
+clamp it: setting the requirements default to `fable` runs requirements on
+`fable`. One-shot helper calls inside a phase (PR descriptions, diagnoses,
+`classifyComplexity`, plan validation, session summaries), the jobs that already
+use the classifier, and improvement-identifier (its own `improvementIdentifierModel`
+setting) are not in the table.
+
+### The `review` cell
+
+pr-reviewer's tier comes from the issue's `review` cell alone, else
+`reviewModelTier`. The planner's `**Recommended review model:**` reaches it
+two ways, both as a **suggested** cell: the issue-refiner records it with the
+rest of the plan's suggestions, and the issue worker, when it opens a PR whose
+plan recommends a review model, writes it with `upsertIssueModelPlanCell` —
+but only when the issue has no `review` row yet, so neither an operator's
+explicit cell nor the planner's own suggestion is replaced. The PR body's
+`review-model:` line is still written, for humans only; nothing reads it. An
+open PR from before this change that has only the body line reviews on the
+default tier.
+
+### The fable guardrail
+
+A **suggested** cell naming `fable` for any phase other than `plan` is clamped
+to `opus` at resolution time, and shown as `opus` on the issue page. The same
+clamp applies to a `fable` in the agent's own legacy input (step 3 above): plan
+prose and a reviewer's `recommended-model:` tier are agent-written text, so a
+plan recommending a `fable` review writes a suggested `review` cell that runs
+on `opus`. Only an operator-set input can
+put a later phase on `fable` — an explicit cell, or the `Plan: Deep` label for
+`plan-refine` or a requirements write. Fresh planning is the one phase that spends Fable by default.
+
+`fable` stays out of `classifyComplexity()`'s answers for the same reason:
+escalating to the best model available is an operator decision, not a
+classification.
+
+The planner's `DEEP_PLANNING_CONTEXT` prompt block ("this issue was explicitly
+labelled for deep planning") needs both the `Plan: Deep` label and a resolved
+`fable` tier: a default fable plan gets no such text, and neither does a
+`Plan: Deep` issue whose explicit cell moved planning off fable.
+
+The `Use *` and `Plan: Deep` labels still work, one layer below the model plan.
+Retiring them in favour of the grid is follow-up work (a label migration across
+every managed repo).
+
+### When a tier's allowance runs out
+
+Claude tiers are separate per-model allowances, so `runClaude` treats two kinds
+of usage limit differently:
+
+- **Model-specific** — `You've reached your Fable limit. Switch to another model
+  to continue.` Only that tier is spent; the account can still serve the others.
+- **Account-wide** — `You've hit your weekly limit · resets 2am (Europe/London)`,
+  `You're out of extra usage · resets 5pm`. Only the Claude account that
+  produced it is held (accounts are database state managed on `/reauth`; see
+  [Claude accounts](configuration.md#claude-accounts)),
+  and the run retries at once on another account that is not held down —
+  pinned runs included. Only when no account is left does the run move to
+  another enabled provider or, when pinned, fail.
+
+**Hold length.** When the message prints `resets <h>[:mm]<am|pm> [(<zone>)]`,
+the hold ends one minute after the next such wall-clock time in that IANA zone
+(the service's own zone when none is printed, UTC when neither is valid), even
+when that is sooner than the fixed cooldown. With no reset time printed, the
+fixed cooldown is the whole hold: `providerRateLimitCooldownMs` (5 minutes) for an
+account-wide limit, an hour for a weekly one, an hour for a model-specific one.
+`resets 2am` on a weekly limit may mean a later week; the next-occurrence rule
+then under-holds, which costs one more attempt that the account retry absorbs.
+
+**Retry order for a Claude run.** Each attempt picks an account with a token
+that is not held, not held for the run's tier, not auth-expired and not
+already tried by this run, preferring the account limited least recently and
+round-robin among ties. A model-specific limit holds that tier on that account
+only; a fable run first retries on `opus` on the same account (below), and any
+other tier moves to another account with the tier free. An expired login on
+one account latches that account (alert fingerprint
+`agent-auth-expired-claude-<id>`) and the run continues on another account;
+with no account left, an unpinned run moves to another provider and a pinned
+one fails. A fable run with no account free for fable but one free for opus
+runs on opus, whatever mix of tier, account and login holds blocks fable.
+Claude counts as rate-limited — skipped by reselection, reported as
+`rateLimited` by `GET /api/providers` and refused by the completion API — only
+when every account with a token is held or auth-expired, until the first
+account comes back. A rate limit that is not an account usage limit (one the
+Ollama classifier flags, such as a 429) holds the account that hit it for
+`providerRateLimitCooldownMs` and the run moves to another account, as for a
+usage limit; it holds the whole provider only when it names no account.
+
+**Shared holds.** Holds live in the `provider_holds` table
+(`src/provider-holds.ts`), keyed `claude`, `claude@<account>`,
+`claude@<account>:<tier>`, `codex`, …, plus `auth-expired:claude@<account>`
+for an expired account login. That hold lasts `providerRateLimitCooldownMs`
+and each further auth failure renews it; once it lapses one run probes the
+account, so a token replaced outside `/reauth` or a misread error heals on
+its own. A successful run on the account or its re-login ends it early (by
+writing a lapsed row, which agent pods may do); Clear cooldown does not: every run reads them before choosing,
+and every hold is written through, so the controller, the web tier and agent
+pods act on the same holds. A pod that cannot reach the ops API keeps its own
+hold for the run and logs the failed write.
+
+On a model-specific limit a Claude `fable` run (including a deep-thinking run)
+retries once, on `opus`, on the same provider. It keeps its deep-thinking
+settings; only the model changes. The limit holds down `claude/fable` alone for
+an hour on that account — the CLI gives no reset time — and while every account
+holds fable a new fable run starts directly on `opus` instead of spending a
+doomed attempt. Runs on
+`opus`, `sonnet` or `haiku` carry on as normal. The fallback is one step: if
+`opus` then hits its own model-specific limit, `opus` is held down too and the
+run fails (pinned) or moves to another provider. A model-specific limit on a
+non-fable tier holds down that tier the same way, with no downgrade.
+
+**An explicit operator pin to `fable` also downgrades.** An explicit `plan` or
+`plan-refine` cell, the `Plan: Deep` label, or an explicit cell putting a later
+phase on `fable` all fall back to `opus` rather than fail: failing would block the
+issue on every dispatcher tick until an unknown reset. The downgrade is never
+silent — the "Models used" (or "Implemented with") attribution ends with
+`; fell back from fable (fable usage limit)`, e.g.
+`*Models used: opus (provider: claude; fell back from fable (fable usage limit))*`.
+Clearing a provider's rate-limit state from the dashboard also clears its tier
+holds; clearing one Claude account's (its Clear cooldown on `/reauth`) clears
+that account's hold and tier holds only.

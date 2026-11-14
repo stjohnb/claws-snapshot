@@ -1,0 +1,565 @@
+# CI builds through the `runtime` target on every push that touches this file,
+# deploy/**, .vex/, the scan script or the npm manifests (see the docker-build
+# job's change filter in .forgejo/workflows/ci.yml), so the
+# secret-scanning RUN blocks below and the zsh smoke test actually execute
+# before merge, not only on `main` via release.yml.
+# golang.org/x/net pin shared by the step-cli-build and gh-build stages, so Renovate
+# bumps it once (each stage re-declares it bare to receive the value).
+# renovate: datasource=go depName=golang.org/x/net
+ARG X_NET_VERSION=v0.62.0
+ARG CLAWS_SESSION_SHELL_IMAGE=registry.home.bstjohn.net/st-john-software/claws-session-shell:latest
+
+# ── Build stage ───────────────────────────────────────────────────────
+FROM node:26.13.0-bookworm-slim@sha256:add5c17c14752c54d2f3d519ec46a3815684d41c33f198bcb09fb998f7dcbf68 AS builder
+
+WORKDIR /src
+
+# Install build-time deps for better-sqlite3 / node-pty native modules
+# Run #1406 stalled 35 min after `Ign:1 http://deb.debian.org/debian bookworm
+# InRelease` because apt has no default network timeout. Time out quickly and
+# retry, as with the npm ci loop below (#2862).
+RUN set -e; \
+    printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' > /etc/apt/apt.conf.d/80-claws-network; \
+    ok=0; \
+    for i in 1 2 3; do \
+      if timeout --kill-after=30s 300s sh -c 'apt-get update && apt-get install -y --no-install-recommends python3 make g++ ca-certificates'; then ok=1; break; fi; \
+      echo "apt attempt $i failed" >&2; \
+      rm -rf /var/lib/apt/lists/*; \
+      sleep 5; \
+    done; \
+    if [ "$ok" != 1 ]; then echo "apt-get failed after 3 attempts" >&2; exit 1; fi ; \
+    rm -rf /var/lib/apt/lists/*
+
+COPY package.json package-lock.json ./
+
+# better-sqlite3 13 and node-pty 1.1 ship no prebuilt binary, so npm always
+# runs `node-gyp rebuild`. Left alone, node-gyp first downloads the Node
+# headers tarball from nodejs.org — a fetch with no timeout, which on
+# 2026-09-04 left two release builds asleep in node-gyp for 6 hours (#2862).
+# The base image already carries the matching headers under
+# /usr/local/include/node, so compile against those and never fetch.
+ENV npm_package_config_node_gyp_nodedir=/usr/local
+
+# esbuild's postinstall writes its native binary then immediately execs it to
+# verify; under BuildKit/overlayfs this intermittently fails with ETXTBSY
+# ("text file busy"). Retry to absorb that race (#1745). The `timeout` is the
+# backstop for #2862: a stall becomes exit 124, which the retry can absorb.
+RUN set -e; \
+    test -f /usr/local/include/node/node.h && test -f /usr/local/include/node/common.gypi \
+      || { echo "node headers are not at /usr/local/include/node — npm_package_config_node_gyp_nodedir is wrong for this base image" >&2; exit 1; }; \
+    ok=0; \
+    for i in 1 2 3; do \
+      echo "npm ci attempt $i"; \
+      s=0; \
+      timeout --kill-after=30s 600s npm ci || s=$?; \
+      if [ "$s" = 0 ]; then ok=1; break; fi; \
+      if [ "$s" = 124 ] || [ "$s" = 137 ]; then \
+        echo "attempt $i exceeded the 10m timeout and was killed (native-module build stall?)" >&2; \
+      else \
+        echo "attempt $i failed with exit $s, cleaning node_modules and retrying after 3s..." >&2; \
+      fi; \
+      rm -rf node_modules; \
+      sleep 3; \
+    done; \
+    [ "$ok" = 1 ] || { echo "npm ci failed after 3 attempts" >&2; exit 1; }
+
+COPY tsconfig.json tsconfig.client.json ./
+COPY scripts ./scripts
+COPY src ./src
+
+# Stamps the release tag into the built image so CLAWS_SESSION_IMAGE
+# defaults correctly; release.yml passes the real tag as a build arg.
+ARG CLAWS_VERSION=dev
+RUN echo "export const VERSION = \"$CLAWS_VERSION\";" > src/version.ts
+
+RUN npm run build \
+ && npm prune --omit=dev
+
+# ── Shared shell source stage ─────────────────────────────────────────
+# Published by St-John-Software/nixos-config#411. Keep this as the source of
+# truth for zsh/git/SSH defaults; the final Claws image remains the app runtime.
+# Source commit: c63fd990 (nixos-config "Post-cutover SSH aliases, records and
+# Samba clean-up (6/7) (#32)").
+FROM ${CLAWS_SESSION_SHELL_IMAGE} AS session-shell
+
+# Extract with Debian tools independently of the upstream user and Nix database.
+# The complete source store retains every transitive shell dependency.
+FROM node:26.13.0-bookworm-slim@sha256:add5c17c14752c54d2f3d519ec46a3815684d41c33f198bcb09fb998f7dcbf68 AS session-shell-defaults
+USER root
+# All of /nix, not only the store: /nix/var/nix/registration is the Nix
+# database registration the runtime stage loads. Copying the parent keeps a
+# session shell that lacks it buildable up to the guard below, which names the fix.
+COPY --from=session-shell /nix /nix
+COPY --from=session-shell /home/brendan /home/brendan
+
+# Home Manager embeds its build user's home, including in configurations
+# sourced by store path. Adapt the private runtime copy as well. This edits
+# registered store paths in place, so their contents no longer match the
+# hashes in /nix/var/nix/registration: `nix store verify --check-contents`
+# would fail, and nothing may run `nix-collect-garbage`, which would delete
+# paths the runtime image depends on.
+RUN set -e; \
+    mkdir -p /claws-skel; \
+    cp -aL /home/brendan/. /claws-skel/; \
+    chmod -R u+rwX /claws-skel; \
+    # Pods have no D-Bus or /etc/machine-id, so the desktop libsecret credential
+    # helper only prints a glib CRITICAL; Claws passes its own helper per URL.
+    if [ -f /claws-skel/.config/git/config ]; then sed -i '/^[[:space:]]*helper[[:space:]]*=.*libsecret/d' /claws-skel/.config/git/config; fi; \
+    if grep -rIq libsecret /claws-skel/.config/git /claws-skel/.gitconfig 2>/dev/null; then echo "libsecret still in skel git config" >&2; exit 1; fi; \
+    grep -rIlZ '/home/brendan' /claws-skel /nix/store > /tmp/claws-home-files; \
+    xargs -0 -r sed -i 's|/home/brendan|/home/claws|g' < /tmp/claws-home-files; \
+    if grep -rIl '/home/brendan' /claws-skel /nix/store; then exit 1; fi; \
+    test -f /claws-skel/.zshrc; \
+    test -f /claws-skel/.ssh/config; \
+    grep -Eiq 'Host[[:space:]]+(nas|ryzen|brendans-macbook-pro)' /claws-skel/.ssh/config; \
+    forbidden='sirius|\.sde|cpartifactory|BEGIN (OPENSSH|RSA|EC|DSA) PRIVATE KEY|known_hosts|kubeconfig|KUBECONFIG|ghp_|github_pat_|sk-[A-Za-z0-9]'; \
+    if grep -RIE "$forbidden" /claws-skel; then exit 1; fi; \
+    if find /claws-skel \( -name 'known_hosts*' -o -name 'id_rsa*' -o -name 'id_dsa*' \
+      -o -name 'id_ecdsa*' -o -name 'id_ed25519*' -o -name '*kubeconfig*' -o -name '.netrc' \
+      -o -name '*.pem' -o -name '*.p12' -o -name '*.pfx' -o -name '*.key' -o -name '*.sde' \
+      -o -name '.kube' -o -name '.gnupg' -o -name '.aws' \) -print | grep .; then exit 1; fi; \
+    grep -RhoE "/nix/store/[0-9a-z]{32}-[^[:space:]\"'\\)]+" /claws-skel | sort -u > /tmp/claws-skel-store-paths; \
+    if xargs -r grep -RIE "$forbidden" < /tmp/claws-skel-store-paths; then exit 1; fi
+
+# The whole store ships to the runtime image, not only the paths /claws-skel
+# references, so scan all of it. The patterns are deliberately narrower than
+# $forbidden above: a package closure legitimately contains the words
+# `known_hosts` (zsh's ssh completion), `kubeconfig` and `sk-…` (`disk-utils`),
+# so those become name-based checks here while the content scan keeps the
+# patterns that cannot match ordinary nixpkgs output. The PEM BEGIN marker is
+# checked separately, anchored to the start of a line: shared-mime-info's
+# freedesktop.org.xml legitimately embeds
+# `-----BEGIN PGP PRIVATE KEY BLOCK-----` mid-line as a MIME magic-byte
+# signature for detecting PGP key files, not an actual key — a real PEM file
+# always starts its BEGIN line at column 0.
+#
+# One benign allowance: nixpkgs cracklib installs its plain-text dictionary
+# `cracklib-small` and the packed `pw_dict.{hwm,pwd,pwi}` under
+# `share/cracklib/`. The word list contains dictionary words such as `sirius`.
+# `--exclude-dir=cracklib` skips only directories with that exact basename, so
+# every other store path is still scanned. Added in #263 after run 887 matched
+# the word list. The self-test below proves the scan still bites outside it.
+RUN set -e; \
+    store_forbidden='sirius|cpartifactory|ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{30,}|sk-ant-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}'; \
+    store_scan() { grep -rIE --exclude-dir=cracklib "$store_forbidden" "$@"; }; \
+    selftest=$(mktemp -d); \
+    mkdir -p "$selftest/plain" "$selftest/share/cracklib"; \
+    echo 'Host sirius' > "$selftest/plain/ssh_config"; \
+    echo 'sirius' > "$selftest/share/cracklib/cracklib-small"; \
+    store_scan "$selftest" > /tmp/store-scan-selftest || true; \
+    if [ "$(wc -l < /tmp/store-scan-selftest)" -ne 1 ] || ! grep -q '/plain/ssh_config' /tmp/store-scan-selftest; then \
+      echo "error: store secret scan self-test failed (planted string missed or cracklib allowance too broad)" >&2; \
+      cat /tmp/store-scan-selftest >&2; exit 1; \
+    fi; \
+    rm -rf "$selftest" /tmp/store-scan-selftest; \
+    if store_scan /nix/store; then exit 1; fi; \
+    if grep -rIE '^-----BEGIN (OPENSSH|RSA|EC|DSA|PGP) PRIVATE KEY' /nix/store; then exit 1; fi; \
+    if find /nix/store \( -name 'known_hosts*' -o -name 'id_rsa' -o -name 'id_dsa' \
+      -o -name 'id_ecdsa' -o -name 'id_ed25519' -o -name '*kubeconfig*' -o -name '.netrc' \
+      -o -name '*.sde' -o -name '.kube' -o -name '.gnupg' -o -name '.aws' \) -print | grep .; then exit 1; fi
+
+# fleet-infra's image-scan scans the copied store. Nix gh duplicated the pinned gh
+# in the runtime stage, and gitleaks 8.30.1 pins vulnerable Go modules with no
+# fixed release, so neither may ship. Fail here rather than in the fleet-infra
+# scan if the published session shell regresses.
+RUN if find /nix/store -maxdepth 1 \( -name '*-gh-[0-9]*' -o -name '*-gitleaks-[0-9]*' \) -print | grep .; then \
+      echo "error: session shell store contains gh or gitleaks; fleet-infra image-scan will fail (fix nixos-config home/common.nix clawsSession)" >&2; \
+      exit 1; \
+    fi
+
+# Export the package profile's executable links, retaining the store targets.
+# Fail on a missing/ambiguous profile instead of silently dropping shell tools.
+RUN set -e; \
+    set -- /nix/store/*-home-manager-path; \
+    test "$#" -eq 1; \
+    test -d "$1/bin"; \
+    mkdir -p /claws-shell-profile; \
+    cp -a "$1/bin" /claws-shell-profile/bin
+
+# Agent pods run single-user Nix (no daemon) from this profile over the copied
+# store, so each repo's flake devShell works (clw_01M5WMKGESZQKEGQW0T8V91MBW).
+RUN if [ ! -e /claws-shell-profile/bin/nix ] || [ ! -f /nix/var/nix/registration ]; then \
+      echo "error: session shell lacks bin/nix or /nix/var/nix/registration (update St-John-Software/nixos-config home/common.nix clawsSession)" >&2; \
+      exit 1; \
+    fi
+
+# ── step CLI build stage ──────────────────────────────────────────────
+# The released step-cli .deb (v0.31.0, the newest release) is built with Go
+# 1.27.1 and carries go-jose v4.1.4, klauspost/compress v1.18.0 and
+# golang.org/x/net v0.59.0: seven fixable HIGH findings across six advisories (CVE-2026-116587,
+# CVE-2026-63209, CVE-2026-78667, CVE-2026-78669, CVE-2026-97031,
+# CVE-2026-111943); x/net v0.60.0 adds CVE-2026-78661 and CVE-2026-97045
+# (fixed in v0.62.0). These block the image scan gate. Build the same tag from
+# source on a fixed Go with those three modules bumped; go.sum entries are
+# checked against sum.golang.org. Drop the bumps (or the whole stage, back to
+# the release .deb) once a step-cli release ships fixed versions.
+#
+# Renovate (renovate.json customManagers, group "step-cli") tracks the
+# step-cli release and its commit, and each module pin below, in one PR. When
+# that PR bumps STEP_CLI_VERSION, check the new release's go.mod: a module it
+# already requires at or above the pinned version must have its bump raised or
+# dropped from the `go get` line, or `go get` would downgrade it. The PR's
+# docker-build CI job builds this stage and shows any break.
+FROM golang:1.27.3-bookworm@sha256:dc0963f32053e4bc451d24d87e3892d42d01021b61f093e98eb95c0352bb84b0 AS step-cli-build
+# renovate: smallstep/cli release tag and its commit (renovate.json's step-cli manager)
+ARG STEP_CLI_VERSION=0.31.0
+ARG STEP_CLI_COMMIT=8301c0dfb1546ccddb808375b9f9311be03c2ba9
+# renovate: datasource=go depName=github.com/go-jose/go-jose/v4
+ARG GO_JOSE_VERSION=v4.1.9
+# renovate: datasource=go depName=github.com/klauspost/compress
+ARG KLAUSPOST_COMPRESS_VERSION=v1.20.3
+ARG X_NET_VERSION
+# Fail the build if step-cli's go.mod asks for a newer toolchain, rather than
+# silently downloading one and undoing the fixed-Go pin.
+ENV GOTOOLCHAIN=local
+RUN set -e; \
+    git clone -q --depth 1 --branch "v${STEP_CLI_VERSION}" https://github.com/smallstep/cli.git /src/step-cli; \
+    cd /src/step-cli; \
+    test "$(git rev-parse HEAD)" = "$STEP_CLI_COMMIT" || { echo "step-cli v${STEP_CLI_VERSION} is not commit $STEP_CLI_COMMIT" >&2; exit 1; }; \
+    go get "github.com/go-jose/go-jose/v4@${GO_JOSE_VERSION}" "github.com/klauspost/compress@${KLAUSPOST_COMPRESS_VERSION}" "golang.org/x/net@${X_NET_VERSION}"; \
+    CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.Version=${STEP_CLI_VERSION}" -o /out/step-cli ./cmd/step; \
+    /out/step-cli version
+
+# ── gh build stage ────────────────────────────────────────────────────
+# The release gh (v2.103.3, the newest) pins golang.org/x/net v0.60.0, which
+# carries CVE-2026-78661 / CVE-2026-97045 (fixed in v0.62.0) and blocks the image
+# scan gate; gh uses x/net/html via bluemonday, so a VEX statement cannot apply.
+# Build the same tag from source with x/net bumped. Drop this stage and go back to
+# the release .deb once a gh release ships x/net >= v0.62.0.
+FROM golang:1.27.3-bookworm@sha256:dc0963f32053e4bc451d24d87e3892d42d01021b61f093e98eb95c0352bb84b0 AS gh-build
+# renovate: cli/cli release tag and its commit (renovate.json's gh manager)
+ARG GH_VERSION=2.103.3
+ARG GH_COMMIT=63837fb778d6a39f02be0ce76ff89f2bc8d74bdc
+ARG X_NET_VERSION
+ENV GOTOOLCHAIN=local
+RUN set -e; git clone -q --depth 1 --branch "v${GH_VERSION}" https://github.com/cli/cli.git /src/gh; cd /src/gh; \
+    test "$(git rev-parse HEAD)" = "$GH_COMMIT" || { echo "gh v${GH_VERSION} is not commit $GH_COMMIT" >&2; exit 1; }; \
+    go get "golang.org/x/net@${X_NET_VERSION}"; \
+    CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X github.com/cli/cli/v2/internal/build.Version=${GH_VERSION}" -o /out/gh ./cmd/gh; \
+    /out/gh --version
+
+# ── Runtime stage ─────────────────────────────────────────────────────
+FROM node:26.13.0-bookworm-slim@sha256:add5c17c14752c54d2f3d519ec46a3815684d41c33f198bcb09fb998f7dcbf68 AS runtime
+
+# Runtime binaries claws shells out to:
+#   git          — clone/worktree operations
+#   tmux         — interactive session backing store
+#   openssh-client — runner and session SSH
+#   netcat-openbsd — `nc -X 5`, the ProxyCommand session ssh configs use to
+#                  reach tailnet hosts through Claws' SOCKS5 egress proxy
+#   step-cli     — signs per-session and per-job SSH certificates (below)
+#   gh           — GitHub CLI (token injected via env per-call), built from
+#                  source in the gh-build stage
+#   jq, sqlite3, curl, ca-certificates — ancillary scripting
+#   ripgrep, fd-find — preinstalled so pi uses them from PATH instead of
+#                  downloading its own unverified copies per run
+#   cups-client  — lp/lpstat/cancel for the `print` session capability;
+#                  CUPS_SERVER is only set in sessions granted it
+#   python3, make, g++ — node-gyp, so a plain `npm ci` in an agent pod builds
+#                  native modules (better-sqlite3 and node-pty compile when the repo approves them in package.json allowScripts)
+#   procps       — ps, so agents can inspect their own processes
+#   corepack     — yarn/pnpm shims; Node 26 images no longer bundle corepack
+#                  or yarn, so it is installed from npm below
+RUN set -e; \
+    printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' > /etc/apt/apt.conf.d/80-claws-network; \
+    ok=0; \
+    for i in 1 2 3; do \
+      if timeout --kill-after=30s 600s sh -c 'apt-get update && apt-get install -y --no-install-recommends git tmux zsh openssh-client netcat-openbsd ca-certificates curl jq sqlite3 tini util-linux ripgrep fd-find cups-client python3 make g++ procps'; then ok=1; break; fi; \
+      echo "apt attempt $i failed" >&2; \
+      rm -rf /var/lib/apt/lists/*; \
+      sleep 5; \
+    done; \
+    if [ "$ok" != 1 ]; then echo "apt-get failed after 3 attempts" >&2; exit 1; fi ; \
+    ln -s /usr/bin/fdfind /usr/local/bin/fd; \
+    rm -rf /var/lib/apt/lists/*
+
+# step CLI (smallstep), for Claws to sign per-session and per-job SSH
+# certificates with the in-house CA (#clw_01M4TVENKC78XCG6CX2VDCEEEE). Built
+# from source in the step-cli-build stage above, so the image scan gate
+# (scripts/ci/image-scan.sh) sees no fixable High/Critical findings in it.
+COPY --from=step-cli-build /out/step-cli /usr/bin/step-cli
+# gh, built from source in the gh-build stage above.
+COPY --from=gh-build /out/gh /usr/bin/gh
+RUN gh --version
+RUN ln -sf /usr/bin/step-cli /usr/local/bin/step && step version
+
+# Compile native modules against the base image's bundled headers and never
+# fetch them from nodejs.org (see the builder stage, #2862) — for agents'
+# `npm ci` as much as for the global installs below. The
+# `npm_package_config_node_gyp_` prefix is used because npm 11.20 warns on
+# unknown `npm_config_*` keys such as `nodedir`, and node-gyp reads this prefix
+# too. Nix (wired up after the store copy) verifies substitutes against
+# Debian's CA bundle.
+ENV npm_package_config_node_gyp_nodedir=/usr/local \
+    NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+
+# kubectl is deliberately absent: sessions and agents hold no cluster
+# credentials, and Claws itself talks to the API server through src/k8s/api.ts.
+
+# AI CLIs. Claude is required; Codex / OpenCode / Pi are soft-failed because
+# upstream package renames happen frequently and we don't want releases
+# to break for an optional fallback provider. release.yml passes
+# CLAUDE_CODE_VERSION, CODEX_VERSION, OPENCODE_VERSION and PI_VERSION with the
+# exact versions it resolved from npm and records them in the release notes;
+# `latest` is only the default for local/manual builds. Their transitive
+# dependency trees are resolved by npm at build time (an accepted gap in
+# docs/security.md) and checked by the image scan gate.
+ARG CLAUDE_CODE_VERSION=latest
+ARG CODEX_VERSION=latest
+ARG OPENCODE_VERSION=latest
+ARG PI_VERSION=latest
+RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} \
+ && (npm install -g @openai/codex@${CODEX_VERSION} || echo "codex install failed — soft fail") \
+ && (npm install -g opencode-ai@${OPENCODE_VERSION} || echo "opencode install failed — soft fail") \
+ && (npm install -g --ignore-scripts @earendil-works/pi-coding-agent@${PI_VERSION} || echo "pi install failed — soft fail")
+
+# yarn and pnpm shims. Node 25+ no longer bundles corepack and this image
+# ships no yarn; corepack honours each repo's `packageManager` pin and
+# downloads that version lazily on first use. Never prompt or rewrite a
+# repo's package.json.
+# renovate: datasource=npm depName=corepack
+ARG COREPACK_VERSION=0.36.0
+RUN npm install -g corepack@${COREPACK_VERSION} && corepack enable && command -v yarn pnpm
+ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
+    COREPACK_ENABLE_AUTO_PIN=0
+
+# Stopgap until a node:26 tag bundles an npm whose own undici is >= 6.29.1 (CVE-2026-109869) and
+# brace-expansion >= 5.0.11 (npm 12.2.0 still ships 6.28.0 / 5.0.9, both with
+# fixable HIGH CVEs the fleet-infra image scan blocks on). Swap the bundled
+# copies for fixed releases; node-gyp needs undici ^6.25.0 and minimatch
+# brace-expansion ^5.0.5, so both stay in range. The assertions fail the build
+# if a future npm reshuffles its tree.
+RUN npmdir=/usr/local/lib/node_modules/npm/node_modules \
+ && tmp="$(mktemp -d)" \
+ && cd "$tmp" \
+ && npm pack --silent undici@6.29.1 brace-expansion@5.0.12 \
+ && for pkg in undici brace-expansion; do \
+      rm -rf "$npmdir/$pkg" && mkdir "$npmdir/$pkg" \
+      && tar -xzf "$tmp/$pkg"-*.tgz -C "$npmdir/$pkg" --strip-components=1; \
+    done \
+ && cd / && rm -rf "$tmp" \
+ && test "$(node -p "require('$npmdir/undici/package.json').version")" = 6.29.1 \
+ && test "$(node -p "require('$npmdir/brace-expansion/package.json').version")" = 5.0.12 \
+ && npm --version >/dev/null \
+ && npm config list >/dev/null
+
+# Stopgap until Pi ships with undici >= 8.12.2 (CVE-2026-109869): it pins
+# undici 8.10.2 exactly. No-op when the soft-fail Pi install is missing.
+RUN pidir=/usr/local/lib/node_modules/@earendil-works/pi-coding-agent \
+ && if [ -d "$pidir" ]; then \
+      tmp="$(mktemp -d)" && cd "$tmp" \
+      && npm pack --silent undici@8.12.2 \
+      && find "$pidir" -type d -name undici -path '*/node_modules/undici' | while read -r d; do \
+           v="$(node -p "require('$d/package.json').version")"; \
+           case "$v" in 8.*) \
+             if [ "$(printf '%s\n8.12.2\n' "$v" | sort -V | head -n1)" != 8.12.2 ]; then \
+               rm -rf "$d" && mkdir "$d" \
+               && tar -xzf "$tmp"/undici-*.tgz -C "$d" --strip-components=1; \
+             fi;; \
+           esac; \
+         done \
+      && cd / && rm -rf "$tmp"; \
+    fi
+
+RUN userdel -r node 2>/dev/null || true \
+ && groupdel node 2>/dev/null || true \
+ && useradd -m -u 1000 -s /bin/bash claws
+
+# Capabilities granted to a running session pod land in its mounted
+# granted-env; every shell sources it so the vars need no manual step. The
+# pod sets BASH_ENV for the normal non-interactive path; bash with a socket on
+# stdin and SHLVL < 2 (the agent's own Bash tool and other node-spawned shells)
+# skips BASH_ENV and runs /etc/bash.bashrc then ~/.bashrc, so the hook must
+# precede Debian's interactive-only `return` at the top of that file. The other
+# hooks cover login bash (profile.d) and every zsh (zshenv). The file is absent
+# in the service container, so the hook is a no-op there.
+RUN hook='[ -r /etc/claws-workload/granted-env ] && . /etc/claws-workload/granted-env' \
+ && printf '%s\n' "$hook" > /etc/profile.d/claws-granted-env.sh \
+ && mkdir -p /etc/zsh \
+ && { printf '%s\n' "$hook"; cat /etc/bash.bashrc; } > /tmp/bb \
+ && mv /tmp/bb /etc/bash.bashrc \
+ && chmod 0644 /etc/bash.bashrc \
+ && printf '\n%s\n' "$hook" >> /etc/zsh/zshenv \
+ && head -n1 /etc/bash.bashrc | grep -q claws-workload/granted-env \
+ && mkdir -p /etc/claws-workload \
+ && chmod 0755 /etc/claws-workload \
+ && smoke='const r=require("child_process").spawnSync("/bin/bash",["-c","echo ${CLAWS_SMOKE_GRANT-unset}"],{stdio:["pipe","pipe","inherit"]});process.stdout.write(r.stdout)' \
+ && echo 'export CLAWS_SMOKE_GRANT=yes' > /etc/claws-workload/granted-env \
+ && chmod 0644 /etc/claws-workload/granted-env \
+ && test "$(runuser -u claws -- env -u SHLVL HOME=/home/claws node -e "$smoke")" = yes \
+ && : > /etc/claws-workload/granted-env \
+ && test "$(runuser -u claws -- env -u SHLVL HOME=/home/claws node -e "$smoke")" = unset \
+ && rm -rf /etc/claws-workload
+
+COPY --from=session-shell-defaults /claws-skel /etc/skel
+COPY --from=session-shell-defaults --chown=claws:claws /nix/store /nix/store
+COPY --from=session-shell-defaults --chown=claws:claws /nix/var/nix/registration /nix/var/nix/registration
+COPY --from=session-shell-defaults /claws-shell-profile /opt/claws/shell-profile
+# Keep the Node runtime and Debian tools first. Session startup prepends its
+# authentication shim to this inherited PATH.
+ENV PATH="${PATH}:/opt/claws/shell-profile/bin"
+
+# Single-user Nix: claws owns /nix, so `nix` uses the local store directly
+# instead of falling back to a user-namespace chroot store, which the pod's
+# security context forbids ("setting up a private mount namespace: Operation
+# not permitted"). The copied store is registered from the session shell's
+# closureInfo registration.
+#
+# Substituters: the in-cluster ncps pull-through cache (fleet-infra
+# apps/nix-cache) first, so a fresh pod copies devShell closures over the LAN
+# instead of from the internet, then cache.nixos.org as the fallback. ncps runs
+# with sign-narinfo: false and passes cache.nixos.org's signatures through
+# unchanged, so cache.nixos.org's key is the only trusted key. connect-timeout
+# and fallback keep a cache outage (or use outside the cluster, where the name
+# does not resolve) down to a few seconds instead of a failed substitution.
+RUN set -e; \
+    mkdir -p /nix/var/nix/db /nix/var/nix/profiles /nix/var/nix/gcroots \
+      /nix/var/nix/temproots /nix/var/nix/userpool /nix/var/log/nix /etc/nix; \
+    chown claws:claws /nix /nix/store /nix/var; \
+    chown -R claws:claws /nix/var/nix /nix/var/log; \
+    printf '%s\n' \
+      'experimental-features = nix-command flakes' \
+      'sandbox = false' \
+      'build-users-group =' \
+      'warn-dirty = false' \
+      'substituters = http://nix-cache.default.svc.cluster.local:8501 https://cache.nixos.org' \
+      'trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=' \
+      'connect-timeout = 5' \
+      'fallback = true' \
+      > /etc/nix/nix.conf; \
+    nix_home="$(mktemp -d)"; chown claws:claws "$nix_home"; \
+    runuser -u claws -- env HOME="$nix_home" nix-store --load-db < /nix/var/nix/registration; \
+    rm -rf "$nix_home"
+
+# Shipped before the smoke tests below, which read /etc/ssh/ssh_known_hosts:
+# the fleet host CA's single @cert-authority line, and the include of the
+# per-session ssh config the session runtime writes from its ssh:* grants.
+COPY --chmod=0644 deploy/ssh-known-hosts /etc/ssh/ssh_known_hosts
+RUN printf '%s\n' '# Per-alias Host blocks for the ssh:* grants of this session, written by the Claws session runtime.' \
+      'Include /run/claws/ssh/config' > /etc/ssh/ssh_config.d/50-claws.conf \
+ && chmod 0644 /etc/ssh/ssh_config.d/50-claws.conf \
+ && grep -q '^Include /etc/ssh/ssh_config.d/\*\.conf' /etc/ssh/ssh_config
+
+RUN set -e; \
+    test -f /etc/skel/.zshrc; \
+    zsh -n /etc/skel/.zshrc; \
+    test -f /etc/skel/.ssh/config; \
+    grep -Eiq 'Host[[:space:]]+(nas|ryzen|brendans-macbook-pro)' /etc/skel/.ssh/config; \
+    forbidden='sirius|\.sde|cpartifactory|BEGIN (OPENSSH|RSA|EC|DSA) PRIVATE KEY|known_hosts|kubeconfig|KUBECONFIG|ghp_|github_pat_|sk-[A-Za-z0-9]'; \
+    if grep -RIE "$forbidden" /etc/skel; then exit 1; fi; \
+    if find /etc/skel \( -name 'known_hosts*' -o -name 'id_rsa*' -o -name 'id_dsa*' \
+      -o -name 'id_ecdsa*' -o -name 'id_ed25519*' -o -name '*kubeconfig*' -o -name '.netrc' \
+      -o -name '*.pem' -o -name '*.p12' -o -name '*.pfx' -o -name '*.key' -o -name '*.sde' \
+      -o -name '.kube' -o -name '.gnupg' -o -name '.aws' \) -print | grep .; then exit 1; fi; \
+    if find /nix/store \( -name 'known_hosts*' -o -name 'id_rsa' -o -name 'id_dsa' \
+      -o -name 'id_ecdsa' -o -name 'id_ed25519' -o -name '*kubeconfig*' -o -name '.netrc' \
+      -o -name '*.sde' -o -name '.kube' -o -name '.gnupg' -o -name '.aws' \) -print | grep .; then exit 1; fi; \
+    test ! -e /home/brendan; \
+    smoke_home=/home/claws; \
+    cp -a /etc/skel/. "$smoke_home/"; \
+    chown -R 1000:1000 "$smoke_home"; \
+    if ! runuser -u claws -- env HOME="$smoke_home" zsh -i -c 'set -e; \
+      test "$(id -u)" = 1000; \
+      test "$HISTFILE" = "$HOME/.zsh_history"; touch "$HISTFILE"; \
+      test -n "$EDITOR"; command -v "$EDITOR" >/dev/null; \
+      command -v "$(git var GIT_EDITOR)" >/dev/null; \
+      for tool in vim fzf eza; do command -v "$tool" >/dev/null; done; \
+      test "$(command -v node)" = /usr/local/bin/node' > /tmp/claws-zsh-startup.log 2>&1; then cat /tmp/claws-zsh-startup.log; exit 1; fi; \
+    if [ -s /tmp/claws-zsh-startup.log ]; then cat /tmp/claws-zsh-startup.log; exit 1; fi; \
+    test -z "$(runuser -u claws -- env HOME="$smoke_home" git config --global --get-all credential.helper)"; \
+    runuser -u claws -- env HOME="$smoke_home" sh -c 'for file in "$HOME/.zshrc" "$HOME/.ssh/config"; do printf "\n# edit smoke test\n" >> "$file"; done'; \
+    test "$(grep -vc '^#' /etc/ssh/ssh_known_hosts)" = 1; \
+    grep -qE '^@cert-authority \* ecdsa-sha2-nistp256 ' /etc/ssh/ssh_known_hosts; \
+    ssh_cfg="$(runuser -u claws -- env HOME="$smoke_home" ssh -G ryzen)"; \
+    echo "$ssh_cfg" | grep -qE '^globalknownhostsfile /etc/ssh/ssh_known_hosts( |$)'; \
+    echo "$ssh_cfg" | grep -qx 'stricthostkeychecking ask'; \
+    for pair in thinkcentre:192.168.0.251; do \
+      host_cfg="$(runuser -u claws -- env HOME="$smoke_home" ssh -G "${pair%%:*}")"; \
+      echo "$host_cfg" | grep -qx "hostname ${pair##*:}"; \
+      echo "$host_cfg" | grep -qx 'user brendan'; \
+      echo "$host_cfg" | grep -qE '^globalknownhostsfile /etc/ssh/ssh_known_hosts( |$)'; \
+    done; \
+    mkdir -p /run/claws/ssh; \
+    printf '%s\n' 'Host prod-cluster prod-cluster-11.tailc20cf.ts.net' '  HostName prod-cluster-11.tailc20cf.ts.net' '  User root' \
+      '  ProxyCommand nc -X 5 -x tailnet-ssh-egress.tailnet-ssh-egress.svc.cluster.local:1055 %h %p' \
+      '  IdentityFile /run/claws/ssh/prod-cluster' '  CertificateFile /run/claws/ssh/prod-cluster-cert.pub' '  IdentitiesOnly yes' '  StrictHostKeyChecking yes' \
+      'Host ryzen' '  HostName 192.168.0.69' '  User brendan' '  IdentityFile /run/claws/ssh/ryzen' '  CertificateFile /run/claws/ssh/ryzen-cert.pub' \
+      '  IdentitiesOnly yes' '  StrictHostKeyChecking yes' \
+      > /run/claws/ssh/config; \
+    chown -R claws:claws /run/claws; \
+    prod_cfg="$(runuser -u claws -- env HOME="$smoke_home" ssh -G prod-cluster)"; \
+    echo "$prod_cfg" | grep -qx 'hostname prod-cluster-11.tailc20cf.ts.net'; \
+    echo "$prod_cfg" | grep -qx 'user root'; \
+    echo "$prod_cfg" | grep -qx 'port 22'; \
+    echo "$prod_cfg" | grep -qx 'stricthostkeychecking true'; \
+    echo "$prod_cfg" | grep -q '^proxycommand nc -X 5 -x tailnet-ssh-egress'; \
+    # The seeded ~/.ssh/config is read first but sets no StrictHostKeyChecking,
+    # so a granted home alias's block still fails closed.
+    runuser -u claws -- env HOME="$smoke_home" ssh -G ryzen | grep -qx 'stricthostkeychecking true'; \
+    rm -rf /run/claws; \
+    test ! -e /home/brendan; \
+    rm -rf "$smoke_home"
+
+WORKDIR /opt/claws
+COPY --from=builder --chown=claws:claws /src/dist ./dist
+COPY --from=builder --chown=claws:claws /src/node_modules ./node_modules
+COPY --from=builder --chown=claws:claws /src/package.json ./package.json
+COPY --chown=claws:claws .skills /opt/claws/deploy/skills
+COPY --chown=claws:claws --chmod=0755 deploy/install-skills.sh deploy/container-entrypoint.sh /opt/claws/deploy/
+
+# Fail the build if any shipped copy is below its fixed version; fleet-infra's
+# image-scan blocks on CVE-2026-109869 (undici 6.x < 6.29.1, 8.x < 8.12.2) and
+# CVE-2026-111181 (body-parser < 2.4.0).
+RUN node -e '\
+const fs=require("fs"),path=require("path");\
+const lt=(a,b)=>{const x=a.split(".").map(Number),y=b.split(".").map(Number);for(let i=0;i<3;i++){if(x[i]!==y[i])return x[i]<y[i];}return false;};\
+const bad=[];\
+const walk=d=>{let es;try{es=fs.readdirSync(d,{withFileTypes:true});}catch{return;}\
+for(const e of es){const p=path.join(d,e.name);if(e.isSymbolicLink())continue;\
+if(e.isDirectory())walk(p);else if(e.name==="package.json"){try{const j=JSON.parse(fs.readFileSync(p,"utf8"));\
+const v=String(j.version||"");\
+if((j.name==="undici"&&((v.startsWith("6.")&&lt(v,"6.29.1"))||(v.startsWith("8.")&&lt(v,"8.12.2"))))||(j.name==="body-parser"&&lt(v,"2.4.0")))bad.push(p+" "+v);}catch{}}}};\
+walk("/usr/local/lib/node_modules");walk("/opt/claws/node_modules");\
+if(bad.length){console.error("vulnerable packages:\n"+bad.join("\n"));process.exit(1);}'
+
+# Ensure the data dir is writable by the non-root user even before a
+# PVC mounts over it (k8s fsGroup handles the mount case).
+RUN mkdir -p /home/claws/.claws \
+ && chown -R claws:claws /home/claws
+
+USER claws
+ENV HOME=/home/claws \
+    PORT=3000 \
+    CLAWS_BIND_HOST=0.0.0.0 \
+    # No NODE_ENV here: agent and session shells inherit the image env, and
+    # NODE_ENV=production makes a plain `npm ci` skip dev dependencies.
+    # deploy/container-entrypoint.sh sets it for the service alone.
+    CLAWS_RUNTIME=container \
+    # The npm prefix above is root-owned, so uid 1000 can never write to it and
+    # the CLI's self-updater always fails (#3088). The image pins the CLI
+    # version instead, and claude-code-release.yml's daily check publishes new versions.
+    # Session pods and headless agent runs inherit this from the image.
+    # Codex has no equivalent env var, so Claws instead disables its startup
+    # update check in every config.toml it writes
+    # (check_for_update_on_startup = false, #3312).
+    DISABLE_AUTOUPDATER=1
+
+# Toolchain smoke tests as the agent user: the store registration loaded
+# (path-info on a session-shell path), nix-command and flakes are enabled, the
+# in-cluster cache is a configured substituter (read from config only; the
+# build runs outside the cluster and must not contact it), node-gyp's
+# toolchain and ps are present, and a fresh login shell has no NODE_ENV.
+RUN set -e; \
+    nix_home="$(mktemp -d)"; \
+    HOME="$nix_home" nix path-info "$(readlink -f /opt/claws/shell-profile/bin/zsh)" >/dev/null; \
+    test "$(HOME="$nix_home" nix eval --expr '1 + 1')" = 2; \
+    HOME="$nix_home" nix config show substituters | grep -q 'nix-cache.default.svc.cluster.local'; \
+    command -v python3 g++ make ps corepack yarn pnpm >/dev/null; \
+    if HOME="$nix_home" npm config list 2>&1 | grep -q 'Unknown env config'; then echo "npm warns about an unknown env config" >&2; exit 1; fi; \
+    HOME="$nix_home" bash -lc 'test -z "${NODE_ENV:-}"'; \
+    rm -rf "$nix_home"
+
+EXPOSE 3000
+
+ENTRYPOINT ["tini", "--"]
+CMD ["/opt/claws/deploy/container-entrypoint.sh"]
