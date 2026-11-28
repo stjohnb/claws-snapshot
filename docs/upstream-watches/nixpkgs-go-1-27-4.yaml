@@ -1,0 +1,16 @@
+# Watched by the upstream-watcher job — see docs/jobs/upstream-watcher.md.
+# Unblocks #clw_01M7SC0YDN6773MWP6YV04A6GW (Go 1.27.4 / CVE-2026-97054) once
+# the staging-next PR carrying Go 1.27.4 lands on nixpkgs master.
+target:
+  issue: clw_01M7SC0YDN6773MWP6YV04A6GW
+conditions:
+  - kind: pr_merged
+    repo: NixOS/nixpkgs
+    number: 588926
+note: >-
+  NixOS/nixpkgs 588926 merges staging-next into master; the
+  nixpkgs-unstable channel only advances to that commit days later, after
+  Hydra finishes. Before planning, confirm that
+  pkgs/development/compilers/go/1.27.nix on the nixpkgs-unstable branch
+  reads version = "1.27.4"; if it still reads 1.27.3, move the issue back to
+  Blocked with that finding instead of planning the lock bump and VEX removal.

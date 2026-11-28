@@ -1,0 +1,21 @@
+# Watched by the upstream-watcher job — see docs/jobs/upstream-watcher.md.
+# Unblocks fleet-infra#913 (Seerr stable + OIDC) once upstream ships it.
+target:
+  repo: St-John-Software/fleet-infra
+  issue: 913
+require: all
+conditions:
+  - kind: pr_merged
+    repo: seerr-team/seerr
+    number: 2715
+  - kind: release
+    repo: seerr-team/seerr
+    published_after: "2026-08-25"
+    include_prereleases: false
+note: >-
+  Re-read the issue before planning: the scope is switching
+  apps/seerr/deployment.yaml off the mutable preview-new-oidc tag onto the
+  stable release, then decommissioning apps/jellyseerr/ and
+  apps/servarr/overseerr/ and the jellyseerr-oidc Authentik blueprint.
+  Confirm the published release actually contains the OIDC work before
+  touching the deployment.
